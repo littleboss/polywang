@@ -19,7 +19,7 @@ import time
 from decimal import Decimal, ROUND_DOWN
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-from polymarket_edge import PolymarketFeeModel
+from .polymarket_edge import PolymarketFeeModel
 
 
 def _json_list(value):
@@ -1493,6 +1493,44 @@ class LiveDirectionalJournal:
                 seen_orders[order_id] = trade_id
         return issues
 
+    def record_halt_flatten(self, token_id: str, sold: float, remaining: float,
+                            order_id: str = "", market_id: str = "") -> dict:
+        """Record a kill-switch FAK sale of unhedged directional inventory."""
+        sold = max(0.0, float(sold))
+        remaining = max(0.0, float(remaining))
+        trade_id = f"halt:{token_id}:{time.time_ns()}"
+        now = time.time()
+        status = "FLATTENED" if remaining <= 1e-8 else "PARTIAL"
+        record = {
+            "trade_id": trade_id,
+            "market_id": str(market_id or ""),
+            "condition_id": "",
+            "token_id": str(token_id),
+            "side": "SELL",
+            "order_type": "FAK",
+            "source": "kill-switch",
+            "event_id": "halt",
+            "reason": "FAK flatten unhedged directional inventory on halt",
+            "requested_shares": sold,
+            "limit_price": 0.0,
+            "capital_reserved": 0.0,
+            "order_id": str(order_id or ""),
+            "order_status": status,
+            "matched_shares": sold,
+            "inventory_shares": 0.0,
+            "fill_details": {
+                "halt-fak": {"shares": sold, "price": None, "fee_usd": 0.0},
+            } if sold > 1e-8 else {},
+            "status": status,
+            "created_at": now,
+            "updated_at": now,
+            "error": "" if remaining <= 1e-8 else f"{remaining} shares remain after FAK",
+            "extra": {"remaining_shares": remaining},
+        }
+        self.state["trades"][trade_id] = record
+        self.save()
+        return record
+
     def summary(self) -> dict:
         return {
             "trades": len(self.state["trades"]),
@@ -2059,7 +2097,7 @@ class OfficialFOKExecutor:
         try:
             from polymarket import AsyncSecureClient
         except ImportError as error:
-            raise RuntimeError("Install the official SDK with: python3 -m pip install polymarket-client") from error
+            raise RuntimeError("Install the official SDK with: uv sync --extra live") from error
         kwargs = {"private_key": private_key}
         wallet = os.getenv("POLYMARKET_WALLET_ADDRESS", "").strip()
         if wallet:
@@ -2773,19 +2811,82 @@ class OfficialFOKExecutor:
             snapshot["directional_inventory"] = self.directional_journal.inventory_by_token()
         return snapshot
 
+    async def _flatten_directional_inventory(self) -> dict:
+        """FAK-sell unhedged directional inventory. Hedged Yes+No pairs stay put."""
+        flattened: List[dict] = []
+        leftover: List[dict] = []
+        journal = self.directional_journal
+        if journal is None:
+            return {"flattened": flattened, "leftover": leftover}
+        for token_id, shares in list(journal.inventory_by_token().items()):
+            if shares <= 1e-8:
+                continue
+            if shares < 0.0:
+                leftover.append({
+                    "token_id": token_id, "shares": shares,
+                    "error": "negative directional inventory requires manual review",
+                })
+                continue
+            try:
+                response = await self._call(
+                    "place_market_order",
+                    token_id=token_id,
+                    side="SELL",
+                    shares=f"{shares:.6f}",
+                    min_price=f"{self.rollback_min_price:.6f}",
+                    order_type="FAK",
+                )
+            except Exception as error:
+                leftover.append({"token_id": token_id, "shares": shares, "error": str(error)})
+                continue
+            filled = _filled_shares(response, side="SELL") or 0.0
+            if not math.isfinite(filled) or filled < 0.0:
+                filled = 0.0
+            filled = min(shares, filled)
+            if not _response_ok(response) or filled <= 1e-8:
+                leftover.append({
+                    "token_id": token_id, "shares": shares,
+                    "error": str(_response_value(response, "message", "errorMsg", default="directional FAK rejected")),
+                })
+                continue
+            remaining = max(0.0, shares - filled)
+            order_id = str(_response_value(response, "order_id", "orderID", default="") or "")
+            journal.record_halt_flatten(token_id, filled, remaining, order_id=order_id)
+            flattened.append({"token_id": token_id, "sold": filled, "remaining": remaining})
+            if remaining > 1e-8:
+                leftover.append({
+                    "token_id": token_id, "shares": remaining,
+                    "error": "partial FAK; leftover directional inventory needs manual handling",
+                })
+        return {"flattened": flattened, "leftover": leftover}
+
     async def flatten_on_halt(self, reason: str) -> dict:
-        """Cancel resting orders and snapshot leftover inventory. Do not dump fills."""
+        """Cancel resting orders, FAK-sell directional inventory, snapshot pair leftovers."""
         cancelled = await self.cancel_all_open_orders()
+        directional_flatten = await self._flatten_directional_inventory()
         inventory = await self._inventory_snapshot()
+        leftover = list(directional_flatten.get("leftover") or [])
         result = {
             "reason": str(reason),
             "cancelled_order_ids": cancelled,
             "inventory": inventory,
-            "note": "matched inventory is not auto-sold; residual pairs need manual handling",
+            "directional_flatten": directional_flatten,
+            "note": (
+                "matched pair inventory is not auto-sold; residual pairs need manual handling. "
+                "unhedged directional inventory was FAK-sold; leftovers are in halt_inventory"
+            ),
         }
+        if leftover:
+            result["note"] += "; directional leftover remains"
         if self.journal:
             self.journal.state["halt_inventory"] = result
             self.journal.save()
+        if self.directional_journal:
+            self.directional_journal.state["halt_inventory"] = {
+                "reason": str(reason),
+                "directional_flatten": directional_flatten,
+            }
+            self.directional_journal.save()
         return result
 
     async def apply_halt_actions(self, risk: "LiveRiskController") -> dict:
@@ -2801,6 +2902,7 @@ class OfficialFOKExecutor:
             "cancelled_order_ids": result.get("cancelled_order_ids", []),
             "open_orders": result.get("inventory", {}).get("open_orders", []),
             "pairs": result.get("inventory", {}).get("pairs", []),
+            "directional_flatten": result.get("directional_flatten", {}),
         }
         risk.save()
         return result

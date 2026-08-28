@@ -15,11 +15,21 @@ import math
 import os
 from typing import Iterable, List, Optional
 
-from polymarket_edge import CalibrationTracker
+from .polymarket_edge import CalibrationTracker
 
 
 def _clamp(value: float, low: float = 1e-6, high: float = 1.0 - 1e-6) -> float:
     return max(low, min(high, float(value)))
+
+
+def _payload_field(payload: dict, *names, required: bool = True):
+    """Read the first present vendor alias. Missing required fields raise KeyError."""
+    for name in names:
+        if name in payload and payload[name] is not None and payload[name] != "":
+            return payload[name]
+    if required:
+        raise KeyError(names[0] if names else "missing field")
+    return None
 
 
 def _logit(value: float) -> float:
@@ -50,13 +60,23 @@ class MacroRelease:
 
     @classmethod
     def from_payload(cls, payload: dict) -> Optional["MacroRelease"]:
+        if not isinstance(payload, dict):
+            return None
         try:
-            event_id = str(payload.get("event_id", payload.get("id", "")))
-            indicator = str(payload.get("indicator", ""))
-            actual = float(payload["actual"])
-            consensus = float(payload["consensus"])
-            historical_std = float(payload["historical_std"])
-            released_at_ms = int(float(payload["released_at_ms"]))
+            event_id = str(_payload_field(payload, "event_id", "id") or "")
+            indicator = str(_payload_field(
+                payload, "indicator", "series", "name", "ticker",
+            ) or "")
+            actual = float(_payload_field(payload, "actual", "print", "released", "value"))
+            consensus = float(_payload_field(
+                payload, "consensus", "forecast", "survey", "expected",
+            ))
+            historical_std = float(_payload_field(
+                payload, "historical_std", "std", "stdev", "sigma",
+            ))
+            released_at_ms = int(float(_payload_field(
+                payload, "released_at_ms", "timestamp_ms", "timestamp", "time",
+            )))
         except (KeyError, TypeError, ValueError):
             return None
         if (not event_id or not indicator or not all(math.isfinite(value) for value in (

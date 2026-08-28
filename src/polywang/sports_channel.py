@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import re
 import time
 from typing import Awaitable, Callable, Dict, Optional
 
@@ -174,6 +175,39 @@ def parse_score(score: str) -> Optional[tuple[int, int]]:
     return home, away
 
 
+def parse_soccer_minute(period: str) -> Optional[float]:
+    """Parse a clock minute from a sports-channel period string.
+
+    Bare ``1`` / ``2`` are treated as half indices (not the 1st/2nd minute)
+    so existing live payloads that only send a period number keep a late-game
+    default. Clock strings such as ``70'``, ``70+2``, and ``2H 63`` win.
+    """
+    text = str(period or "").strip()
+    if not text:
+        return None
+    compact = re.sub(r"[\s']+", "", text.upper())
+    if compact in {"HT", "HALF", "HALFTIME", "HALF-TIME", "HALF–TIME"}:
+        return 45.0
+    if compact in {"FT", "FULL", "FULLTIME", "FULL-TIME", "FULL–TIME", "END"}:
+        return 90.0
+    extra = re.search(r"(\d+)\+(\d+)", compact)
+    if extra:
+        return float(extra.group(1)) + float(extra.group(2))
+    numbers = re.findall(r"\d+", compact)
+    if not numbers:
+        return None
+    value = float(numbers[-1])
+    if "2H" in compact or "2ND" in compact:
+        return value if value >= 45.0 else value + 45.0
+    if "1H" in compact or "1ST" in compact:
+        return value
+    if compact in {"1", "2"}:
+        return 25.0 if compact == "1" else 70.0
+    if not math.isfinite(value) or value < 0.0:
+        return None
+    return min(120.0, value)
+
+
 def soccer_fair_probability(score: str, team_focus: str = "home",
                             minute: float = 70.0) -> Optional[float]:
     """Coarse in-play home/away win probability. Not a priced trading model."""
@@ -216,6 +250,9 @@ class SportsTradeCandidate:
     edge: float = 0.0
 
 
+SPORTS_STRATEGY = "sports-latency-v1"
+
+
 def evaluate_sports_candidate(observation: SportsObservation,
                               gate: SportsLatencyGate,
                               mapping: SportsMarketMap,
@@ -227,7 +264,9 @@ def evaluate_sports_candidate(observation: SportsObservation,
                               min_edge: float = 0.03,
                               evaluator=None,
                               yes_token_id: str = "",
-                              no_token_id: str = "") -> SportsTradeCandidate:
+                              no_token_id: str = "",
+                              calibration=None,
+                              strategy: str = SPORTS_STRATEGY) -> SportsTradeCandidate:
     """Map a sports observation to a candidate. Execution is opt-in and gated."""
     link = mapping.resolve(observation.game_id)
     if link is None:
@@ -235,6 +274,9 @@ def evaluate_sports_candidate(observation: SportsObservation,
             observation.game_id, "", "NONE", None, market_price, False,
             "sports event is not mapped to a binary market",
         )
+    parsed_minute = parse_soccer_minute(observation.period)
+    if parsed_minute is not None:
+        minute = parsed_minute
     decision = gate.evaluate(observation, market_timestamp_ms, now_ms=now_ms)
     fair = soccer_fair_probability(observation.score, team_focus=link.yes_means, minute=minute)
     direction = "BUY_YES" if link.yes_means == "home" else "BUY_NO"
@@ -286,6 +328,13 @@ def evaluate_sports_candidate(observation: SportsObservation,
                 True, "sports candidate failed edge evaluator: " + "; ".join(assessment.reasons),
                 token_id=token_id, edge=edge,
             )
+    ready = calibration is not None and calibration.is_live_ready(strategy)
+    if not ready:
+        return SportsTradeCandidate(
+            observation.game_id, link.market_id, direction, fair, market_price,
+            True, "sports model lacks out-of-sample calibration evidence",
+            token_id=token_id, edge=edge,
+        )
     if direction not in {"BUY_YES", "BUY_NO"}:
         return SportsTradeCandidate(
             observation.game_id, link.market_id, direction, fair, market_price,

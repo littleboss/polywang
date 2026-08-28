@@ -1,10 +1,20 @@
-# Generated on first run and holds the wallet private key and API credentials.
+# Secrets — never commit a filled copy
 .env
 
+# Python
 __pycache__/
 *.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# UV / virtualenvs
 .venv/
 venv/
+.uv/
+
+# Runtime journals and operator files
 paper-ledger.json
 live-orders.json
 live-directional.json
@@ -14,4 +24,3 @@ live-kill-switch
 whale-intelligence.json
 calibration.json
 market-events.jsonl
-

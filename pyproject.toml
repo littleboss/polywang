@@ -1,0 +1,30 @@
+[project]
+name = "polywang"
+version = "0.1.0"
+description = "Fail-closed Polymarket Yes/No combo-arbitrage bot"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "polywang" }]
+dependencies = [
+    "requests>=2.32,<3",
+    "websockets>=13,<16",
+]
+
+[project.optional-dependencies]
+live = [
+    "polymarket-client==0.6.0",
+]
+
+[project.scripts]
+polywang = "polywang.arbitrage_bot:main"
+polywang-replay = "polywang.market_replay:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+package = true
+
+[dependency-groups]
+dev = []

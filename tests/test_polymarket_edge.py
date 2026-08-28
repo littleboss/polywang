@@ -5,12 +5,12 @@ Tests for the edge evaluation module.
 The fee tests check against the published fee tables rather than against the
 implementation, so if the formula is ever mistranscribed they will catch it.
 
-Run with:  python3 -m unittest -v test_polymarket_edge
+Run with:  uv run python -m unittest -v tests.test_polymarket_edge
 """
 
 import unittest
 
-from polymarket_edge import (
+from polywang.polymarket_edge import (
     CalibrationTracker,
     EdgeEvaluator,
     NegRiskScanner,

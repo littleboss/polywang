@@ -19,14 +19,17 @@ import time
 from typing import Dict, Iterable, List, Optional
 
 import requests
-from whale_intelligence import WhaleIntelligenceEngine
-from sports_channel import SportsStateTracker, SportsLatencyGate, SportsMarketMap, consume_sports_channel, evaluate_sports_candidate
-from market_replay import JsonlEventRecorder
-from macro_model import JsonlMacroFeed, MacroEventModel, MacroRelease
-from crypto_model import CryptoObservation, CryptoStatArbModel, JsonlCryptoFeed
-from polymarket_edge import CalibrationTracker, EdgeEvaluator
+from .whale_intelligence import WhaleIntelligenceEngine
+from .sports_channel import (
+    SportsStateTracker, SportsLatencyGate, SportsMarketMap,
+    consume_sports_channel, evaluate_sports_candidate,
+)
+from .market_replay import JsonlEventRecorder
+from .macro_model import JsonlMacroFeed, MacroEventModel, MacroRelease
+from .crypto_model import CryptoObservation, CryptoStatArbModel, JsonlCryptoFeed
+from .polymarket_edge import CalibrationTracker, EdgeEvaluator
 
-from arbitrage_core import (
+from .arbitrage_core import (
     BinaryArbitrageScanner,
     BinaryMarket,
     DirectionalExecutor,
@@ -180,6 +183,7 @@ class PaperMarketRunner:
             min_coordination_trade_usd=env_float("WHALE_MIN_COORDINATION_TRADE_USD", 500.0),
         )
         self.max_book_age_seconds = env_float("MAX_BOOK_AGE_SECONDS", 5.0)
+        self.max_leg_skew_ms = max(0, int(env_float("MAX_LEG_SKEW_MS", 1000.0)))
         self.last_fingerprint = set()
         self.directional_executor = None
         self.calibration = None
@@ -278,6 +282,8 @@ class PaperMarketRunner:
                 continue
             if now_ms - oldest_timestamp > self.max_book_age_seconds * 1000:
                 continue
+            if abs(yes_book.timestamp_ms - no_book.timestamp_ms) > self.max_leg_skew_ms:
+                continue
             opportunity = self.scanner.scan(market, yes_book, no_book)
             if not opportunity or opportunity.fingerprint in self.last_fingerprint:
                 continue
@@ -334,7 +340,7 @@ async def run_market_stream(runner: PaperMarketRunner, token_ids: List[str]) -> 
     try:
         import websockets
     except ImportError as error:
-        raise SystemExit("Install websockets for the paper market stream: python3 -m pip install websockets") from error
+        raise SystemExit("Install websockets for the paper market stream: uv sync") from error
 
     backoff = 1.0
     recorder = JsonlEventRecorder(os.getenv("MARKET_EVENT_LOG", ""), source="market")
@@ -460,6 +466,56 @@ async def run_reconciliation_loop(executor: OfficialFOKExecutor,
             raise
 
 
+async def process_sports_observation(observation, runner: PaperMarketRunner,
+                                     mapping: SportsMarketMap,
+                                     gate: Optional[SportsLatencyGate] = None,
+                                     directional=None,
+                                     allow_execution: bool = False,
+                                     min_edge: float = 0.03):
+    """Map one sports observation onto the live books and optionally execute."""
+    if runner is None or not mapping.links:
+        return None
+    link = mapping.resolve(observation.game_id)
+    if link is None:
+        return None
+    market = runner.markets.get(link.market_id)
+    if market is None:
+        LOG.info("SPORTS UNMAPPED MARKET: game %s -> market %s not in the live universe",
+                 observation.game_id, link.market_id)
+        return None
+    yes_book = runner.books.get(market.yes_token_id)
+    market_ts = yes_book.timestamp_ms if yes_book else 0
+    price = yes_book.best_ask()[0] if yes_book and yes_book.best_ask() else None
+    candidate = evaluate_sports_candidate(
+        observation, gate or SportsLatencyGate(), mapping, market_ts, market_price=price,
+        now_ms=observation.received_at_ms,
+        allow_execution=allow_execution,
+        min_edge=min_edge,
+        evaluator=getattr(runner, "edge_evaluator", None),
+        yes_token_id=market.yes_token_id,
+        no_token_id=market.no_token_id,
+        calibration=getattr(runner, "calibration", None),
+    )
+    LOG.info(
+        "SPORTS CANDIDATE: %s | %s | eligible=%s executable=%s | %s",
+        candidate.market_id, candidate.direction, candidate.eligible,
+        candidate.executable, candidate.reason,
+    )
+    if not candidate.executable or directional is None:
+        return candidate
+    token_id = candidate.token_id or (
+        market.yes_token_id if candidate.direction == "BUY_YES" else market.no_token_id
+    )
+    intent = intent_from_best_ask(
+        market, token_id, runner.books.get(token_id), env_float("MAX_ORDER_USD", 100.0),
+        source="sports", event_id=observation.game_id, reason=candidate.reason,
+    )
+    if intent is None:
+        return candidate
+    await runner.execute_directional(intent)
+    return candidate
+
+
 async def run_sports_stream(executor: OfficialFOKExecutor, tracker: SportsStateTracker,
                             runner: Optional[PaperMarketRunner] = None,
                             mapping: Optional[SportsMarketMap] = None,
@@ -480,45 +536,10 @@ async def run_sports_stream(executor: OfficialFOKExecutor, tracker: SportsStateT
                 "SPORTS STATE: game %s | %s | score %s | period %s",
                 observation.game_id, observation.status, observation.score, observation.period,
             )
-        if not mapping.links or runner is None:
-            return
-        link = mapping.resolve(observation.game_id)
-        if link is None:
-            return
-        market = runner.markets.get(link.market_id)
-        if market is None:
-            LOG.info("SPORTS UNMAPPED MARKET: game %s -> market %s not in the live universe",
-                     observation.game_id, link.market_id)
-            return
-        yes_book = runner.books.get(market.yes_token_id)
-        market_ts = yes_book.timestamp_ms if yes_book else 0
-        price = yes_book.best_ask()[0] if yes_book and yes_book.best_ask() else None
-        candidate = evaluate_sports_candidate(
-            observation, gate, mapping, market_ts, market_price=price,
-            allow_execution=allow_execution,
-            min_edge=min_edge,
-            evaluator=getattr(runner, "edge_evaluator", None),
-            yes_token_id=market.yes_token_id,
-            no_token_id=market.no_token_id,
+        await process_sports_observation(
+            observation, runner, mapping, gate, directional,
+            allow_execution=allow_execution, min_edge=min_edge,
         )
-        LOG.info(
-            "SPORTS CANDIDATE: %s | %s | eligible=%s executable=%s | %s",
-            candidate.market_id, candidate.direction, candidate.eligible,
-            candidate.executable, candidate.reason,
-        )
-        if not candidate.executable or directional is None:
-            return
-        token_id = candidate.token_id or (
-            market.yes_token_id if candidate.direction == "BUY_YES" else market.no_token_id
-        )
-        book = runner.books.get(token_id)
-        intent = intent_from_best_ask(
-            market, token_id, book, env_float("MAX_ORDER_USD", 100.0),
-            source="sports", event_id=observation.game_id, reason=candidate.reason,
-        )
-        if intent is None:
-            return
-        await runner.execute_directional(intent)
 
     while True:
         try:
@@ -539,6 +560,39 @@ def _token_for_direction(market: BinaryMarket, direction: str) -> str:
     return market.yes_token_id
 
 
+async def process_macro_release(runner: PaperMarketRunner, model: MacroEventModel,
+                                release: MacroRelease, now_ms: Optional[int] = None):
+    now_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+    market_id = model.market_map.get(release.indicator, "")
+    market = runner.markets.get(market_id)
+    price = 0.5
+    book = None
+    if market:
+        book = runner.books.get(market.yes_token_id)
+        if book and book.best_ask():
+            price = book.best_ask()[0]
+    if env_bool("ENABLE_CALIBRATION_AUTOTUNE") and runner.calibration:
+        model.apply_calibration()
+        if runner.edge_evaluator:
+            runner.calibration.apply_recommended_edge(runner.edge_evaluator, model.strategy)
+    signal = model.predict(release, price, now_ms, market_id=market_id)
+    LOG.info(
+        "MACRO SIGNAL: %s %s | eligible=%s executable=%s edge=%.4f | %s",
+        signal.event_id, signal.market_id, signal.eligible, signal.executable,
+        signal.edge, signal.reason,
+    )
+    if not signal.executable or market is None or book is None:
+        return signal
+    token_id = _token_for_direction(market, signal.direction)
+    intent = intent_from_best_ask(
+        market, token_id, runner.books.get(token_id), env_float("MAX_ORDER_USD", 100.0),
+        source="macro", event_id=signal.event_id, reason=signal.reason,
+    )
+    if intent:
+        await runner.execute_directional(intent)
+    return signal
+
+
 async def run_macro_feed(runner: PaperMarketRunner, model: MacroEventModel, feed: JsonlMacroFeed) -> None:
     interval = max(0.5, env_float("MACRO_POLL_SECONDS", 2.0))
     live_ok = (not runner.live) or env_bool("ENABLE_MACRO_LIVE")
@@ -547,33 +601,54 @@ async def run_macro_feed(runner: PaperMarketRunner, model: MacroEventModel, feed
         await asyncio.sleep(interval)
         now_ms = int(time.time() * 1000)
         for release in feed.poll():
-            market_id = model.market_map.get(release.indicator, "")
-            market = runner.markets.get(market_id)
-            price = 0.5
-            book = None
-            if market:
-                book = runner.books.get(market.yes_token_id)
-                if book and book.best_ask():
-                    price = book.best_ask()[0]
-            if env_bool("ENABLE_CALIBRATION_AUTOTUNE") and runner.calibration:
-                model.apply_calibration()
-                if runner.edge_evaluator:
-                    runner.calibration.apply_recommended_edge(runner.edge_evaluator, model.strategy)
-            signal = model.predict(release, price, now_ms, market_id=market_id)
-            LOG.info(
-                "MACRO SIGNAL: %s %s | eligible=%s executable=%s edge=%.4f | %s",
-                signal.event_id, signal.market_id, signal.eligible, signal.executable,
-                signal.edge, signal.reason,
-            )
-            if not signal.executable or market is None or book is None:
-                continue
-            token_id = _token_for_direction(market, signal.direction)
-            intent = intent_from_best_ask(
-                market, token_id, runner.books.get(token_id), env_float("MAX_ORDER_USD", 100.0),
-                source="macro", event_id=signal.event_id, reason=signal.reason,
-            )
-            if intent:
-                await runner.execute_directional(intent)
+            await process_macro_release(runner, model, release, now_ms=now_ms)
+
+
+async def process_crypto_quote(runner: PaperMarketRunner, model: CryptoStatArbModel,
+                               quote, now_ms: Optional[int] = None):
+    now_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+    market = runner.markets.get(quote.market_id)
+    if market is None:
+        return None
+    yes_book = runner.books.get(market.yes_token_id)
+    if not yes_book or not yes_book.synced or not yes_book.best_ask():
+        return None
+    observation = CryptoObservation(
+        quote.market_id, yes_book.best_ask()[0], quote.implied_probability, quote.timestamp_ms,
+        market_timestamp_ms=yes_book.timestamp_ms,
+    )
+    signal = model.observe(observation, now_ms, reference_timestamp_ms=quote.timestamp_ms)
+    LOG.info(
+        "CRYPTO SIGNAL: %s | z=%.3f %s %s eligible=%s executable=%s | %s",
+        signal.market_id, signal.zscore, signal.action, signal.direction,
+        signal.eligible, signal.executable, signal.reason,
+    )
+    if not signal.executable:
+        return signal
+    if signal.action == "EXIT":
+        held = model.inventory.get(signal.market_id) or {}
+        token_id = held.get("token_id") or market.yes_token_id
+        book = runner.books.get(token_id)
+        shares = float(held.get("shares") or 0.0)
+        intent = intent_from_inventory_bid(
+            market, token_id, book, shares,
+            source="crypto", event_id=signal.market_id, reason=signal.reason,
+        )
+        if intent:
+            result = await runner.execute_directional(intent)
+            if result:
+                model.mark_closed(signal.market_id)
+        return signal
+    token_id = _token_for_direction(market, signal.direction)
+    intent = intent_from_best_ask(
+        market, token_id, runner.books.get(token_id), env_float("MAX_ORDER_USD", 100.0),
+        source="crypto", event_id=signal.market_id, reason=signal.reason,
+    )
+    if intent:
+        result = await runner.execute_directional(intent)
+        if result:
+            model.mark_open(signal, token_id=token_id, shares=result.shares)
+    return signal
 
 
 async def run_crypto_feed(runner: PaperMarketRunner, model: CryptoStatArbModel,
@@ -585,46 +660,7 @@ async def run_crypto_feed(runner: PaperMarketRunner, model: CryptoStatArbModel,
         await asyncio.sleep(interval)
         now_ms = int(time.time() * 1000)
         for quote in feed.poll():
-            market = runner.markets.get(quote.market_id)
-            if market is None:
-                continue
-            yes_book = runner.books.get(market.yes_token_id)
-            if not yes_book or not yes_book.synced or not yes_book.best_ask():
-                continue
-            observation = CryptoObservation(
-                quote.market_id, yes_book.best_ask()[0], quote.implied_probability, quote.timestamp_ms,
-            )
-            signal = model.observe(observation, now_ms, reference_timestamp_ms=quote.timestamp_ms)
-            LOG.info(
-                "CRYPTO SIGNAL: %s | z=%.3f %s %s eligible=%s executable=%s | %s",
-                signal.market_id, signal.zscore, signal.action, signal.direction,
-                signal.eligible, signal.executable, signal.reason,
-            )
-            if not signal.executable:
-                continue
-            if signal.action == "EXIT":
-                held = model.inventory.get(signal.market_id) or {}
-                token_id = held.get("token_id") or market.yes_token_id
-                book = runner.books.get(token_id)
-                shares = float(held.get("shares") or 0.0)
-                intent = intent_from_inventory_bid(
-                    market, token_id, book, shares,
-                    source="crypto", event_id=signal.market_id, reason=signal.reason,
-                )
-                if intent:
-                    result = await runner.execute_directional(intent)
-                    if result:
-                        model.mark_closed(signal.market_id)
-                continue
-            token_id = _token_for_direction(market, signal.direction)
-            intent = intent_from_best_ask(
-                market, token_id, runner.books.get(token_id), env_float("MAX_ORDER_USD", 100.0),
-                source="crypto", event_id=signal.market_id, reason=signal.reason,
-            )
-            if intent:
-                result = await runner.execute_directional(intent)
-                if result:
-                    model.mark_open(signal, token_id=token_id, shares=result.shares)
+            await process_crypto_quote(runner, model, quote, now_ms=now_ms)
 
 
 async def run_health_loop(path: str, risk: Optional[LiveRiskController],
@@ -700,6 +736,7 @@ def _research_tasks(runner: PaperMarketRunner, executor=None, directional=None) 
         model = CryptoStatArbModel(
             runner.calibration or CalibrationTracker(),
             allow_execution=env_bool("ENABLE_CRYPTO_EXECUTION") and ((not runner.live) or env_bool("ENABLE_CRYPTO_LIVE")),
+            max_reference_lag_ms=env_int("CRYPTO_MAX_REFERENCE_LAG_MS", 1_000),
         )
         tasks.add(asyncio.create_task(run_crypto_feed(runner, model, JsonlCryptoFeed(crypto_path))))
     return tasks

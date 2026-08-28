@@ -15,7 +15,7 @@ import math
 import os
 from typing import Deque, Dict, List, Optional
 
-from polymarket_edge import CalibrationTracker
+from .polymarket_edge import CalibrationTracker
 
 
 def _clamp(value: float) -> float:
@@ -133,12 +133,27 @@ class JsonlCryptoFeed:
         return quotes
 
 
+def _optional_epoch_ms(value) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        timestamp_ms = int(float(value))
+    except (TypeError, ValueError):
+        return None
+    if timestamp_ms <= 0:
+        return None
+    if timestamp_ms < 10_000_000_000:
+        timestamp_ms *= 1000
+    return timestamp_ms
+
+
 @dataclass(frozen=True)
 class CryptoObservation:
     market_id: str
     market_probability: float
     reference_probability: float
     timestamp_ms: int
+    market_timestamp_ms: Optional[int] = None
 
     @property
     def spread(self) -> float:
@@ -160,7 +175,9 @@ class CryptoObservation:
             return None
         if timestamp_ms < 10_000_000_000:
             timestamp_ms *= 1000
-        return cls(market_id, market_probability, reference_probability, timestamp_ms)
+        market_ts = _optional_epoch_ms(payload.get("market_timestamp_ms", payload.get("book_timestamp_ms")))
+        return cls(market_id, market_probability, reference_probability, timestamp_ms,
+                   market_timestamp_ms=market_ts)
 
 
 @dataclass(frozen=True)
@@ -240,9 +257,12 @@ class CryptoStatArbModel:
         direction = "BUY_MARKET" if zscore <= -self.entry_zscore else (
             "SELL_MARKET" if zscore >= self.entry_zscore else "NONE"
         )
-        fresh = 0 <= int(now_ms) - observation.timestamp_ms <= self.max_age_ms
         ref_ts = int(reference_timestamp_ms if reference_timestamp_ms is not None else observation.timestamp_ms)
-        lag = abs(int(now_ms) - ref_ts)
+        fresh = 0 <= int(now_ms) - ref_ts <= self.max_age_ms
+        market_ts = observation.market_timestamp_ms
+        if market_ts is None:
+            market_ts = now_ms
+        lag = abs(int(market_ts) - ref_ts)
         lagged = lag > self.max_reference_lag_ms
         ready = self.tracker.is_live_ready(self.strategy)
         held = self.inventory.get(observation.market_id)
