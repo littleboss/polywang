@@ -48,6 +48,10 @@ class FeeModelTests(unittest.TestCase):
     def test_geopolitics_is_free(self):
         self.assertEqual(PolymarketFeeModel("geopolitics").fee_usd(1000, 0.50), 0.0)
 
+    def test_explicit_market_fee_parameters_override_category_defaults(self):
+        model = PolymarketFeeModel("sports", taker_fee_rate=0.02, fee_exponent=2.0)
+        self.assertAlmostEqual(model.fee_usd(100, 0.50), 0.125, places=9)
+
     def test_makers_are_never_charged(self):
         for category in ("sports", "crypto", "politics"):
             model = PolymarketFeeModel(category)
@@ -85,6 +89,11 @@ class FeeModelTests(unittest.TestCase):
 
     def test_dust_fees_round_to_zero(self):
         self.assertEqual(PolymarketFeeModel("sports").fee_usd(0.0001, 0.99), 0.0)
+
+    def test_large_fill_does_not_lose_a_small_per_share_fee(self):
+        sports = PolymarketFeeModel("sports")
+        self.assertGreater(sports.fee_per_share(0.9999), 0.0)
+        self.assertGreater(sports.fee_usd(10_000, 0.9999), 0.0)
 
 
 class BreakevenTests(unittest.TestCase):

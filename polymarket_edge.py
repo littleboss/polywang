@@ -21,6 +21,9 @@ by an order of magnitude and understates the cost of longshots.
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import math
+import json
+import os
+import tempfile
 
 # Taker fee rate per market category, from the Polymarket fee schedule.
 # Makers are never charged, in any category.
@@ -52,33 +55,38 @@ class PolymarketFeeModel:
     Two properties matter for strategy design and neither survives a flat
     percentage approximation:
 
-    1. The fee is quadratic in price, peaking at p = 0.50 and vanishing at both
-       extremes. As a share of notional it is `feeRate x (1 - p)`.
+    1. With the current default exponent of one, the fee is quadratic in price,
+       peaking at p = 0.50 and vanishing at both extremes. Market-specific fee
+       schedules may override the rate and exponent.
     2. Makers pay nothing. Crossing the spread is a choice with a price tag, so
        any edge that is not time-critical should be captured with a resting
        limit order instead.
     """
 
-    def __init__(self, category: str = DEFAULT_CATEGORY, maker_rebate_share: float = 0.0):
+    def __init__(self, category: str = DEFAULT_CATEGORY, maker_rebate_share: float = 0.0,
+                 taker_fee_rate: Optional[float] = None, fee_exponent: float = 1.0):
         self.category = (category or DEFAULT_CATEGORY).strip().lower()
-        self.taker_fee_rate = CATEGORY_TAKER_FEE_RATES.get(self.category, CATEGORY_TAKER_FEE_RATES[DEFAULT_CATEGORY])
+        default_rate = CATEGORY_TAKER_FEE_RATES.get(self.category, CATEGORY_TAKER_FEE_RATES[DEFAULT_CATEGORY])
+        self.taker_fee_rate = max(0.0, float(taker_fee_rate)) if taker_fee_rate is not None else default_rate
+        self.fee_exponent = max(0.0, float(fee_exponent))
         self.maker_rebate_share = maker_rebate_share
 
     def fee_usd(self, shares: float, price: float, is_taker: bool = True) -> float:
         """Total fee in USDC for a fill of `shares` at `price`."""
-        if not is_taker or self.taker_fee_rate <= 0.0:
-            return 0.0
-        price = _clamp(price, 0.0, 1.0)
-        fee = abs(shares) * self.taker_fee_rate * price * (1.0 - price)
+        fee = abs(shares) * self.fee_per_share(price, is_taker=is_taker)
         return 0.0 if fee < MIN_CHARGEABLE_FEE_USDC else fee
 
     def fee_per_share(self, price: float, is_taker: bool = True) -> float:
-        return self.fee_usd(1.0, price, is_taker=is_taker)
+        if not is_taker or self.taker_fee_rate <= 0.0:
+            return 0.0
+        price = _clamp(price, 0.0, 1.0)
+        return self.taker_fee_rate * (price * (1.0 - price)) ** self.fee_exponent
 
     def fee_as_fraction_of_notional(self, price: float, is_taker: bool = True) -> float:
         """
         Fee expressed against the dollars deployed, which is the number worth
-        comparing against an expected return. Algebraically `feeRate x (1 - p)`.
+        comparing against an expected return. For the default exponent this is
+        algebraically `feeRate x (1 - p)`.
         """
         if not is_taker or price <= 0.0:
             return 0.0
@@ -561,12 +569,57 @@ class CalibrationTracker:
 
     WORSE_THAN_UNINFORMATIVE = 0.25
 
-    def __init__(self, min_samples: int = 20):
-        self.min_samples = min_samples
+    def __init__(self, min_samples: int = 20, path: str = ""):
+        self.min_samples = max(1, int(min_samples))
+        self.path = path
         self.strategies: Dict[str, StrategyCalibration] = {}
+        self.load()
+
+    def load(self) -> None:
+        if not self.path:
+            return
+        try:
+            with open(self.path, "r", encoding="utf-8") as handle:
+                loaded = json.load(handle)
+            if not isinstance(loaded, dict):
+                raise ValueError("calibration state must be an object")
+            for name, values in loaded.items():
+                if not isinstance(name, str) or not isinstance(values, list):
+                    continue
+                record = StrategyCalibration(name)
+                for entry in values:
+                    if isinstance(entry, list) and len(entry) == 2:
+                        record.record(entry[0], entry[1])
+                self.strategies[name] = record
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError, TypeError) as error:
+            raise RuntimeError(f"Calibration state is unreadable: {self.path}") from error
+
+    def save(self) -> None:
+        if not self.path:
+            return
+        directory = os.path.dirname(os.path.abspath(self.path)) or "."
+        os.makedirs(directory, exist_ok=True)
+        fd, temp_path = tempfile.mkstemp(prefix=".calibration-", dir=directory, text=True)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump({name: record.forecasts for name, record in self.strategies.items()},
+                          handle, indent=2, sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, self.path)
+        except Exception:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+            raise
 
     def record(self, strategy: str, forecast_probability: float, outcome: int) -> None:
         self.strategies.setdefault(strategy, StrategyCalibration(strategy)).record(forecast_probability, outcome)
+        self.save()
 
     def is_trustworthy(self, strategy: str) -> bool:
         """
@@ -578,6 +631,15 @@ class CalibrationTracker:
         if record is None or record.count < self.min_samples:
             return True
         return record.brier_score < self.WORSE_THAN_UNINFORMATIVE
+
+    def is_live_ready(self, strategy: str) -> bool:
+        """Require evidence before a predictive signal can reach live trading."""
+        record = self.strategies.get(strategy)
+        return bool(
+            record is not None
+            and record.count >= self.min_samples
+            and self.is_trustworthy(strategy)
+        )
 
     def underperformers(self) -> List[str]:
         return [name for name in self.strategies if not self.is_trustworthy(name)]

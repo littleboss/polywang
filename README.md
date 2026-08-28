@@ -1,28 +1,79 @@
 # polywang
 
-Polymarket 体育赛事延迟套利与多策略机器人（v7）。
+Polymarket 确定性二元套利与钱包流量情报机器人。
 
-核心思路：现实世界发生进球的那一刻，与预测市场订单薄反应过来之间存在几秒钟的时间差。
-机器人在这个窗口内用泊松模型算出理论公允价值，如果市场价还没跟上，就是套利机会。
-
-但整个系统真正的重点不是"找机会"，而是**拦截不该做的交易**。播客里提到的教训是
-66% 的胜率仍然亏钱——因为每一笔盈利都小到不够付手续费。所以下单前必须过一遍摩擦成本计算。
+核心目标是先验证可锁定的 Yes/No 组合价差，再将真实钱包流量作为独立的统计确认信号。钱包协同不是无风险套利，也不会绕过确定性套利执行器的风控。
 
 ## 快速开始
 
 ```bash
-# 仅需 Python 3.8+ 和 requests；模拟模式不需要任何密钥
-pip install requests
-
-# 跑模拟，这是修改代码后的第一件事
-python3 polymarket-tracker.py --mock
-
-# 看新旧成本模型的差异，理解为什么护栏这样设计
-python3 compare_models.py
+# 纸面市场流需要 Python 3.10+、requests 和 websockets；不需要任何密钥
+pip install requests websockets
 
 # 跑单元测试
-python3 -m unittest -v test_polymarket_tracker test_polymarket_edge
+python3 -m unittest -v test_polymarket_edge test_arbitrage_core test_arbitrage_bot test_whale_intelligence test_market_replay test_sports_channel test_predictive_models
 ```
+
+历史盘口回放使用 Gamma 市场 JSON 和原始 CLOB 事件 JSONL，并复用线上同一套盘口/手续费/深度扫描逻辑：
+
+```bash
+python3 market_replay.py --markets markets.json --events market-events.jsonl --consume-fills
+```
+
+live 或 paper 运行时设置 `MARKET_EVENT_LOG=market-events.jsonl` 可记录收到的 raw/typed market event、源类型和本机接收时间，之后可直接作为盘口回放输入。记录器只保存事件，不会把订单响应或成交假设写成历史成交；成交真实性仍需单独保存 `live-orders.json` 并做对账。
+
+回放结果只是“按记录盘口可见的机会报告”，还需要用真实订单回报校验成交率、延迟、拒单和实际手续费，不能把回放净收益直接当成可实现 PnL。启用 `--consume-fills` 和执行延迟后，`executed_net_profit` 只代表通过模拟深度、价格上限和新鲜度检查的回放成交；顶层 `net_profit` 仍是所有可见信号的汇总，不能替代真实 PnL。
+
+`sports_channel.py` 提供官方 Sports Channel 消费器和保守的延迟闸门。live 模式默认启动该频道（可用 `ENABLE_SPORTS_CHANNEL=0` 关闭观测）；它要求体育事件源时间戳、盘口时间戳、比赛 live 状态和新状态变化同时满足，缺少时间戳时只记录观察，不生成下单信号。当前体育事件仍不会绕过 deterministic Yes/No 风控直接下单。
+
+`macro_model.py` 和 `crypto_model.py` 只提供带时间戳的预测信号接口，不会自动下单。两者都要求通过持久化 `CalibrationTracker` 获得最小样本和样本外 Brier 证据；没有独立数据源、真实结算回填和回放结果时，信号保持不可交易。
+
+## 确定性二元套利引擎
+
+项目现在另外提供一个独立的、默认纸面交易的二元套利引擎：
+
+```bash
+python3 arbitrage_bot.py --markets 100 --cash 1000
+```
+
+它只研究 Yes 和 No 两腿同时买入后合计支付 1.00 的二元市场。机会必须使用订单簿中的实际 ask 和深度，并覆盖两腿 taker 费用、资金安全缓冲和最大仓位；纸面成交写入 `paper-ledger.json`，程序重启后会恢复账本。
+
+新引擎只有在显式设置 `POLYMARKET_LIVE_CONFIRM=I_UNDERSTAND_THE_RISK`、官方 geoblock 放行、私钥存在且 `polymarket-client` 可用时，才会使用两腿 FOK 执行器。安装和验证官方客户端后才考虑运行：
+
+```bash
+.venv/bin/python -m pip install polymarket-client
+POLYMARKET_LIVE_CONFIRM=I_UNDERSTAND_THE_RISK \
+  .venv/bin/python arbitrage_bot.py --live --markets 100
+```
+
+正式启动前可先只做账户和账本检查，不启动行情流、不下单：
+
+```bash
+POLYMARKET_LIVE_CONFIRM=I_UNDERSTAND_THE_RISK \
+  .venv/bin/python arbitrage_bot.py --live --preflight --markets 20
+```
+
+实盘启动顺序是：地理限制检查 → 官方 SDK 账户 preflight → 读取未完成 pair 的 open order / account trades / order 状态 → 核验两腿 conditional-token 余额 → 启动官方 typed market stream、私有 user stream 和持续对账任务。市场流断线后会废弃本地盘口，必须重新收到快照才恢复扫描；持续对账失败会持久化风险 halt。实盘 pair 日志默认写入 `live-orders.json`，也可用 `--live-journal PATH` 指定。日志会保存 pair ID、condition/token ID、两腿订单 ID、请求数量、已确认成交数量、实际成交价格、手续费字段、trade ID、交易哈希、回滚状态和 `PENDING/HEDGED/RESOLVED_PENDING_REDEMPTION/SETTLED/UNHEDGED` 状态。
+
+实盘还会从 `live-risk.json` 恢复风险状态。默认总暴露上限为账户权益的 25%，单市场上限为 5%，最多 10 个未结 pair；可分别用 `LIVE_MAX_TOTAL_EXPOSURE_FRACTION`、`LIVE_MAX_MARKET_EXPOSURE_FRACTION`、`LIVE_MAX_OPEN_PAIRS` 和 `LIVE_RISK_EQUITY_USD` 配置。User Stream 负责实时成交回报，REST 对账默认每 15 秒检查已知订单、增量成交和余额，并每 `LIVE_FULL_RECOVERY_CYCLES` 轮（默认 20 轮）做一次 open-order 孤儿恢复；启动时仍会做完整恢复。创建 `live-kill-switch` 文件，或设置 `POLYMARKET_KILL_SWITCH=1`，会持久化停止新单；清除文件不会自动解除已经持久化的 halt，必须人工检查 `live-risk.json` 后再决定是否恢复。已提交但等待超时的 merge/redeem 交易会在后续对账中查询其原 transaction ID/hash，确认成功后自动完成账本，绝不会重新提交。
+
+两腿中的第一腿成交而第二腿失败时，程序会使用 FAK 反向平掉第一腿；如果回滚不完整，或私有 user stream / 重启对账发现一条腿成交而另一条腿不足，程序会停止并要求人工对账。`HEDGED` 只表示两腿成交数量均已被确认，市场结算后才变成 `SETTLED`；订单被接受不等于成交。425 matching-engine restart 会有限次数退避重试，503 cancel-only/post-only 状态不会盲目重试。
+
+对于普通（二元、非 NegRisk）市场，可显式设置 `AUTO_MERGE_COMPLETE_SETS=1`。当两腿成交均确认后，程序会调用官方 `merge_positions(condition_id=..., amount=...)` 将完整 Yes/No 集合合并回抵押品，并等待链上交易哈希；链上余额尚未到账或交易未确认时只保留 `HEDGED`，不会提前记为已结算。市场发布 resolution 时，pair 会进入 `RESOLVED_PENDING_REDEMPTION`，程序再调用官方 `redeem_positions(condition_id=...)`；只有赎回交易确认后才变为 `SETTLED`、释放风险预算并计算已实现 PnL。赎回交易一旦提交即持久化为 `REDEEM_SUBMITTED`，等待超时不会重复提交，需通过链上或账户对账完成确认。合并和赎回交易的 gas/账户配置仍需在实盘前用小额账户验证。
+
+官方 SDK 的 collateral allowance 以最小单位返回，且可能包含多个 spender。若返回多个 spender，必须显式设置正确的 `POLYMARKET_ALLOWANCE_SPENDER`，否则实盘会拒绝启动。程序不会自动无限批准；只有明确设置 `POLYMARKET_SETUP_APPROVALS=1` 才会调用官方 `setup_trading_approvals()`。实盘前仍必须使用专用小额账户验证余额、allowance、订单状态和结算。
+
+不能把这种回滚当成无损保证，也不要把私钥写入仓库，更不要用代理绕过 Polymarket 地理限制。
+
+这个引擎是确定性套利，不等于体育、宏观或加密预测策略。后者必须分别接入独立数据源并完成样本外校准，不能把任意 confidence 分数当作概率。
+
+## 大鲸情报层
+
+`whale_intelligence.py` 是独立的钱包流量情报层，由新引擎消费公开市场交易事件。它会过滤匿名或格式错误的钱包地址，按 `trade_id` 去重，保存每个钱包的交易量、持仓、结算次数、已实现 PnL 和收缩后的质量分数，并计算最近窗口内按钱包质量加权的市场净买卖压力。
+
+默认只有同时满足以下条件的交易才会被标记为可跟随的大鲸流：名义金额达到阈值、钱包有足够的历史结算样本、历史质量分数过线、近期压力方向一致。协同信号还必须属于同一 outcome、同一方向，达到最少钱包数和总金额，并限制最大单钱包金额占比；至少需要一个历史上合格的钱包。否则只记录为 `LARGE TRADE` 观察，不再把它升级为大鲸反转交易。钱包历史默认保存到 `whale-intelligence.json`，可通过 `WHALE_STATE_PATH` 修改。
+
+注意：公开 CLOB 行情事件经常没有真实交易者地址。没有地址时系统只承认“大额匿名交易”，不会把多个匿名事件当成多个钱包，也不会据此生成高质量大鲸信号。数据适配器必须提供 `wallet_address`、`trade_id`、`side` 和结算结果。
 
 ## 先看这个：手续费不是固定百分比
 
@@ -49,31 +100,11 @@ fee = 股数 × 费率 × p × (1 - p)      # 只对 taker 收取，maker 免费
    机会会在等待中消失时（比如刚进球）才值得付。
 3. **持有到结算比提前平仓便宜**，因为结算不收费，而平仓要再付一次 taker 费。
 
-首次运行会自动生成一份 `.env` 模板。**`.env` 包含私钥，绝对不要提交到 git。**
+如果使用环境变量文件，请由操作者自行创建 `.env`，并确保它不提交到 git。**`.env` 包含私钥，绝对不要提交到 git。**
 
-实盘模式需要额外装 `websockets`，并在 `.env` 里填好凭证：
+小额实盘的启动、监控、链上交易超时和停机流程见 [LIVE_RUNBOOK.md](LIVE_RUNBOOK.md)。
 
-```bash
-pip install websockets
-python3 polymarket-tracker.py --live
-```
-
-## 模拟模式跑了什么
-
-`--mock` 会依次回放 6 个场景，每个场景对应一道安全防线。改完阈值后跑一遍，
-就能确认这些防线还在正常工作：
-
-| 场景 | 验证的机制 | 期望看到的日志 |
-|------|-----------|---------------|
-| 1 | 建立初始订单薄 | 平价套利信号 |
-| 2 | 高置信度但零利润空间 | `🛡️ [FRICTION BLOCKED]` |
-| 3 | 进球后市场未反应 | `✅ [FRICTION PASSED]` + `🛒 [SIMULATED BUY]` |
-| 4 | 正常结算 | `🏁 [SIMULATED RESOLUTION]` |
-| 5 | 数据源过期 | `⌛ [WINDOW CLOSED]` |
-| 6 | 比分逆转 | `🛑 [STATE STOP LOSS]` |
-
-场景 2 是最重要的一个：8 个巨鲸钱包涌入一个 0.97 的合约，置信度轻松超过 80 的
-行动阈值。唯一挡住这笔交易的就是摩擦成本计算——这正是播客里亏钱的那种情形。
+查看本地 live journal 状态（不联网、不读取私钥）：`python3 arbitrage_bot.py --status --live-journal live-orders.json`。
 
 ## 安全防线
 
@@ -93,22 +124,15 @@ python3 polymarket-tracker.py --live
 所以估计值会先向市场价收缩，再取四分之一凯利，最后还有硬上限。
 
 **限价单保护** — 每笔订单都带 `max_allowed_fill_price` 上限。执行前会重新读一次
-订单薄：如果市场在信号产生和下单之间已经涨过上限，订单作废。延迟套利的前提就是
+订单薄：如果市场在信号产生和下单之间已经涨过上限，订单作废。live 模式默认只使用每条腿的最佳 ask 档位（可用 `LIVE_MAX_BOOK_LEVELS` 显式调整）；BUY 的 SDK 参数是花费金额，若价格改善导致成交份额超过目标，程序会拒绝该 pair 并尝试回滚。延迟套利的前提就是
 市场还没反应，一旦反应了就不再是套利，而是高位接盘。
 
 **校准反馈** — 每个策略的预测都会记 Brier 分数（均方误差，越低越好）。0.25 是"所有
 问题都答 50%"的得分，超过它说明这个策略还不如不预测，会被自动停用。没有这个回路，
 就无法区分"真的有效"和"运气好"。
 
-**状态止损** — 普通止损等价格下跌，但在这里比分才是真相、价格是滞后的，等价格跌
-就等于在所有人卖完之后才卖。所以一旦比分让当初做多的理由不成立（领先被追平或反超），
-立刻平仓，不等价格确认。
-
-**延迟窗口** — 进球后超过 `SPORTS_LATENCY_THRESHOLD_SECS` 秒仍未成交就放弃。
-窗口之外还存在的价差，更可能是自己这边数据过期，而不是真实机会。
-
 **地理合规** — 启动时检查 IP 归属地。检查失败时模拟模式仅告警，但会直接阻断
-`--live`（除非显式加 `--force`）。
+`--live`。
 
 ## 关于"抓高概率机会"
 
@@ -141,33 +165,31 @@ python3 polymarket-tracker.py --live
 | `MIN_EDGE_OVER_BREAKEVEN` | 0.02 | 模型精度的自我认知。模型越粗糙应该调得越高 |
 | `KELLY_FRACTION` | 0.25 | 凯利比例。全凯利在高价位会爆仓，不要调到 1.0 |
 | `ESTIMATE_CONFIDENCE` | 0.5 | 你的估计相对市场价的可信度权重 |
-| `TIME_DECAY_WEIGHT` | 1.0 | 按运动项目校准：进球多的联赛调高，防守型联赛调低 |
-| `SPORTS_LATENCY_THRESHOLD_SECS` | 5 | 数据源变快或变慢时 |
 | `WHALE_THRESHOLD_USD` | 5000 | 市场流动性上升时调高 |
+| `WHALE_MIN_COORDINATION_TRADE_USD` | 500 | 协同中的单笔最小金额 |
+| `WHALE_MAX_CONCENTRATION` | 0.75 | 单一钱包最多占协同金额的比例 |
 
-费率**不再需要手工配置**，它由 `MARKET_CATEGORY` 按官方费率表推导。平台调整费率时
-只需更新 `polymarket_edge.py` 里的 `CATEGORY_TAKER_FEE_RATES`。
-
-以下参数名同时兼容旧写法：`MIN_ARBITRAGE_EDGE_PCT`、`WHALE_USD_THRESHOLD`、
-`COORDINATION_WINDOW_SECS`。
+费率**不再需要手工配置**：如果 Gamma 返回逐市场 `feeSchedule`，扫描器优先使用该费率和指数；否则才由市场类别的 `CATEGORY_TAKER_FEE_RATES` 提供缺省值。
 
 ## 文件结构
 
 | 文件 | 职责 |
 |------|------|
-| `polymarket-tracker.py` | 信号检测、体育延迟套利、实盘/模拟主循环 |
+| `arbitrage_bot.py` | 市场流、钱包流、纸面交易和实盘启动编排 |
+| `arbitrage_core.py` | 二元套利扫描、账本、官方 FOK 执行、对账和订单状态机 |
 | `polymarket_edge.py` | 费率模型、边际评估、凯利仓位、校准跟踪、NegRisk 扫描 |
-| `compare_models.py` | 新旧成本模型对比演示 |
-| `test_*.py` | 104 个测试，只用标准库、不联网 |
+| `whale_intelligence.py` | 钱包过滤、历史质量、质量加权净流向、结算反馈和持久化 |
+| `market_replay.py` | JSONL 盘口历史回放与机会统计 |
+| `sports_channel.py` | Sports Channel 消费与时间戳延迟闸门 |
+| `macro_model.py` | 宏观事件 surprise 概率模型与校准闸门 |
+| `crypto_model.py` | crypto 市场概率价差 z-score 模型与校准闸门 |
+| `test_*.py` | 单元测试，只用标准库、不联网 |
 
 ## 修改代码时的注意事项
 
-1. 先跑 `--mock`，再跑 `python3 -m unittest test_polymarket_tracker test_polymarket_edge`。
+1. 先跑 paper mode，再跑 `python3 -m unittest`。
 2. 费率测试是**直接对照官方费率表**写的，不是对照实现写的。如果公式被改错，测试会发现。
-3. 泊松模型改动会直接影响公允价值，进而影响所有交易决策，改之前建议先用
-   `calculate_soccer_probability` 打印一遍不同比分和时间的概率曲线，确认是单调合理的。
-4. 实盘下单模块目前只签名、不提交（`sign_limit_order` 返回的是 mock 签名），
-   接入真实 EIP-712 签名需要 `web3` 和 Polygon 网络配置。
-5. `debias_market_price` 用 Wang 变换估计物理概率（λ≈0.176，基于已结算合约标定）。
+3. 实盘下单必须确认订单响应、私有 user stream 和重启对账；不能把订单被接受当作双腿成交。
+4. `debias_market_price` 用 Wang 变换估计物理概率（λ≈0.176，基于已结算合约标定）。
    **它默认不启用**，因为该偏差在高成交量市场趋近于零，对流动性好的市场套用固定 λ
    会凭空造出并不存在的边际。

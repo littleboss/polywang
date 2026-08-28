@@ -5,3 +5,8 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+paper-ledger.json
+live-orders.json
+whale-intelligence.json
+live-risk.json
+live-kill-switch
