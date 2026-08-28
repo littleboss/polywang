@@ -212,6 +212,8 @@ class SportsTradeCandidate:
     eligible: bool
     reason: str
     executable: bool = False
+    token_id: str = ""
+    edge: float = 0.0
 
 
 def evaluate_sports_candidate(observation: SportsObservation,
@@ -220,8 +222,13 @@ def evaluate_sports_candidate(observation: SportsObservation,
                               market_timestamp_ms: int,
                               market_price: Optional[float] = None,
                               now_ms: Optional[int] = None,
-                              minute: float = 70.0) -> SportsTradeCandidate:
-    """Map a sports observation to a research candidate. Never marks executable."""
+                              minute: float = 70.0,
+                              allow_execution: bool = False,
+                              min_edge: float = 0.03,
+                              evaluator=None,
+                              yes_token_id: str = "",
+                              no_token_id: str = "") -> SportsTradeCandidate:
+    """Map a sports observation to a candidate. Execution is opt-in and gated."""
     link = mapping.resolve(observation.game_id)
     if link is None:
         return SportsTradeCandidate(
@@ -236,20 +243,58 @@ def evaluate_sports_candidate(observation: SportsObservation,
         home, away = parsed
         leading = home > away if link.yes_means == "home" else away > home
         direction = "BUY_YES" if leading else "BUY_NO"
+    token_id = yes_token_id if direction == "BUY_YES" else no_token_id
+    if not token_id:
+        token_id = link.home_token_id if direction == "BUY_YES" else link.away_token_id
+    edge = 0.0
+    if fair is not None and market_price is not None:
+        edge = float(fair) - float(market_price)
     if not decision.eligible:
         return SportsTradeCandidate(
             observation.game_id, link.market_id, direction, fair, market_price,
-            False, decision.reason,
+            False, decision.reason, token_id=token_id, edge=edge,
         )
     if fair is None:
         return SportsTradeCandidate(
             observation.game_id, link.market_id, direction, None, market_price,
-            False, "score cannot be parsed into a fair value",
+            False, "score cannot be parsed into a fair value", token_id=token_id,
+        )
+    if not allow_execution:
+        return SportsTradeCandidate(
+            observation.game_id, link.market_id, direction, fair, market_price,
+            True, "mapped latency candidate; not routed to the binary FOK executor",
+            executable=False, token_id=token_id, edge=edge,
+        )
+    if market_price is None or not math.isfinite(float(market_price)):
+        return SportsTradeCandidate(
+            observation.game_id, link.market_id, direction, fair, market_price,
+            True, "sports candidate has no live market price for edge gates",
+            token_id=token_id, edge=edge,
+        )
+    if abs(edge) < float(min_edge):
+        return SportsTradeCandidate(
+            observation.game_id, link.market_id, direction, fair, market_price,
+            True, "sports edge is below the directional execution threshold",
+            token_id=token_id, edge=edge,
+        )
+    if evaluator is not None:
+        assessment = evaluator.assess(float(market_price), float(fair), bankroll=1.0,
+                                      days_to_resolution=max(1.0 / 24.0, (90.0 - float(minute)) / (24.0 * 60.0)))
+        if not assessment.accepted:
+            return SportsTradeCandidate(
+                observation.game_id, link.market_id, direction, fair, market_price,
+                True, "sports candidate failed edge evaluator: " + "; ".join(assessment.reasons),
+                token_id=token_id, edge=edge,
+            )
+    if direction not in {"BUY_YES", "BUY_NO"}:
+        return SportsTradeCandidate(
+            observation.game_id, link.market_id, direction, fair, market_price,
+            True, "sports direction is not a binary BUY", token_id=token_id, edge=edge,
         )
     return SportsTradeCandidate(
         observation.game_id, link.market_id, direction, fair, market_price,
-        True, "mapped latency candidate; not routed to the binary FOK executor",
-        executable=False,
+        True, "mapped latency candidate admitted to the directional executor",
+        executable=True, token_id=token_id, edge=edge,
     )
 
 

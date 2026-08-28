@@ -1,15 +1,16 @@
 # 小额实盘运行手册
 
-当前可实盘的策略范围只有普通二元市场的确定性 Yes/No 组合套利。体育延迟、宏观预测、crypto 统计套利和钱包协同目前都是观测/研究模块，不会被主循环自动下单。
+当前默认可实盘的策略范围只有普通二元市场的确定性 Yes/No 组合套利。体育延迟、宏观预测和 crypto 统计套利需要单独打开执行开关，并且走方向性单腿执行器，不会塞进买双腿 FOK。即使打开，它们也不是无风险套利。
 
 ## 启动前
 
-1. 使用专用小额钱包，不要在仓库、`.env`、日志或 shell 历史中保存私钥。
+1. 使用专用小额钱包，不要在仓库、`.env`、日志或 shell 历史中保存私钥。复制 `.env.example` 为 `.env` 后只在本机填写。
 2. 确认账户所在地符合 Polymarket 官方地理限制；不要使用代理绕过限制。
 3. 安装锁定版本的依赖：`polymarket-client==0.6.0`。
-4. 先用 `MARKET_EVENT_LOG` 记录至少一段真实 CLOB 事件，再用 `market_replay.py` 检查盘口快照、增量事件、费用和深度。
+4. 先用 `MARKET_EVENT_LOG` 记录至少一段真实 CLOB 事件，再用 `market_replay.py --markets fixtures/replay/markets.json --events fixtures/replay/events.jsonl` 检查盘口快照、增量 sequence、费用回填和深度。
 5. 先以 paper 模式核对机会数量、盘口年龄、可见深度和预期净边际；回放收益不等于可成交收益。
 6. 正式启动前先运行 `--live --preflight`；它只检查 geoblock、账户余额/allowance、账本完整性和已有订单恢复，不启动行情流，也不下单。
+7. `python3 arbitrage_bot.py --health` 读取 `live-health.json`。进程在跑时应周期性更新该文件。
 
 ## 首次小额实盘
 
@@ -51,4 +52,15 @@ LIVE_MAX_MARKET_EXPOSURE_FRACTION=0.01 \
 
 ## 停机
 
-创建 `live-kill-switch` 文件或设置 `POLYMARKET_KILL_SWITCH=1` 会持久化停止新单，并立刻撤销账户内所有未完成订单。匹配到的条件 token 库存不会自动市价平仓，会写入 `live-risk.json` / journal 的 `halt_inventory` 供人工处理。清除文件不会自动解除已持久化的风险 halt。
+创建 `live-kill-switch` 文件或设置 `POLYMARKET_KILL_SWITCH=1` 会持久化停止新单，并立刻撤销账户内所有未完成订单。匹配到的条件 token 库存不会自动市价平仓，会写入 `live-risk.json` / journal 的 `halt_inventory` 供人工处理。收到 SIGINT/SIGTERM 且 `LIVE_CANCEL_ON_SHUTDOWN=1`（默认）时，同样会撤销未完成订单。清除 kill-switch 文件不会自动解除已持久化的风险 halt。
+
+## 方向性策略（默认关闭）
+
+体育、宏观、crypto 默认只观测。若要接入方向性执行器，必须同时满足：
+
+- 对应的 `ENABLE_*_EXECUTION=1`
+- 实盘还要 `ENABLE_*_LIVE=1`
+- `CalibrationTracker` 样本外 Brier / 漂移闸门通过
+- 暴露计入 `live-directional.json`，和组合套利共用 `LiveRiskController`
+
+crypto 的 SELL 进入是买对侧 Polymarket token，退出是卖掉已有库存，不会去中心化交易所做期货对冲。

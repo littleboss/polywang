@@ -7,6 +7,11 @@ __pycache__/
 venv/
 paper-ledger.json
 live-orders.json
-whale-intelligence.json
+live-directional.json
+live-health.json
 live-risk.json
 live-kill-switch
+whale-intelligence.json
+calibration.json
+market-events.jsonl
+

@@ -76,6 +76,23 @@ class SportsChannelTests(unittest.TestCase):
         self.assertEqual(candidate.direction, "BUY_YES")
         self.assertGreater(candidate.fair_probability, 0.5)
 
+    def test_allow_execution_marks_a_mapped_candidate_executable(self):
+        from sports_channel import SportsMarketMap, evaluate_sports_candidate
+        tracker = SportsStateTracker()
+        observation = tracker.observe({
+            "gameId": "g1", "status": "LIVE", "live": True, "ended": False,
+            "score": "2-0", "period": "2", "source_timestamp": 1_700_000_004_000,
+        }, received_at_ms=1_700_000_005_000)
+        mapping = SportsMarketMap({"g1": {"market_id": "m-home", "yes_means": "home"}})
+        candidate = evaluate_sports_candidate(
+            observation, SportsLatencyGate(max_age_seconds=5, min_delay_ms=100, max_delay_ms=5_000),
+            mapping, 1_700_000_000_000, market_price=0.42, now_ms=1_700_000_005_000,
+            allow_execution=True, min_edge=0.03, yes_token_id="yes-token", no_token_id="no-token",
+        )
+        self.assertTrue(candidate.executable)
+        self.assertEqual(candidate.direction, "BUY_YES")
+        self.assertEqual(candidate.token_id, "yes-token")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -10,8 +10,10 @@ be marked live-ready.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import math
-from typing import Optional
+import os
+from typing import Iterable, List, Optional
 
 from polymarket_edge import CalibrationTracker
 
@@ -77,6 +79,7 @@ class MacroSignal:
     eligible: bool
     reason: str
     executable: bool = False
+    direction: str = "NONE"
 
 
 class MacroEventModel:
@@ -96,6 +99,13 @@ class MacroEventModel:
         self.max_age_ms = max(1, int(float(max_age_seconds) * 1000))
         self.market_map = {str(key): str(value) for key, value in (market_map or {}).items()}
         self.seen_event_ids = set()
+        self.allow_execution = False
+
+    def apply_calibration(self) -> dict:
+        """Raise the edge hurdle from persisted walk-forward calibration."""
+        params = self.tracker.recommended_parameters(self.strategy)
+        self.min_edge = max(self.min_edge, float(params["min_edge_over_breakeven"]))
+        return params
 
     def predict(self, release: MacroRelease, market_price: float,
                 now_ms: int, market_id: str = "") -> MacroSignal:
@@ -124,9 +134,55 @@ class MacroEventModel:
         else:
             reason = "calibrated macro signal passed freshness and edge gates"
             eligible = True
+        executable = bool(self.allow_execution and eligible)
+        if executable:
+            reason = "calibrated macro signal admitted to the directional executor"
         self.seen_event_ids.add(release.event_id)
         return MacroSignal(self.strategy, release.event_id, mapped, price, fair, edge,
-                           eligible, reason, executable=False)
+                           eligible, reason, executable=executable,
+                           direction="BUY_YES" if edge >= 0 else "BUY_NO")
 
     def record_settlement(self, signal: MacroSignal, yes_won: bool) -> None:
         self.tracker.record(signal.strategy, signal.fair_probability, int(bool(yes_won)))
+        self.apply_calibration()
+
+
+class JsonlMacroFeed:
+    """Append-only JSONL adapter for timestamped actual/consensus releases."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self._offset = 0
+
+    def poll(self) -> List[MacroRelease]:
+        if not self.path or not os.path.exists(self.path):
+            return []
+        releases: List[MacroRelease] = []
+        with open(self.path, "r", encoding="utf-8") as handle:
+            handle.seek(self._offset)
+            remainder = handle.read()
+            self._offset = handle.tell()
+        for line_number, line in enumerate(remainder.splitlines(), 1):
+            if not line.strip():
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise ValueError(f"invalid macro JSONL: {error}") from error
+            if not isinstance(payload, dict):
+                raise ValueError("macro JSONL row must be an object")
+            release = MacroRelease.from_payload(payload)
+            if release is None:
+                continue
+            releases.append(release)
+        return releases
+
+
+def load_macro_payloads(rows: Iterable[dict]) -> List[MacroRelease]:
+    releases = []
+    for row in rows:
+        if isinstance(row, dict):
+            release = MacroRelease.from_payload(row)
+            if release is not None:
+                releases.append(release)
+    return releases

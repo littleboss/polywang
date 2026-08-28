@@ -116,6 +116,52 @@ class PredictiveModelTests(unittest.TestCase):
         self.assertEqual(held.action, "EXIT")
         self.assertFalse(held.executable)
 
+    def test_macro_jsonl_feed_and_execution_flag(self):
+        from macro_model import JsonlMacroFeed, MacroEventModel, MacroRelease
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "macro.jsonl")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write('{"event_id":"e1","indicator":"cpi","actual":5,"consensus":4,'
+                             '"historical_std":0.5,"released_at_ms":1700000000000}\n')
+            feed = JsonlMacroFeed(path)
+            releases = feed.poll()
+            self.assertEqual(len(releases), 1)
+            self.assertEqual(feed.poll(), [])
+        tracker = CalibrationTracker(min_samples=2)
+        tracker.record("macro-event-v1", 0.9, 1)
+        tracker.record("macro-event-v1", 0.1, 0)
+        model = MacroEventModel(tracker, min_edge=0.01, surprise_weight=1.0, market_map={"cpi": "m-cpi"})
+        model.allow_execution = True
+        signal = model.predict(MacroRelease("e2", "cpi", 5.0, 4.0, 0.5, 1_700_000_000_000), 0.5, 1_700_000_001_000)
+        self.assertTrue(signal.executable)
+        self.assertEqual(signal.direction, "BUY_YES")
+
+    def test_crypto_reference_adapter_and_directional_sell_entry(self):
+        from crypto_model import CryptoReferenceAdapter, CryptoStatArbModel, digital_call_probability
+        probability = digital_call_probability(65000, 60000, 0.55, 0.08)
+        self.assertIsNotNone(probability)
+        self.assertGreater(probability, 0.5)
+        quote = CryptoReferenceAdapter().parse({
+            "market_id": "m", "spot": 65000, "strike": 60000, "vol": 0.55,
+            "t": 0.08, "timestamp_ms": 1700000000000, "source": "fixture",
+        })
+        self.assertAlmostEqual(quote.implied_probability, probability)
+        tracker = CalibrationTracker(min_samples=1)
+        tracker.record("crypto-spread-v1", 0.9, 1)
+        model = CryptoStatArbModel(tracker, entry_zscore=1.0, allow_execution=True)
+        history_time = 1_700_000_000_000
+        for index in range(12):
+            market_p = 0.50 + (0.01 if index % 2 == 0 else -0.01)
+            model.observe(CryptoObservation("m", market_p, 0.5, history_time + index), history_time + index)
+        sell = model.observe(CryptoObservation("m", 0.9, 0.5, history_time + 12), history_time + 12)
+        self.assertEqual(sell.direction, "BUY_NO")
+        self.assertTrue(sell.executable)
+        self.assertEqual(sell.action, "ENTER")
+        model.mark_open(sell, token_id="no-token", shares=2.0)
+        exit_signal = model.observe(CryptoObservation("m", 0.50, 0.5, history_time + 13), history_time + 13)
+        self.assertEqual(exit_signal.action, "EXIT")
+        self.assertTrue(exit_signal.executable)
+
 
 if __name__ == "__main__":
     unittest.main()

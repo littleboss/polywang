@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import time
 from dataclasses import dataclass
@@ -25,6 +26,7 @@ from arbitrage_core import (
     OrderBook,
     handle_market_event,
 )
+from polymarket_edge import PolymarketFeeModel
 
 
 class JsonlEventRecorder:
@@ -128,10 +130,12 @@ class BinaryMarketReplay:
         self.opportunities: List[ReplayOpportunity] = []
         self.executed_opportunities: List[ReplayOpportunity] = []
         self.pending = []
+        self.fee_overrides: Dict[str, float] = {}
         self.execution_stats = {
             "signals": 0, "executed": 0, "latency_missed": 0,
             "stale_missed": 0, "depth_missed": 0, "pending_at_end": 0,
             "rejected": 0, "queue_missed": 0, "second_leg_failed": 0,
+            "fee_backfills": 0,
             "simulated": True,
         }
 
@@ -152,6 +156,32 @@ class BinaryMarketReplay:
                 return int(datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp() * 1000)
             except (TypeError, ValueError, OverflowError):
                 return 0
+
+    def _backfill_fee_rate(self, event: dict) -> None:
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else event
+        rate = payload.get("fee_rate_bps", event.get("fee_rate_bps"))
+        token_id = str(payload.get("asset_id", payload.get("token_id", "")) or "")
+        if rate is None or not token_id:
+            return
+        market = self.token_to_market.get(token_id)
+        if market is None:
+            return
+        try:
+            numeric = float(rate)
+        except (TypeError, ValueError):
+            return
+        if not math.isfinite(numeric) or numeric < 0.0:
+            return
+        if numeric > 1.0:
+            numeric /= 10_000.0
+        self.fee_overrides[market.market_id] = numeric
+        self.execution_stats["fee_backfills"] += 1
+
+    def _fee_model_for(self, market: BinaryMarket) -> PolymarketFeeModel:
+        rate = self.fee_overrides.get(market.market_id, market.taker_fee_rate)
+        return PolymarketFeeModel(
+            market.category, taker_fee_rate=rate, fee_exponent=market.fee_exponent,
+        )
 
     def _flush_pending(self, now_ms: int) -> None:
         if not self.pending or now_ms <= 0:
@@ -192,6 +222,7 @@ class BinaryMarketReplay:
         found: List[ReplayOpportunity] = []
         event_time_ms = self._event_time_ms(event)
         self._flush_pending(event_time_ms)
+        self._backfill_fee_rate(event)
         for market_id in handle_market_event(event, self.token_to_market, self.books):
             market = self.markets[market_id]
             yes_book = self.books.get(market.yes_token_id)
@@ -202,7 +233,7 @@ class BinaryMarketReplay:
                     and event_time_ms - min(yes_book.timestamp_ms, no_book.timestamp_ms) > self.max_book_age_ms):
                 self.execution_stats["stale_missed"] += 1
                 continue
-            opportunity = self.scanner.scan(market, yes_book, no_book)
+            opportunity = self.scanner.scan(market, yes_book, no_book, fee_model=self._fee_model_for(market))
             if opportunity is None:
                 continue
             record = ReplayOpportunity.from_opportunity(event_index, opportunity)

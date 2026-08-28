@@ -154,6 +154,24 @@ class ReplayTests(unittest.TestCase):
         self.assertEqual(failing.report()["execution"]["second_leg_failed"], 1)
         self.assertTrue(failing.report()["pnl_is_simulated"])
 
+    def test_committed_fixture_replays_with_sequence_and_fee_backfill(self):
+        from market_replay import BinaryMarketReplay, FillModel, _load_events, _load_json
+        raw = _load_json("fixtures/replay/markets.json")
+        markets = [
+            parsed for row in raw
+            for parsed in [BinaryMarket.from_gamma(row)] if parsed
+        ]
+        replay = BinaryMarketReplay(
+            markets,
+            scanner=BinaryArbitrageScanner(min_net_profit_usd=0.01, min_return=0.0, safety_buffer_usd=0.0),
+            consume_fills=True,
+            fill_model=FillModel(rejection_rate=0.0, fill_probability=1.0, seed=1),
+        )
+        replay.run(_load_events("fixtures/replay/events.jsonl"))
+        self.assertGreaterEqual(replay.report()["opportunities"], 1)
+        self.assertGreaterEqual(replay.execution_stats["fee_backfills"], 1)
+        self.assertTrue(replay.report()["pnl_is_simulated"])
+
 
 if __name__ == "__main__":
     unittest.main()

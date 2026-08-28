@@ -1,0 +1,13 @@
+[
+  {
+    "id": "m1",
+    "conditionId": "c1",
+    "question": "Fixture Yes/No combo arb",
+    "clobTokenIds": "[\"yes\",\"no\"]",
+    "outcomes": "[\"Yes\",\"No\"]",
+    "active": true,
+    "closed": false,
+    "category": "geopolitics",
+    "feeSchedule": {"rate": 0, "exponent": 1.0}
+  }
+]

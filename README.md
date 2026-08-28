@@ -11,22 +11,26 @@ Polymarket 确定性二元套利与钱包流量情报机器人。
 pip install requests websockets
 
 # 跑单元测试
-python3 -m unittest -v test_polymarket_edge test_arbitrage_core test_arbitrage_bot test_whale_intelligence test_market_replay test_sports_channel test_predictive_models
+python3 -m unittest -v test_polymarket_edge test_arbitrage_core test_arbitrage_bot test_whale_intelligence test_market_replay test_sports_channel test_predictive_models test_directional_executor
 ```
 
 历史盘口回放使用 Gamma 市场 JSON 和原始 CLOB 事件 JSONL，并复用线上同一套盘口/手续费/深度扫描逻辑：
 
 ```bash
-python3 market_replay.py --markets markets.json --events market-events.jsonl --consume-fills
+python3 market_replay.py --markets fixtures/replay/markets.json --events fixtures/replay/events.jsonl --consume-fills
 ```
+
+仓库自带 `fixtures/replay/` 作为可提交的示例数据集。回放会按事件里的 `fee_rate_bps` 回填费率，并用排队/拒单/第二腿失败模型估计成交；`executed_net_profit` 仍然是模拟值。
 
 live 或 paper 运行时设置 `MARKET_EVENT_LOG=market-events.jsonl` 可记录收到的 raw/typed market event、源类型和本机接收时间，之后可直接作为盘口回放输入。记录器只保存事件，不会把订单响应或成交假设写成历史成交；成交真实性仍需单独保存 `live-orders.json` 并做对账。
 
 回放结果只是“按记录盘口可见的机会报告”，还需要用真实订单回报校验成交率、延迟、拒单和实际手续费，不能把回放净收益直接当成可实现 PnL。启用 `--consume-fills` 和执行延迟后，`executed_net_profit` 只代表通过模拟深度、价格上限和新鲜度检查的回放成交；顶层 `net_profit` 仍是所有可见信号的汇总，不能替代真实 PnL。
 
-`sports_channel.py` 提供官方 Sports Channel 消费器、延迟闸门，以及可选的 `SPORTS_MARKET_MAP` 比赛-市场映射和粗略公允价值。映射后的候选只记日志，`executable` 恒为 false，不会交给二元 FOK 执行器。缺少源时间戳时只记录观察。
+`sports_channel.py` 在默认配置下只记日志。设置 `ENABLE_SPORTS_EXECUTION=1`（实盘还需 `ENABLE_SPORTS_LIVE=1`）、`SPORTS_MARKET_MAP` 以及通过校准/边际闸门后，候选会走独立的方向性 BUY 执行器，而不是 Yes+No 组合 FOK。
 
-`macro_model.py` 和 `crypto_model.py` 只提供带时间戳的预测信号接口，不会自动下单。宏观模型会按 `event_id` 去重，并可绑定指标到市场；crypto 模型有退出 z-score 和库存上限，`SELL_MARKET` 不能走当前的买双腿 FOK 执行器。两者都要求通过持久化 `CalibrationTracker` 的滚动窗口、样本外 Brier 和漂移检测；没有独立数据源、真实结算回填和回放结果时，信号保持不可交易。
+`macro_model.py` 从 `MACRO_FEED_PATH` JSONL 读取带时间戳的 actual/consensus/std，按 `event_id` 去重，并可用 `MACRO_MARKET_MAP` 绑定指标到市场。`crypto_model.py` 从 `CRYPTO_REFERENCE_FEED_PATH` 读取独立参考概率，或用 spot/strike/vol/T 计算数字期权 `N(d2)`；进入对侧 Polymarket token，退出用 SELL 平自有库存，不用 CEX 期货对冲。两者默认 `executable=false`，只有显式执行开关、样本外校准和风控限额同时满足才会下单。
+
+启动时会读取本地 `.env`（不覆盖已有环境变量）。模板见 `.env.example`。实盘循环会写 `live-health.json`；`python3 arbitrage_bot.py --health` 可查看。收到 SIGINT/SIGTERM 时，默认 `LIVE_CANCEL_ON_SHUTDOWN=1` 会撤销未完成订单。方向性库存记在 `live-directional.json`，计入同一套暴露限额。
 
 ## 确定性二元套利引擎
 
@@ -179,10 +183,11 @@ fee = 股数 × 费率 × p × (1 - p)      # 只对 taker 收取，maker 免费
 | `arbitrage_core.py` | 二元套利扫描、账本、官方 FOK 执行、对账和订单状态机 |
 | `polymarket_edge.py` | 费率模型、边际评估、凯利仓位、校准跟踪、NegRisk 扫描 |
 | `whale_intelligence.py` | 钱包过滤、历史质量、质量加权净流向、结算反馈和持久化 |
-| `market_replay.py` | JSONL 盘口历史回放与机会统计 |
-| `sports_channel.py` | Sports Channel 消费与时间戳延迟闸门 |
-| `macro_model.py` | 宏观事件 surprise 概率模型与校准闸门 |
-| `crypto_model.py` | crypto 市场概率价差 z-score 模型与校准闸门 |
+| `market_replay.py` | JSONL 盘口历史回放、成交模型与费率回填 |
+| `sports_channel.py` | Sports Channel 消费、延迟闸门、映射与可选方向性执行 |
+| `macro_model.py` | 宏观 JSONL 数据源、surprise 模型、去重与校准闸门 |
+| `crypto_model.py` | 参考概率/数字期权适配、z-score、库存与 SELL 平仓 |
+| `.env.example` | 可部署环境变量模板（不含密钥） |
 | `test_*.py` | 单元测试，只用标准库、不联网 |
 
 ## 修改代码时的注意事项
