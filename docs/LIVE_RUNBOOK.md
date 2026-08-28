@@ -32,7 +32,7 @@ uv run polywang --status --live-journal live-orders.json \
 
 ## 首次小额实盘
 
-选市不再只按 24h 成交量。程序先拉一个更大的活跃市场池（`MARKET_SCAN_POOL`，默认 `max(limit×5, 100)`），再按 **1 tick 错价在扣完 taker 费后还剩多少** 排序：geopolitics（0 费率）和已经走到 0.90+ 的市场排在 0.50 附近的 politics 前面。NegRisk 多结果市场只记日志，不会进入双腿 FOK。
+选市不再只按 24h 成交量。程序先拉一个更大的活跃市场池（`MARKET_SCAN_POOL`，默认 `max(limit×5, 100)`），再按 **1 tick 错价在扣完 taker 费后还剩多少** 排序：geopolitics（0 费率）和已经走到 0.90+ 的市场排在 0.50 附近的 politics 前面。NegRisk 多结果市场默认只记日志，**不会**进入双腿 FOK。若要走独立的 n 腿完整集合路径，必须另外打开 `ENABLE_NEGRISK_EXECUTION`（实盘还要 `ENABLE_NEGRISK_LIVE`），见下文。
 
 建议从极小的 `MAX_ORDER_USD`、单市场暴露和总暴露开始，并保留默认的 `LIVE_MAX_BOOK_LEVELS=1`。**小额阶段请保持 `AUTO_MERGE_COMPLETE_SETS=0`**：merge 的 gas 是固定成本，`$5` 单子上 `$0.30` gas 就会把 1 tick 的 geopolitics 利润吃掉。只有你实测过一笔 merge 的链上费用后，才把数字填进 `MERGE_GAS_USD` 并打开自动 merge。扫描净收益已经会减掉这个数字；填 `0` 同时又开 merge，等于把成本藏起来。
 
@@ -121,3 +121,16 @@ ENABLE_CRYPTO_LIVE=1
 - `CalibrationTracker` 样本外 Brier / 漂移通过（`CALIBRATION_PATH`，`CALIBRATION_MIN_SAMPLES`）
 - 暴露计入 `live-directional.json`，和组合套利共用 `LiveRiskController`
 - crypto 的 SELL 进入是买对侧 Polymarket token，退出是卖掉已有库存，不会去中心化交易所做期货对冲
+
+## NegRisk 完整集合（默认关闭）
+
+这不是 Yes/No 双腿 FOK。互斥 n 结果字段买齐全部 YES（或在有 NO token 时买齐全部 NO）才是完整集合。顺序 n 腿同样不是原子成交，`is_risk_free` 仍为 false。官方 NegRisk adapter 的 convert/redeem 与二元 `merge_positions` 不同，本路径**不会自动 merge**。
+
+```bash
+ENABLE_NEGRISK_EXECUTION=1
+ENABLE_NEGRISK_LIVE=1          # 仅实盘需要
+NEGRISK_MARKET_LIMIT=10
+LIVE_MAX_OPEN_NEGRISK=2
+```
+
+只会订阅 Gamma 已经列全的字段（一张 n-way 市场，或带齐子市场列表的 event）。不要指望成交量前 N 里几条散落的 `negRisk` 二元行会被拼成完整集合。账本是 `live-negrisk.json`，和 `live-orders.json` 分开。未完成的篮子在启动时会 halt，已组装的库存计入总暴露，等待人工 convert 或结算。

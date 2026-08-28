@@ -31,6 +31,15 @@ from .polymarket_edge import (
     CalibrationTracker, EdgeEvaluator, NegRiskScanner,
     combo_arb_universe_score, merge_gas_startup_warning, rank_combo_arb_markets,
 )
+from .negrisk import (
+    LiveNegRiskJournal,
+    NegRiskBookScanner,
+    NegRiskMarket,
+    OfficialNegRiskExecutor,
+    PaperNegRiskExecutor,
+    negrisk_execution_enabled,
+    parse_negrisk_markets,
+)
 from .arbitrage_core import (
     BinaryArbitrageScanner,
     BinaryMarket,
@@ -115,11 +124,25 @@ def write_health(path: str, payload: dict) -> None:
 
 def fetch_markets(limit: int, *, get=None, pool: Optional[int] = None) -> List[BinaryMarket]:
     """Fetch a volume-ordered pool, then keep the binary markets closest to combo-arb breakeven."""
+    binary, _negrisk = fetch_universe(limit, get=get, pool=pool, negrisk_limit=0)
+    return binary
+
+
+def fetch_universe(limit: int, *, get=None, pool: Optional[int] = None,
+                   negrisk_limit: int = 0) -> tuple:
+    """Return ranked binary combo-arb markets plus complete NegRisk fields.
+
+    NegRisk rows are never mixed into the Yes/No FOK universe. Scattered
+    volume-pool binaries that happen to be marked negRisk are also excluded
+    because a truncated field is not a complete set.
+    """
     getter = get or _http_get_gamma
     keep = max(1, int(limit))
     pool_size = int(pool if pool is not None else env_int("MARKET_SCAN_POOL", max(keep * 5, 100)))
     pool_size = max(keep, pool_size)
     rows = _fetch_gamma_rows(pool_size, getter)
+    negrisk = parse_negrisk_markets(rows)
+    negrisk_ids = {market.market_id for market in negrisk}
     binary: List[BinaryMarket] = []
     for row in rows:
         if not isinstance(row, dict):
@@ -128,7 +151,12 @@ def fetch_markets(limit: int, *, get=None, pool: Optional[int] = None) -> List[B
         if parsed and parsed.active and not parsed.neg_risk:
             binary.append(parsed)
         elif env_bool("ENABLE_NEGRISK_OBSERVE", True):
-            _log_negrisk_observation(row)
+            market_id = str(row.get("id", row.get("conditionId", "")) or "")
+            if market_id not in negrisk_ids:
+                _log_negrisk_observation(row)
+    if env_bool("ENABLE_NEGRISK_OBSERVE", True):
+        for market in negrisk:
+            _log_negrisk_market(market)
     ranked = rank_combo_arb_markets(binary)
     selected = ranked[:keep]
     if selected:
@@ -144,7 +172,14 @@ def fetch_markets(limit: int, *, get=None, pool: Optional[int] = None) -> List[B
             score.one_tick_net,
             "unknown" if head.implied_yes is None else f"{head.implied_yes:.3f}",
         )
-    return selected
+    keep_negrisk = max(0, int(negrisk_limit))
+    selected_negrisk = negrisk[:keep_negrisk]
+    if selected_negrisk:
+        LOG.info(
+            "NegRisk universe: %d complete fields parsed, keeping %d for the independent path",
+            len(negrisk), len(selected_negrisk),
+        )
+    return selected, selected_negrisk
 
 
 def _http_get_gamma(params: dict) -> list:
@@ -192,6 +227,19 @@ def _log_negrisk_observation(row: dict) -> None:
     )
 
 
+def _log_negrisk_market(market: NegRiskMarket) -> None:
+    prices = market.implied_yes
+    if len(prices) < 2:
+        return
+    opportunity = NegRiskScanner(min_net_margin=0.01).scan(market.market_id, prices)
+    if opportunity is None or not opportunity.tradeable:
+        return
+    LOG.info(
+        "NEGRISK OBSERVE: %s | %s | %s | independent path, not binary FOK",
+        market.market_id, opportunity.direction, opportunity.note,
+    )
+
+
 def _events(payload) -> Iterable[dict]:
     values = payload if isinstance(payload, list) else [payload]
     return (value for value in values if isinstance(value, dict))
@@ -200,12 +248,31 @@ def _events(payload) -> Iterable[dict]:
 class PaperMarketRunner:
     def __init__(self, markets: List[BinaryMarket], ledger_path: str,
                  initial_cash: float, scanner: BinaryArbitrageScanner, executor=None,
-                 risk_controller: Optional[LiveRiskController] = None):
+                 risk_controller: Optional[LiveRiskController] = None,
+                 negrisk_markets: Optional[List[NegRiskMarket]] = None,
+                 negrisk_scanner: Optional[NegRiskBookScanner] = None,
+                 negrisk_executor=None):
         seen_identifiers = {}
         for market in markets:
             for kind, value in (
                 ("market", market.market_id), ("condition", market.condition_id),
                 ("token", market.yes_token_id), ("token", market.no_token_id),
+            ):
+                key = (kind, str(value))
+                owner = seen_identifiers.get(key)
+                if owner is not None:
+                    raise ValueError(
+                        f"duplicate {kind} identifier {value!r} across markets "
+                        f"{owner!r} and {market.market_id!r}"
+                    )
+                seen_identifiers[key] = market.market_id
+        self.negrisk_markets: Dict[str, NegRiskMarket] = {
+            market.market_id: market for market in (negrisk_markets or [])
+        }
+        for market in self.negrisk_markets.values():
+            for kind, value in (
+                [("market", market.market_id), ("condition", market.condition_id)]
+                + [("token", token_id) for token_id in market.token_ids]
             ):
                 key = (kind, str(value))
                 owner = seen_identifiers.get(key)
@@ -221,8 +288,14 @@ class PaperMarketRunner:
             for market in markets
             for token in (market.yes_token_id, market.no_token_id)
         }
+        for market in self.negrisk_markets.values():
+            for token_id in market.token_ids:
+                self.token_to_market[token_id] = market
         self.books: Dict[str, OrderBook] = {}
         self.scanner = scanner
+        self.negrisk_scanner = negrisk_scanner
+        self.negrisk_executor = negrisk_executor
+        self.negrisk_journal = getattr(negrisk_executor, "journal", None)
         self.ledger = None if executor else JsonLedger(ledger_path, initial_cash=initial_cash)
         self.executor = executor or PaperArbitrageExecutor(
             self.ledger,
@@ -293,9 +366,16 @@ class PaperMarketRunner:
                             )
                     if settled:
                         LOG.info("LIVE RESOLUTION: %s pair(s) pending redemption", settled)
+                if self.negrisk_journal:
+                    marked = 0
+                    for resolved_market in self.negrisk_markets.values():
+                        if resolved_id in {resolved_market.market_id, resolved_market.condition_id}:
+                            marked += self.negrisk_journal.mark_resolved(resolved_id, winning)
+                    if marked:
+                        LOG.info("LIVE NEGRISK RESOLUTION: %s basket(s) marked settled; convert is still manual", marked)
                 return
             for position_id, position in list(self.ledger.state["positions"].items()):
-                market = self.markets.get(position.get("market_id"))
+                market = self.markets.get(position.get("market_id")) or self.negrisk_markets.get(position.get("market_id"))
                 if market and resolved_id in {market.market_id, market.condition_id} and not position.get("settled"):
                     self.ledger.settle(position_id, winning)
                     LOG.info("PAPER SETTLE: %s | position %s", market.title, position_id)
@@ -303,7 +383,7 @@ class PaperMarketRunner:
         if event_type == "last_trade_price":
             token_id = str(value("asset_id", "token_id", default=""))
             market = self.token_to_market.get(token_id)
-            if market:
+            if isinstance(market, BinaryMarket):
                 outcome = "Yes" if token_id == market.yes_token_id else "No"
                 observation = self.whale_engine.record_trade({
                     "trade_id": value("trade_id", "id", default=""),
@@ -328,7 +408,12 @@ class PaperMarketRunner:
         affected = handle_market_event(event, self.token_to_market, self.books)
         now_ms = int(time.time() * 1000)
         for market_id in affected:
-            market = self.markets[market_id]
+            if market_id in self.negrisk_markets:
+                await self._scan_negrisk(market_id, now_ms)
+                continue
+            market = self.markets.get(market_id)
+            if market is None:
+                continue
             yes_book = self.books.get(market.yes_token_id)
             no_book = self.books.get(market.no_token_id)
             if not yes_book or not no_book:
@@ -377,6 +462,62 @@ class PaperMarketRunner:
                 LOG.info("PAPER ARB: %s | %.4f shares | capital $%.4f | net after buffer $%.4f | position %s",
                          market.title, opportunity.shares, opportunity.capital_required,
                          opportunity.net_profit, result.position_id)
+
+    async def _scan_negrisk(self, market_id: str, now_ms: int) -> None:
+        if self.negrisk_scanner is None:
+            return
+        market = self.negrisk_markets[market_id]
+        books = []
+        for token_id in market.yes_token_ids:
+            book = self.books.get(token_id)
+            if book is None or not book.synced or not book.timestamp_ms:
+                return
+            books.append(book)
+        if self.live and not getattr(self.executor, "user_stream_healthy", False):
+            return
+        timestamps = [book.timestamp_ms for book in books]
+        oldest = min(timestamps)
+        newest = max(timestamps)
+        if now_ms + 30_000 < oldest:
+            return
+        if now_ms - oldest > self.max_book_age_seconds * 1000:
+            return
+        if newest - oldest > self.max_leg_skew_ms:
+            return
+        opportunity = self.negrisk_scanner.scan(market, self.books)
+        if not opportunity or opportunity.fingerprint in self.last_fingerprint:
+            return
+        if self.negrisk_executor is None:
+            LOG.info(
+                "NEGRISK OBSERVE BOOK: %s | %s | %.4f shares | net $%.4f | not executed",
+                market.title, opportunity.direction, opportunity.shares, opportunity.net_profit,
+            )
+            self.last_fingerprint.add(opportunity.fingerprint)
+            return
+        try:
+            if self.risk_controller and self.live:
+                self.risk_controller.check_negrisk(opportunity)
+            result = self.negrisk_executor.execute(opportunity)
+            if inspect.isawaitable(result):
+                result = await result
+        except UnhedgedPairError:
+            if self.risk_controller:
+                self.risk_controller.halt("unfinished NegRisk basket requires manual reconciliation")
+            LOG.critical("UNHEDGED NEGRISK BASKET: stopping the process for manual reconciliation")
+            raise
+        except ValueError as error:
+            LOG.info("Skip NegRisk %s: %s", market.title, error)
+            return
+        for leg in opportunity.legs:
+            book = self.books.get(leg.token_id)
+            if book is not None:
+                book.consume_asks(leg.fills)
+        self.last_fingerprint.add(opportunity.fingerprint)
+        LOG.info(
+            "NEGRISK %s: %s | %s | %.4f shares | net $%.4f | basket %s",
+            "LIVE" if self.live else "PAPER", market.title, opportunity.direction,
+            opportunity.shares, opportunity.net_profit, result.basket_id,
+        )
 
     async def execute_directional(self, intent: DirectionalIntent):
         if self.directional_executor is None:
@@ -728,7 +869,8 @@ async def run_crypto_feed(runner: PaperMarketRunner, model: CryptoStatArbModel,
 async def run_health_loop(path: str, risk: Optional[LiveRiskController],
                           journal: Optional[LiveOrderJournal],
                           directional: Optional[LiveDirectionalJournal],
-                          stop: asyncio.Event) -> None:
+                          stop: asyncio.Event,
+                          negrisk: Optional[LiveNegRiskJournal] = None) -> None:
     interval = max(1.0, env_float("LIVE_HEALTH_INTERVAL_SECONDS", 5.0))
     while not stop.is_set():
         write_health(path, {
@@ -736,8 +878,10 @@ async def run_health_loop(path: str, risk: Optional[LiveRiskController],
             "halt_reason": (risk.state.get("halt_reason") if risk else ""),
             "pair_exposure": journal.open_exposure() if journal else 0.0,
             "directional_exposure": directional.open_exposure() if directional else 0.0,
+            "negrisk_exposure": negrisk.open_exposure() if negrisk else 0.0,
             "open_pairs": len(journal.incomplete_pairs()) if journal else 0,
             "open_directional": len(directional.incomplete_trades()) if directional else 0,
+            "open_negrisk": len(negrisk.incomplete_baskets()) if negrisk else 0,
         })
         try:
             await asyncio.wait_for(stop.wait(), timeout=interval)
@@ -813,6 +957,7 @@ def main() -> int:
     parser.add_argument("--ledger", default=os.getenv("PAPER_LEDGER", "paper-ledger.json"))
     parser.add_argument("--live-journal", default=os.getenv("LIVE_ORDER_JOURNAL", "live-orders.json"))
     parser.add_argument("--directional-journal", default=os.getenv("LIVE_DIRECTIONAL_JOURNAL", "live-directional.json"))
+    parser.add_argument("--negrisk-journal", default=os.getenv("LIVE_NEGRISK_JOURNAL", "live-negrisk.json"))
     parser.add_argument("--health", action="store_true", help="Print the local health snapshot and exit")
     parser.add_argument("--status", action="store_true", help="Print the local live journal summary and exit")
     parser.add_argument("--cash", type=float, default=env_float("PAPER_CASH", 1000.0))
@@ -835,6 +980,7 @@ def main() -> int:
         payload = {
             "pairs": LiveOrderJournal(args.live_journal).summary(),
             "directional": LiveDirectionalJournal(args.directional_journal).summary(),
+            "negrisk": LiveNegRiskJournal(args.negrisk_journal).summary(),
         }
         print(json.dumps(payload, indent=2, sort_keys=True))
         return 0
@@ -845,7 +991,9 @@ def main() -> int:
         LOG.error("Set POLYMARKET_LIVE_CONFIRM=I_UNDERSTAND_THE_RISK to unlock live FOK execution")
         return 2
 
-    markets = fetch_markets(args.markets)
+    want_negrisk = negrisk_execution_enabled(args.live)
+    negrisk_limit = env_int("NEGRISK_MARKET_LIMIT", 10) if want_negrisk else 0
+    markets, negrisk_markets = fetch_universe(args.markets, negrisk_limit=negrisk_limit)
     if not markets:
         LOG.error("No active binary markets with Yes/No token IDs were found")
         return 1
@@ -857,6 +1005,14 @@ def main() -> int:
         max_levels=env_int("LIVE_MAX_BOOK_LEVELS", 1) if args.live else None,
         merge_gas_usd=env_float("MERGE_GAS_USD", 0.0),
     )
+    negrisk_scanner = NegRiskBookScanner(
+        min_net_profit_usd=args.min_profit,
+        min_return=args.min_return,
+        safety_buffer_usd=args.buffer,
+        max_order_usd=args.max_order,
+        max_levels=env_int("LIVE_MAX_BOOK_LEVELS", 1) if args.live else None,
+        merge_gas_usd=env_float("MERGE_GAS_USD", 0.0),
+    ) if negrisk_markets else None
     gas_warning = merge_gas_startup_warning(
         env_float("MERGE_GAS_USD", 0.0), args.max_order, env_bool("AUTO_MERGE_COMPLETE_SETS"),
     )
@@ -871,13 +1027,18 @@ def main() -> int:
         async def run_live() -> None:
             journal = LiveOrderJournal(args.live_journal)
             directional_journal = LiveDirectionalJournal(args.directional_journal)
+            negrisk_journal = LiveNegRiskJournal(args.negrisk_journal)
             executor = await OfficialFOKExecutor.create_from_env(
                 journal=journal, directional_journal=directional_journal,
+            )
+            negrisk_live_executor = (
+                OfficialNegRiskExecutor(executor, negrisk_journal)
+                if want_negrisk and negrisk_markets else None
             )
             account = await executor.preflight(required_usd=0.01)
             risk = LiveRiskController(
                 journal,
-                equity_usd=env_float("LIVE_RISK_EQUITY_USD", account["balance"] + journal.open_exposure()),
+                equity_usd=env_float("LIVE_RISK_EQUITY_USD", account["balance"] + journal.open_exposure() + negrisk_journal.open_exposure()),
                 state_path=os.getenv("LIVE_RISK_STATE_PATH", "live-risk.json"),
                 kill_switch_path=os.getenv("LIVE_KILL_SWITCH_PATH", "live-kill-switch"),
                 max_total_exposure_fraction=env_float("LIVE_MAX_TOTAL_EXPOSURE_FRACTION", 0.25),
@@ -886,6 +1047,8 @@ def main() -> int:
                 max_daily_loss_usd=env_float("LIVE_MAX_DAILY_LOSS_USD", 0.0),
                 extra_journals=[directional_journal],
                 max_open_directional=env_int("LIVE_MAX_OPEN_DIRECTIONAL", 5),
+                negrisk_journal=negrisk_journal,
+                max_open_negrisk=env_int("LIVE_MAX_OPEN_NEGRISK", 2) if negrisk_live_executor else 0,
             )
             directional = DirectionalExecutor(executor, directional_journal, risk=risk)
             try:
@@ -910,6 +1073,7 @@ def main() -> int:
                     "account": account,
                     "journal": journal.summary(),
                     "directional": directional_journal.summary(),
+                    "negrisk": negrisk_journal.summary(),
                     "risk": risk.state,
                 }, indent=2, sort_keys=True))
                 await executor.close()
@@ -917,6 +1081,9 @@ def main() -> int:
             runner = PaperMarketRunner(
                 markets, args.ledger, args.cash, scanner, executor=executor,
                 risk_controller=risk,
+                negrisk_markets=negrisk_markets,
+                negrisk_scanner=negrisk_scanner,
+                negrisk_executor=negrisk_live_executor,
             )
             runner.directional_executor = directional
             _attach_research(runner, directional_journal)
@@ -932,7 +1099,7 @@ def main() -> int:
                 )
             )
             health_task = asyncio.create_task(
-                run_health_loop(health_path, risk, journal, directional_journal, stop)
+                run_health_loop(health_path, risk, journal, directional_journal, stop, negrisk_journal)
             )
             tasks = {market_task, user_task, reconcile_task, health_task}
             tasks |= _research_tasks(runner, executor, directional)
@@ -972,14 +1139,24 @@ def main() -> int:
         return 0
 
     async def run_paper() -> None:
-        runner = PaperMarketRunner(markets, args.ledger, args.cash, scanner)
+        negrisk_journal = LiveNegRiskJournal(args.negrisk_journal)
+        paper_negrisk = None
+        runner = PaperMarketRunner(
+            markets, args.ledger, args.cash, scanner,
+            negrisk_markets=negrisk_markets,
+            negrisk_scanner=negrisk_scanner,
+        )
+        if want_negrisk and negrisk_markets:
+            paper_negrisk = PaperNegRiskExecutor(negrisk_journal, runner.ledger)
+            runner.negrisk_executor = paper_negrisk
+            runner.negrisk_journal = negrisk_journal
         directional_journal = LiveDirectionalJournal(args.directional_journal)
         runner.directional_executor = PaperDirectionalExecutor(directional_journal)
         _attach_research(runner, directional_journal)
         stop = asyncio.Event()
         _install_stop_signal(stop)
         health_task = asyncio.create_task(
-            run_health_loop(health_path, None, None, directional_journal, stop)
+            run_health_loop(health_path, None, None, directional_journal, stop, negrisk_journal)
         )
         market_task = asyncio.create_task(run_market_stream(runner, list(runner.token_to_market)))
         tasks = {market_task, health_task} | _research_tasks(runner)
