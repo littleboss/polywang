@@ -1,0 +1,7 @@
+# Generated on first run and holds the wallet private key and API credentials.
+.env
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
