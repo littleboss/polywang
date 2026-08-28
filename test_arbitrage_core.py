@@ -114,12 +114,79 @@ class MarketAndBookTests(unittest.TestCase):
         }, mapping, books), [])
         self.assertEqual(books["yes-token"].best_ask(), (0.45, 5.0))
 
+    def test_sequence_gap_invalidates_the_book_instead_of_applying_a_partial_update(self):
+        m = market()
+        books = {}
+        mapping = {m.yes_token_id: m, m.no_token_id: m}
+        handle_market_event({
+            "event_type": "book", "asset_id": "yes-token", "timestamp": "1000",
+            "sequence": 10, "hash": "a", "schema_version": "1",
+            "bids": [], "asks": [{"price": "0.45", "size": "5"}],
+        }, mapping, books)
+        self.assertTrue(books["yes-token"].synced)
+        affected = handle_market_event({
+            "event_type": "price_change", "timestamp": "1002", "sequence": 12,
+            "price_changes": [{"asset_id": "yes-token", "price": "0.40", "size": "9", "side": "SELL", "hash": "c"}],
+        }, mapping, books)
+        self.assertEqual(affected, [])
+        book = books["yes-token"]
+        self.assertFalse(book.synced)
+        self.assertEqual(book.asks, {})
+        self.assertIn("sequence gap", book.gap_reason)
+        self.assertIsNone(BinaryArbitrageScanner(min_net_profit_usd=0.01, min_return=0.0).scan(
+            m, book, book))
+
+    def test_contiguous_sequence_and_duplicate_sequence_are_applied(self):
+        m = market()
+        books = {}
+        mapping = {m.yes_token_id: m, m.no_token_id: m}
+        handle_market_event({
+            "event_type": "book", "asset_id": "yes-token", "timestamp": "1000",
+            "sequence": 10, "hash": "a", "asks": [{"price": "0.45", "size": "5"}], "bids": [],
+        }, mapping, books)
+        self.assertEqual(handle_market_event({
+            "event_type": "price_change", "timestamp": "1001", "sequence": 11,
+            "price_changes": [{"asset_id": "yes-token", "price": "0.44", "size": "2", "side": "SELL", "hash": "b"}],
+        }, mapping, books), ["m1"])
+        self.assertEqual(books["yes-token"].best_ask(), (0.44, 2.0))
+        self.assertEqual(handle_market_event({
+            "event_type": "price_change", "timestamp": "1001", "sequence": 11,
+            "price_changes": [{"asset_id": "yes-token", "price": "0.43", "size": "1", "side": "SELL", "hash": "b2"}],
+        }, mapping, books), ["m1"])
+        self.assertEqual(books["yes-token"].best_ask(), (0.43, 1.0))
+
+    def test_unknown_schema_version_and_hash_chain_break_unsync_the_book(self):
+        m = market()
+        books = {}
+        mapping = {m.yes_token_id: m, m.no_token_id: m}
+        handle_market_event({
+            "event_type": "book", "asset_id": "yes-token", "timestamp": "1000",
+            "hash": "a", "asks": [{"price": "0.45", "size": "5"}], "bids": [],
+        }, mapping, books)
+        self.assertEqual(handle_market_event({
+            "event_type": "book", "asset_id": "yes-token", "timestamp": "1001",
+            "schema_version": "99.0", "hash": "b",
+            "asks": [{"price": "0.10", "size": "99"}], "bids": [],
+        }, mapping, books), [])
+        self.assertFalse(books["yes-token"].synced)
+        books["yes-token"].replace_snapshot({
+            "timestamp": "1002", "hash": "c",
+            "asks": [{"price": "0.45", "size": "5"}], "bids": [],
+        })
+        self.assertEqual(handle_market_event({
+            "event_type": "price_change", "timestamp": "1003", "prev_hash": "not-c",
+            "price_changes": [{"asset_id": "yes-token", "price": "0.40", "size": "1", "side": "SELL", "hash": "d"}],
+        }, mapping, books), [])
+        self.assertFalse(books["yes-token"].synced)
+        self.assertIn("hash chain", books["yes-token"].gap_reason)
+
 
 class ScannerTests(unittest.TestCase):
     def book(self, asks):
         b = OrderBook()
         b.asks = dict(asks)
         b.timestamp_ms = 1
+        b.synced = True
         return b
 
     def test_requires_both_legs_and_includes_taker_fees(self):
@@ -167,6 +234,28 @@ class ScannerTests(unittest.TestCase):
         self.assertIsNone(BinaryArbitrageScanner(min_net_profit_usd=0.01).scan(
             negative_risk, self.book([(0.30, 10)]), self.book([(0.30, 10)])))
 
+    def test_merge_gas_is_subtracted_from_scan_profit_and_pair_is_not_risk_free(self):
+        cheap = BinaryArbitrageScanner(
+            min_net_profit_usd=0.01, min_return=0.0, safety_buffer_usd=0.0, merge_gas_usd=0.0,
+        ).scan(market(), self.book([(0.40, 10)]), self.book([(0.40, 10)]))
+        costly = BinaryArbitrageScanner(
+            min_net_profit_usd=0.01, min_return=0.0, safety_buffer_usd=0.0, merge_gas_usd=5.0,
+        ).scan(market(), self.book([(0.40, 10)]), self.book([(0.40, 10)]))
+        self.assertIsNotNone(cheap)
+        self.assertFalse(cheap.is_risk_free)
+        self.assertIn("not atomic", cheap.residual_risk)
+        self.assertIsNone(costly)
+        still_profit = BinaryArbitrageScanner(
+            min_net_profit_usd=0.01, min_return=0.0, safety_buffer_usd=0.0, merge_gas_usd=0.05,
+        ).scan(market(), self.book([(0.40, 10)]), self.book([(0.40, 10)]))
+        self.assertAlmostEqual(still_profit.net_profit, cheap.net_profit - 0.05, places=6)
+
+    def test_unsynced_book_is_not_scanned(self):
+        yes, no = self.book([(0.40, 10)]), self.book([(0.40, 10)])
+        yes.synced = False
+        self.assertIsNone(BinaryArbitrageScanner(min_net_profit_usd=0.01, min_return=0.0).scan(
+            market(), yes, no))
+
 
 class LedgerTests(unittest.TestCase):
     def test_paper_pair_is_atomic_and_recovers_on_reload(self):
@@ -179,6 +268,8 @@ class LedgerTests(unittest.TestCase):
             # Construct through real books to keep this test close to execution.
             yes, no = OrderBook(), OrderBook()
             yes.asks, no.asks = {0.40: 10}, {0.40: 10}
+            yes.synced = no.synced = True
+            yes.timestamp_ms = no.timestamp_ms = 1
             opportunity = BinaryArbitrageScanner(min_net_profit_usd=0.01, min_return=0.0).scan(market(), yes, no)
             position = PaperArbitrageExecutor(ledger, max_total_exposure_fraction=1.0,
                                                max_market_exposure_fraction=1.0).execute(opportunity)
@@ -210,6 +301,10 @@ class FakeClient:
     async def list_account_trades(self, **kwargs):
         return []
 
+    async def cancel_order(self, **kwargs):
+        self.calls.append({"cancel_order": kwargs})
+        return {"ok": True, "order_id": kwargs.get("order_id")}
+
     async def place_market_order(self, **kwargs):
         self.calls.append(kwargs)
         side = kwargs["side"]
@@ -226,6 +321,8 @@ class LiveExecutorTests(unittest.TestCase):
     def opportunity(self):
         yes, no = OrderBook(), OrderBook()
         yes.asks, no.asks = {0.40: 10}, {0.40: 10}
+        yes.synced = no.synced = True
+        yes.timestamp_ms = no.timestamp_ms = 1
         return BinaryArbitrageScanner(min_net_profit_usd=0.01, min_return=0.0).scan(market(), yes, no)
 
     def test_fok_pair_uses_price_caps_and_returns_two_orders(self):
@@ -239,6 +336,8 @@ class LiveExecutorTests(unittest.TestCase):
     def test_protected_buy_is_sized_to_target_shares_at_worst_price(self):
         yes, no = OrderBook(), OrderBook()
         yes.asks, no.asks = {0.40: 5, 0.45: 5}, {0.40: 5, 0.45: 5}
+        yes.synced = no.synced = True
+        yes.timestamp_ms = no.timestamp_ms = 1
         opportunity = BinaryArbitrageScanner(
             min_net_profit_usd=0.01, min_return=0.0, safety_buffer_usd=0.0,
         ).scan(market(), yes, no)
@@ -923,6 +1022,83 @@ class LiveExecutorTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "balance/allowance response is invalid"):
             asyncio.run(OfficialFOKExecutor(InvalidBalanceClient()).preflight(required_usd=0.0))
 
+    def test_account_scan_halts_on_external_open_orders_and_positions(self):
+        class ExternalClient(FakeClient):
+            async def list_open_orders(self, **kwargs):
+                return [{"id": "foreign-order", "token_id": "other-token", "side": "BUY"}]
+
+            async def list_positions(self):
+                return [{"token_id": "stray-token", "size": "4.0"}]
+
+            async def get_order(self, **kwargs):
+                return {"status": "FILLED", "size_matched": "10"}
+
+        with tempfile.TemporaryDirectory() as directory:
+            journal = LiveOrderJournal(os.path.join(directory, "live.json"))
+            asyncio.run(OfficialFOKExecutor(FakeClient(), journal=journal).execute(self.opportunity()))
+            executor = OfficialFOKExecutor(ExternalClient(), journal=LiveOrderJournal(journal.path))
+            with self.assertRaisesRegex(UnhedgedPairError, "open orders outside"):
+                asyncio.run(executor.reconcile(stale_after_seconds=9999, scan_account=True))
+
+        class PositionOnlyClient(FakeClient):
+            async def list_positions(self):
+                return [{"asset_id": "stray-token", "shares": "1.5"}]
+
+            async def get_order(self, **kwargs):
+                return {"status": "FILLED", "size_matched": "10"}
+
+        with tempfile.TemporaryDirectory() as directory:
+            journal = LiveOrderJournal(os.path.join(directory, "live.json"))
+            asyncio.run(OfficialFOKExecutor(FakeClient(), journal=journal).execute(self.opportunity()))
+            executor = OfficialFOKExecutor(PositionOnlyClient(), journal=LiveOrderJournal(journal.path))
+            with self.assertRaisesRegex(UnhedgedPairError, "inventory outside"):
+                asyncio.run(executor.reconcile(stale_after_seconds=9999, scan_account=True))
+
+    def test_kill_switch_cancel_all_leaves_matched_inventory_for_manual_review(self):
+        class FlattenClient(FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.open = [{"id": "resting-1", "token_id": "yes-token"}]
+                self.cancelled = []
+
+            async def list_open_orders(self, **kwargs):
+                return list(self.open)
+
+            async def cancel_order(self, **kwargs):
+                order_id = kwargs["order_id"]
+                self.cancelled.append(order_id)
+                self.open = [order for order in self.open if order["id"] != order_id]
+                return {"ok": True, "order_id": order_id}
+
+            async def get_balance_allowance(self, **kwargs):
+                if kwargs.get("asset_type") == "CONDITIONAL":
+                    return {"balance": "10000000", "allowances": {"c": "0"}}
+                return await super().get_balance_allowance(**kwargs)
+
+        with tempfile.TemporaryDirectory() as directory:
+            journal = LiveOrderJournal(os.path.join(directory, "live.json"))
+            kill_path = os.path.join(directory, "kill")
+            with open(kill_path, "w", encoding="utf-8") as handle:
+                handle.write("stop\n")
+            result = asyncio.run(OfficialFOKExecutor(FakeClient(), journal=journal).execute(self.opportunity()))
+            journal.set_status(result.pair_id, "HEDGED")
+            client = FlattenClient()
+            executor = OfficialFOKExecutor(client, journal=LiveOrderJournal(journal.path))
+            risk = LiveRiskController(
+                executor.journal, equity_usd=100.0,
+                state_path=os.path.join(directory, "risk.json"),
+                kill_switch_path=kill_path,
+            )
+            with self.assertRaises(RiskHaltError):
+                risk.check_startup()
+            flatten = asyncio.run(executor.apply_halt_actions(risk))
+            self.assertEqual(client.cancelled, ["resting-1"])
+            self.assertEqual(flatten["cancelled_order_ids"], ["resting-1"])
+            self.assertTrue(risk.state["flatten_completed"])
+            self.assertEqual(len(flatten["inventory"]["pairs"]), 1)
+            self.assertIn("not auto-sold", flatten["note"])
+            asyncio.run(executor.apply_halt_actions(risk))
+            self.assertEqual(client.cancelled, ["resting-1"])
 
 
 if __name__ == "__main__":

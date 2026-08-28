@@ -14,27 +14,37 @@ import json
 import logging
 import math
 import os
+import signal
 import time
 from typing import Dict, Iterable, List, Optional
 
 import requests
 from whale_intelligence import WhaleIntelligenceEngine
-from sports_channel import SportsStateTracker, consume_sports_channel
+from sports_channel import SportsStateTracker, SportsLatencyGate, SportsMarketMap, consume_sports_channel, evaluate_sports_candidate
 from market_replay import JsonlEventRecorder
+from macro_model import JsonlMacroFeed, MacroEventModel, MacroRelease
+from crypto_model import CryptoObservation, CryptoStatArbModel, JsonlCryptoFeed
+from polymarket_edge import CalibrationTracker, EdgeEvaluator
 
 from arbitrage_core import (
     BinaryArbitrageScanner,
     BinaryMarket,
+    DirectionalExecutor,
+    DirectionalIntent,
     JsonLedger,
+    LiveDirectionalJournal,
     LiveOrderJournal,
     OrderBook,
     PaperArbitrageExecutor,
+    PaperDirectionalExecutor,
     OfficialFOKExecutor,
     LiveRiskController,
     RiskHaltError,
     UnhedgedPairError,
     handle_market_event,
     consume_user_stream,
+    intent_from_best_ask,
+    intent_from_inventory_bid,
     _event_name,
 )
 
@@ -59,6 +69,42 @@ def env_int(name: str, default: int) -> int:
         return int(raw) if raw else default
     except ValueError:
         return default
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def load_dotenv(path: str = "") -> None:
+    """Load KEY=VALUE pairs from a local .env without overriding the process env."""
+    dotenv_path = path or os.getenv("DOTENV_PATH", ".env")
+    if not dotenv_path or not os.path.isfile(dotenv_path):
+        return
+    with open(dotenv_path, "r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip("'").strip('"')
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+
+def write_health(path: str, payload: dict) -> None:
+    if not path:
+        return
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(directory, exist_ok=True)
+    body = dict(payload)
+    body["updated_at"] = time.time()
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(body, handle, indent=2, sort_keys=True)
+        handle.write("\n")
 
 
 def fetch_markets(limit: int) -> List[BinaryMarket]:
@@ -135,15 +181,15 @@ class PaperMarketRunner:
         )
         self.max_book_age_seconds = env_float("MAX_BOOK_AGE_SECONDS", 5.0)
         self.last_fingerprint = set()
+        self.directional_executor = None
+        self.calibration = None
+        self.edge_evaluator = None
+        self.last_directional_event = ""
 
     def invalidate_books(self) -> None:
         """Require fresh snapshots after a market-stream reconnect."""
         for book in self.books.values():
-            book.bids.clear()
-            book.asks.clear()
-            book.timestamp_ms = 0
-            book.hash = ""
-            book.synced = False
+            book.invalidate("market stream reconnect")
 
     async def process(self, event: dict) -> None:
         event_type = _event_name(event.get("event_type", event.get("type", "")) if isinstance(event, dict) else getattr(event, "type", ""))
@@ -221,6 +267,8 @@ class PaperMarketRunner:
             no_book = self.books.get(market.no_token_id)
             if not yes_book or not no_book:
                 continue
+            if not yes_book.synced or not no_book.synced:
+                continue
             if self.live and not getattr(self.executor, "user_stream_healthy", False):
                 continue
             if not yes_book.timestamp_ms or not no_book.timestamp_ms:
@@ -261,6 +309,25 @@ class PaperMarketRunner:
                 LOG.info("PAPER ARB: %s | %.4f shares | capital $%.4f | net after buffer $%.4f | position %s",
                          market.title, opportunity.shares, opportunity.capital_required,
                          opportunity.net_profit, result.position_id)
+
+    async def execute_directional(self, intent: DirectionalIntent):
+        if self.directional_executor is None:
+            return None
+        if self.risk_controller and self.live:
+            self.risk_controller.check_directional(intent.notional + float(intent.fee_cap), intent.market_id)
+        key = f"{intent.source}:{intent.event_id}:{intent.token_id}:{intent.side}"
+        if key == self.last_directional_event:
+            return None
+        result = self.directional_executor.execute(intent)
+        if inspect.isawaitable(result):
+            result = await result
+        self.last_directional_event = key
+        LOG.info(
+            "DIRECTIONAL %s: %s | %s %s | %.4f @ %.4f | %s | %s",
+            "LIVE" if self.live else "PAPER", intent.source, intent.side, intent.token_id,
+            result.shares, intent.limit_price, result.status, intent.reason,
+        )
+        return result
 
 
 async def run_market_stream(runner: PaperMarketRunner, token_ids: List[str]) -> None:
@@ -347,6 +414,9 @@ async def run_user_stream(executor: OfficialFOKExecutor,
         except UnhedgedPairError:
             if risk:
                 risk.halt("user stream found an unhedged live pair")
+                flatten = getattr(executor, "apply_halt_actions", None)
+                if flatten:
+                    await flatten(risk)
             LOG.critical("User stream found an unhedged pair; stopping for manual reconciliation")
             raise
         except Exception as error:
@@ -366,9 +436,13 @@ async def run_reconciliation_loop(executor: OfficialFOKExecutor,
         await asyncio.sleep(interval)
         try:
             risk.record_account_snapshot(await executor.preflight(required_usd=0.0))
+            if risk.poll_kill_switch():
+                await executor.apply_halt_actions(risk)
+                raise RiskHaltError(risk.state.get("halt_reason") or "kill switch")
             reconciled = await executor.reconcile(
                 stale_after_seconds=env_float("STALE_ORDER_SECONDS", 30.0),
                 recover_orphans=(cycle % full_recovery_every == 0),
+                scan_account=(cycle % full_recovery_every == 0),
             )
             cycle += 1
             settled = await executor.settle_hedged_pairs()
@@ -381,13 +455,23 @@ async def run_reconciliation_loop(executor: OfficialFOKExecutor,
             raise
         except Exception as error:
             risk.halt(f"continuous live reconciliation failed: {error}")
+            await executor.apply_halt_actions(risk)
             LOG.critical("LIVE RECONCILIATION HALT: %s", error)
             raise
 
 
-async def run_sports_stream(executor: OfficialFOKExecutor, tracker: SportsStateTracker) -> None:
+async def run_sports_stream(executor: OfficialFOKExecutor, tracker: SportsStateTracker,
+                            runner: Optional[PaperMarketRunner] = None,
+                            mapping: Optional[SportsMarketMap] = None,
+                            directional=None) -> None:
     """Keep the official Sports Channel alive for timestamped observations."""
     backoff = 1.0
+    mapping = mapping or SportsMarketMap()
+    gate = SportsLatencyGate()
+    allow_execution = env_bool("ENABLE_SPORTS_EXECUTION")
+    if runner and runner.live and not env_bool("ENABLE_SPORTS_LIVE"):
+        allow_execution = False
+    min_edge = env_float("SPORTS_MIN_EDGE", 0.03)
 
     async def observe(event) -> None:
         observation = tracker.observe(event)
@@ -396,6 +480,45 @@ async def run_sports_stream(executor: OfficialFOKExecutor, tracker: SportsStateT
                 "SPORTS STATE: game %s | %s | score %s | period %s",
                 observation.game_id, observation.status, observation.score, observation.period,
             )
+        if not mapping.links or runner is None:
+            return
+        link = mapping.resolve(observation.game_id)
+        if link is None:
+            return
+        market = runner.markets.get(link.market_id)
+        if market is None:
+            LOG.info("SPORTS UNMAPPED MARKET: game %s -> market %s not in the live universe",
+                     observation.game_id, link.market_id)
+            return
+        yes_book = runner.books.get(market.yes_token_id)
+        market_ts = yes_book.timestamp_ms if yes_book else 0
+        price = yes_book.best_ask()[0] if yes_book and yes_book.best_ask() else None
+        candidate = evaluate_sports_candidate(
+            observation, gate, mapping, market_ts, market_price=price,
+            allow_execution=allow_execution,
+            min_edge=min_edge,
+            evaluator=getattr(runner, "edge_evaluator", None),
+            yes_token_id=market.yes_token_id,
+            no_token_id=market.no_token_id,
+        )
+        LOG.info(
+            "SPORTS CANDIDATE: %s | %s | eligible=%s executable=%s | %s",
+            candidate.market_id, candidate.direction, candidate.eligible,
+            candidate.executable, candidate.reason,
+        )
+        if not candidate.executable or directional is None:
+            return
+        token_id = candidate.token_id or (
+            market.yes_token_id if candidate.direction == "BUY_YES" else market.no_token_id
+        )
+        book = runner.books.get(token_id)
+        intent = intent_from_best_ask(
+            market, token_id, book, env_float("MAX_ORDER_USD", 100.0),
+            source="sports", event_id=observation.game_id, reason=candidate.reason,
+        )
+        if intent is None:
+            return
+        await runner.execute_directional(intent)
 
     while True:
         try:
@@ -409,13 +532,189 @@ async def run_sports_stream(executor: OfficialFOKExecutor, tracker: SportsStateT
             backoff = min(backoff * 2.0, 30.0)
 
 
+def _token_for_direction(market: BinaryMarket, direction: str) -> str:
+    normalized = str(direction or "").upper()
+    if normalized in {"BUY_NO", "SELL_MARKET", "NO"}:
+        return market.no_token_id
+    return market.yes_token_id
+
+
+async def run_macro_feed(runner: PaperMarketRunner, model: MacroEventModel, feed: JsonlMacroFeed) -> None:
+    interval = max(0.5, env_float("MACRO_POLL_SECONDS", 2.0))
+    live_ok = (not runner.live) or env_bool("ENABLE_MACRO_LIVE")
+    model.allow_execution = env_bool("ENABLE_MACRO_EXECUTION") and live_ok
+    while True:
+        await asyncio.sleep(interval)
+        now_ms = int(time.time() * 1000)
+        for release in feed.poll():
+            market_id = model.market_map.get(release.indicator, "")
+            market = runner.markets.get(market_id)
+            price = 0.5
+            book = None
+            if market:
+                book = runner.books.get(market.yes_token_id)
+                if book and book.best_ask():
+                    price = book.best_ask()[0]
+            if env_bool("ENABLE_CALIBRATION_AUTOTUNE") and runner.calibration:
+                model.apply_calibration()
+                if runner.edge_evaluator:
+                    runner.calibration.apply_recommended_edge(runner.edge_evaluator, model.strategy)
+            signal = model.predict(release, price, now_ms, market_id=market_id)
+            LOG.info(
+                "MACRO SIGNAL: %s %s | eligible=%s executable=%s edge=%.4f | %s",
+                signal.event_id, signal.market_id, signal.eligible, signal.executable,
+                signal.edge, signal.reason,
+            )
+            if not signal.executable or market is None or book is None:
+                continue
+            token_id = _token_for_direction(market, signal.direction)
+            intent = intent_from_best_ask(
+                market, token_id, runner.books.get(token_id), env_float("MAX_ORDER_USD", 100.0),
+                source="macro", event_id=signal.event_id, reason=signal.reason,
+            )
+            if intent:
+                await runner.execute_directional(intent)
+
+
+async def run_crypto_feed(runner: PaperMarketRunner, model: CryptoStatArbModel,
+                          feed: JsonlCryptoFeed) -> None:
+    interval = max(0.5, env_float("CRYPTO_POLL_SECONDS", 2.0))
+    live_ok = (not runner.live) or env_bool("ENABLE_CRYPTO_LIVE")
+    model.allow_execution = env_bool("ENABLE_CRYPTO_EXECUTION") and live_ok
+    while True:
+        await asyncio.sleep(interval)
+        now_ms = int(time.time() * 1000)
+        for quote in feed.poll():
+            market = runner.markets.get(quote.market_id)
+            if market is None:
+                continue
+            yes_book = runner.books.get(market.yes_token_id)
+            if not yes_book or not yes_book.synced or not yes_book.best_ask():
+                continue
+            observation = CryptoObservation(
+                quote.market_id, yes_book.best_ask()[0], quote.implied_probability, quote.timestamp_ms,
+            )
+            signal = model.observe(observation, now_ms, reference_timestamp_ms=quote.timestamp_ms)
+            LOG.info(
+                "CRYPTO SIGNAL: %s | z=%.3f %s %s eligible=%s executable=%s | %s",
+                signal.market_id, signal.zscore, signal.action, signal.direction,
+                signal.eligible, signal.executable, signal.reason,
+            )
+            if not signal.executable:
+                continue
+            if signal.action == "EXIT":
+                held = model.inventory.get(signal.market_id) or {}
+                token_id = held.get("token_id") or market.yes_token_id
+                book = runner.books.get(token_id)
+                shares = float(held.get("shares") or 0.0)
+                intent = intent_from_inventory_bid(
+                    market, token_id, book, shares,
+                    source="crypto", event_id=signal.market_id, reason=signal.reason,
+                )
+                if intent:
+                    result = await runner.execute_directional(intent)
+                    if result:
+                        model.mark_closed(signal.market_id)
+                continue
+            token_id = _token_for_direction(market, signal.direction)
+            intent = intent_from_best_ask(
+                market, token_id, runner.books.get(token_id), env_float("MAX_ORDER_USD", 100.0),
+                source="crypto", event_id=signal.market_id, reason=signal.reason,
+            )
+            if intent:
+                result = await runner.execute_directional(intent)
+                if result:
+                    model.mark_open(signal, token_id=token_id, shares=result.shares)
+
+
+async def run_health_loop(path: str, risk: Optional[LiveRiskController],
+                          journal: Optional[LiveOrderJournal],
+                          directional: Optional[LiveDirectionalJournal],
+                          stop: asyncio.Event) -> None:
+    interval = max(1.0, env_float("LIVE_HEALTH_INTERVAL_SECONDS", 5.0))
+    while not stop.is_set():
+        write_health(path, {
+            "status": "halted" if risk and risk.state.get("halted") else "running",
+            "halt_reason": (risk.state.get("halt_reason") if risk else ""),
+            "pair_exposure": journal.open_exposure() if journal else 0.0,
+            "directional_exposure": directional.open_exposure() if directional else 0.0,
+            "open_pairs": len(journal.incomplete_pairs()) if journal else 0,
+            "open_directional": len(directional.incomplete_trades()) if directional else 0,
+        })
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval)
+        except asyncio.TimeoutError:
+            continue
+
+
+def _install_stop_signal(stop: asyncio.Event) -> None:
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop.set)
+        except (NotImplementedError, RuntimeError):
+            signal.signal(sig, lambda *_: stop.set())
+
+
+def _parse_json_map(raw: str) -> dict:
+    raw = (raw or "").strip()
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _attach_research(runner: PaperMarketRunner, directional_journal: Optional[LiveDirectionalJournal]):
+    runner.calibration = CalibrationTracker(
+        min_samples=env_int("CALIBRATION_MIN_SAMPLES", 20),
+        path=os.getenv("CALIBRATION_PATH", "calibration.json"),
+    )
+    runner.edge_evaluator = EdgeEvaluator()
+    if env_bool("ENABLE_CALIBRATION_AUTOTUNE"):
+        for strategy in ("macro-event-v1", "crypto-spread-v1", "sports-latency-v1"):
+            runner.calibration.apply_recommended_edge(runner.edge_evaluator, strategy)
+    return runner.calibration
+
+
+def _research_tasks(runner: PaperMarketRunner, executor=None, directional=None) -> set:
+    tasks = set()
+    sports_map = SportsMarketMap(_parse_json_map(os.getenv("SPORTS_MARKET_MAP", "")))
+    if executor is not None and os.getenv("ENABLE_SPORTS_CHANNEL", "1") == "1":
+        tasks.add(asyncio.create_task(
+            run_sports_stream(executor, SportsStateTracker(), runner, sports_map, directional)
+        ))
+    macro_path = os.getenv("MACRO_FEED_PATH", "").strip()
+    macro_map = _parse_json_map(os.getenv("MACRO_MARKET_MAP", ""))
+    if macro_path:
+        model = MacroEventModel(
+            runner.calibration or CalibrationTracker(),
+            market_map=macro_map,
+            min_edge=env_float("MACRO_MIN_EDGE", 0.03),
+        )
+        tasks.add(asyncio.create_task(run_macro_feed(runner, model, JsonlMacroFeed(macro_path))))
+    crypto_path = os.getenv("CRYPTO_REFERENCE_FEED_PATH", "").strip()
+    if crypto_path:
+        model = CryptoStatArbModel(
+            runner.calibration or CalibrationTracker(),
+            allow_execution=env_bool("ENABLE_CRYPTO_EXECUTION") and ((not runner.live) or env_bool("ENABLE_CRYPTO_LIVE")),
+        )
+        tasks.add(asyncio.create_task(run_crypto_feed(runner, model, JsonlCryptoFeed(crypto_path))))
+    return tasks
+
+
 def main() -> int:
+    load_dotenv()
     parser = argparse.ArgumentParser(description="Polymarket deterministic binary arbitrage scanner")
     parser.add_argument("--live", action="store_true", help="Use the official FOK executor after explicit environment confirmation")
     parser.add_argument("--preflight", action="store_true", help="Run live account and journal checks without starting streams or placing orders")
     parser.add_argument("--markets", type=int, default=env_int("MARKET_LIMIT", 100))
     parser.add_argument("--ledger", default=os.getenv("PAPER_LEDGER", "paper-ledger.json"))
     parser.add_argument("--live-journal", default=os.getenv("LIVE_ORDER_JOURNAL", "live-orders.json"))
+    parser.add_argument("--directional-journal", default=os.getenv("LIVE_DIRECTIONAL_JOURNAL", "live-directional.json"))
+    parser.add_argument("--health", action="store_true", help="Print the local health snapshot and exit")
     parser.add_argument("--status", action="store_true", help="Print the local live journal summary and exit")
     parser.add_argument("--cash", type=float, default=env_float("PAPER_CASH", 1000.0))
     parser.add_argument("--max-order", type=float, default=env_float("MAX_ORDER_USD", 100.0))
@@ -425,8 +724,20 @@ def main() -> int:
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    health_path = os.getenv("LIVE_HEALTH_PATH", "live-health.json")
+    if args.health:
+        if not os.path.isfile(health_path):
+            print(json.dumps({"status": "missing", "path": health_path}, indent=2, sort_keys=True))
+            return 1
+        with open(health_path, encoding="utf-8") as handle:
+            print(handle.read())
+        return 0
     if args.status:
-        print(json.dumps(LiveOrderJournal(args.live_journal).summary(), indent=2, sort_keys=True))
+        payload = {
+            "pairs": LiveOrderJournal(args.live_journal).summary(),
+            "directional": LiveDirectionalJournal(args.directional_journal).summary(),
+        }
+        print(json.dumps(payload, indent=2, sort_keys=True))
         return 0
     if args.preflight and not args.live:
         LOG.error("--preflight must be combined with --live")
@@ -445,6 +756,7 @@ def main() -> int:
         safety_buffer_usd=args.buffer,
         max_order_usd=args.max_order,
         max_levels=env_int("LIVE_MAX_BOOK_LEVELS", 1) if args.live else None,
+        merge_gas_usd=env_float("MERGE_GAS_USD", 0.0),
     )
     if args.live:
         geoblock = requests.get("https://polymarket.com/api/geoblock", timeout=5).json()
@@ -454,7 +766,10 @@ def main() -> int:
 
         async def run_live() -> None:
             journal = LiveOrderJournal(args.live_journal)
-            executor = await OfficialFOKExecutor.create_from_env(journal=journal)
+            directional_journal = LiveDirectionalJournal(args.directional_journal)
+            executor = await OfficialFOKExecutor.create_from_env(
+                journal=journal, directional_journal=directional_journal,
+            )
             account = await executor.preflight(required_usd=0.01)
             risk = LiveRiskController(
                 journal,
@@ -465,20 +780,32 @@ def main() -> int:
                 max_market_exposure_fraction=env_float("LIVE_MAX_MARKET_EXPOSURE_FRACTION", 0.05),
                 max_open_pairs=env_int("LIVE_MAX_OPEN_PAIRS", 10),
                 max_daily_loss_usd=env_float("LIVE_MAX_DAILY_LOSS_USD", 0.0),
+                extra_journals=[directional_journal],
+                max_open_directional=env_int("LIVE_MAX_OPEN_DIRECTIONAL", 5),
             )
-            risk.check_startup()
+            directional = DirectionalExecutor(executor, directional_journal, risk=risk)
             try:
-                await executor.reconcile(stale_after_seconds=env_float("STALE_ORDER_SECONDS", 30.0))
+                risk.check_startup()
+            except RiskHaltError:
+                await executor.apply_halt_actions(risk)
+                raise
+            try:
+                await executor.reconcile(
+                    stale_after_seconds=env_float("STALE_ORDER_SECONDS", 30.0),
+                    scan_account=True,
+                )
             except asyncio.CancelledError:
                 raise
             except Exception as error:
                 risk.halt(f"startup live reconciliation failed: {error}")
+                await executor.apply_halt_actions(risk)
                 raise
             if args.preflight:
                 print(json.dumps({
                     "preflight": "ok",
                     "account": account,
                     "journal": journal.summary(),
+                    "directional": directional_journal.summary(),
                     "risk": risk.state,
                 }, indent=2, sort_keys=True))
                 await executor.close()
@@ -487,6 +814,10 @@ def main() -> int:
                 markets, args.ledger, args.cash, scanner, executor=executor,
                 risk_controller=risk,
             )
+            runner.directional_executor = directional
+            _attach_research(runner, directional_journal)
+            stop = asyncio.Event()
+            _install_stop_signal(stop)
             market_task = asyncio.create_task(
                 run_official_market_stream(executor, runner, list(runner.token_to_market))
             )
@@ -496,21 +827,35 @@ def main() -> int:
                     executor, risk, env_float("LIVE_RECONCILIATION_INTERVAL_SECONDS", 15.0)
                 )
             )
-            sports_task = None
-            if os.getenv("ENABLE_SPORTS_CHANNEL", "1") == "1":
-                sports_task = asyncio.create_task(run_sports_stream(executor, SportsStateTracker()))
-            tasks = {market_task, user_task, reconcile_task} | ({sports_task} if sports_task else set())
+            health_task = asyncio.create_task(
+                run_health_loop(health_path, risk, journal, directional_journal, stop)
+            )
+            tasks = {market_task, user_task, reconcile_task, health_task}
+            tasks |= _research_tasks(runner, executor, directional)
+            shutdown_task = asyncio.create_task(stop.wait())
             try:
                 done, pending = await asyncio.wait(
-                    tasks, return_when=asyncio.FIRST_EXCEPTION
+                    tasks | {shutdown_task}, return_when=asyncio.FIRST_COMPLETED
                 )
+                if shutdown_task in done:
+                    LOG.info("Shutdown signal received")
                 for task in done:
+                    if task is shutdown_task:
+                        continue
                     task.result()
             finally:
-                for task in tasks:
+                stop.set()
+                for task in tasks | {shutdown_task}:
                     if not task.done():
                         task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
+                await asyncio.gather(*tasks, shutdown_task, return_exceptions=True)
+                try:
+                    if risk.state.get("halted"):
+                        await executor.apply_halt_actions(risk)
+                    elif env_bool("LIVE_CANCEL_ON_SHUTDOWN", True):
+                        await executor.cancel_all_open_orders()
+                except Exception as flatten_error:
+                    LOG.critical("SHUTDOWN CANCEL-ALL FAILED: %s", flatten_error)
                 await executor.close()
 
         try:
@@ -522,10 +867,35 @@ def main() -> int:
             return 3
         return 0
 
-    runner = PaperMarketRunner(markets, args.ledger, args.cash, scanner)
-    token_ids = list(runner.token_to_market)
+    async def run_paper() -> None:
+        runner = PaperMarketRunner(markets, args.ledger, args.cash, scanner)
+        directional_journal = LiveDirectionalJournal(args.directional_journal)
+        runner.directional_executor = PaperDirectionalExecutor(directional_journal)
+        _attach_research(runner, directional_journal)
+        stop = asyncio.Event()
+        _install_stop_signal(stop)
+        health_task = asyncio.create_task(
+            run_health_loop(health_path, None, None, directional_journal, stop)
+        )
+        market_task = asyncio.create_task(run_market_stream(runner, list(runner.token_to_market)))
+        tasks = {market_task, health_task} | _research_tasks(runner)
+        shutdown_task = asyncio.create_task(stop.wait())
+        try:
+            done, pending = await asyncio.wait(
+                tasks | {shutdown_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if shutdown_task not in done:
+                for task in done:
+                    task.result()
+        finally:
+            stop.set()
+            for task in tasks | {shutdown_task}:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, shutdown_task, return_exceptions=True)
+
     try:
-        asyncio.run(run_market_stream(runner, token_ids))
+        asyncio.run(run_paper())
     except KeyboardInterrupt:
         LOG.info("Stopped")
     return 0

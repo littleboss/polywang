@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from arbitrage_bot import PaperMarketRunner, run_user_stream
+from arbitrage_bot import PaperMarketRunner, load_dotenv, run_user_stream, write_health
 from arbitrage_core import BinaryArbitrageScanner, BinaryMarket, UnhedgedPairError
 
 
@@ -63,6 +63,27 @@ class SettlementMappingTests(unittest.TestCase):
             with self.assertRaises(UnhedgedPairError):
                 asyncio.run(run_user_stream(executor, risk))
         self.assertIn("unhedged", risk.reason)
+
+    def test_load_dotenv_does_not_override_existing_env(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, ".env")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("POLYMARKET_LIVE_CONFIRM=from-file\nEXISTING_KEEP=file\n")
+            os.environ["EXISTING_KEEP"] = "process"
+            os.environ.pop("POLYMARKET_LIVE_CONFIRM", None)
+            load_dotenv(path)
+            self.assertEqual(os.environ.get("POLYMARKET_LIVE_CONFIRM"), "from-file")
+            self.assertEqual(os.environ.get("EXISTING_KEEP"), "process")
+            os.environ.pop("POLYMARKET_LIVE_CONFIRM", None)
+
+    def test_health_snapshot_is_written(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "live-health.json")
+            write_health(path, {"status": "running", "open_pairs": 0})
+            with open(path, encoding="utf-8") as handle:
+                payload = __import__("json").load(handle)
+            self.assertEqual(payload["status"], "running")
+            self.assertIn("updated_at", payload)
 
 
 if __name__ == "__main__":

@@ -57,6 +57,21 @@ def _category(raw: object) -> str:
     return aliases.get(value, value if value else "other")
 
 
+# Market-channel schema versions this process can apply. An unknown version is
+# a gap: the local book must be discarded rather than guessed into.
+KNOWN_MARKET_SCHEMA_VERSIONS = frozenset({"", "1", "1.0", "v1"})
+
+
+def _optional_int(value) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        numeric = int(float(value))
+    except (TypeError, ValueError):
+        return None
+    return numeric if numeric >= 0 else None
+
+
 @dataclass(frozen=True)
 class BinaryMarket:
     market_id: str
@@ -153,14 +168,29 @@ class BinaryMarket:
 
 
 class OrderBook:
-    """Local best-effort order book built from official market-channel events."""
+    """Local order book built from official market-channel events.
+
+    Incremental updates are fail-closed: a sequence gap, hash-chain break, or
+    unknown schema version discards the book. Trading on a book that missed an
+    update is worse than standing down until the next snapshot.
+    """
 
     def __init__(self):
         self.bids: Dict[float, float] = {}
         self.asks: Dict[float, float] = {}
         self.timestamp_ms: int = 0
         self.hash: str = ""
+        self.sequence: Optional[int] = None
+        self.schema_version: str = ""
         self.synced: bool = False
+        self.gap_reason: str = ""
+
+    def invalidate(self, reason: str = "unsynced") -> None:
+        """Drop resting levels so a partial book cannot be scanned."""
+        self.bids.clear()
+        self.asks.clear()
+        self.synced = False
+        self.gap_reason = str(reason or "unsynced")
 
     @staticmethod
     def _levels(levels: Iterable[dict]) -> Dict[float, float]:
@@ -176,11 +206,12 @@ class OrderBook:
         return result
 
     def replace_snapshot(self, event: dict) -> bool:
-        if not self._set_meta(event, allow_equal=True):
+        if not self._set_meta(event, allow_equal=True, is_snapshot=True):
             return False
         self.bids = self._levels(_response_value(event, "bids", default=()))
         self.asks = self._levels(_response_value(event, "asks", default=()))
         self.synced = True
+        self.gap_reason = ""
         return True
 
     def apply_change(self, side: str, price: float, size: float,
@@ -196,7 +227,7 @@ class OrderBook:
             return False
         if not (0.0 < price < 1.0):
             return False
-        if event and not self._set_meta(event, level_hash=level_hash, allow_equal=True):
+        if event and not self._set_meta(event, level_hash=level_hash, allow_equal=True, is_snapshot=False):
             return False
         if size <= 0.0:
             book.pop(price, None)
@@ -206,8 +237,42 @@ class OrderBook:
             self.hash = str(level_hash)
         return True
 
+    def _schema_ok(self, event: dict) -> bool:
+        raw = _response_value(event, "schema_version", "version", "clob_version", default="")
+        version = str(raw or "").strip()
+        if version and version not in KNOWN_MARKET_SCHEMA_VERSIONS:
+            self.invalidate(f"unsupported market-channel schema version {version!r}")
+            return False
+        if version:
+            self.schema_version = version
+        return True
+
+    def _sequence_ok(self, event: dict, is_snapshot: bool) -> bool:
+        sequence = _optional_int(_response_value(
+            event, "sequence", "seq", "event_sequence", default=None
+        ))
+        if sequence is None:
+            return True
+        if is_snapshot or self.sequence is None:
+            self.sequence = sequence
+            return True
+        if sequence == self.sequence or sequence == self.sequence + 1:
+            self.sequence = sequence
+            return True
+        self.invalidate(f"sequence gap: expected {self.sequence + 1}, got {sequence}")
+        return False
+
+    def _hash_chain_ok(self, event: dict, is_snapshot: bool) -> bool:
+        prev = _response_value(event, "prev_hash", "previous_hash", "parent_hash", default=None)
+        if is_snapshot or not prev or not self.hash:
+            return True
+        if str(prev) == str(self.hash):
+            return True
+        self.invalidate(f"hash chain break: local {self.hash} != prev {prev}")
+        return False
+
     def _set_meta(self, event: dict, level_hash: Optional[str] = None,
-                  allow_equal: bool = False) -> bool:
+                  allow_equal: bool = False, is_snapshot: bool = False) -> bool:
         try:
             raw_timestamp = _response_value(event, "timestamp", default=0)
             if hasattr(raw_timestamp, "timestamp"):
@@ -231,6 +296,12 @@ class OrderBook:
         except (TypeError, ValueError):
             return False
         if timestamp <= 0:
+            return False
+        if not self._schema_ok(event):
+            return False
+        if not self._sequence_ok(event, is_snapshot=is_snapshot):
+            return False
+        if not self._hash_chain_ok(event, is_snapshot=is_snapshot):
             return False
         raw_hash = level_hash if level_hash is not None else _response_value(event, "hash", default=None)
         if raw_hash:
@@ -275,6 +346,30 @@ class OrderBook:
             else:
                 self.asks[price] = remaining
 
+    def walk_bids(self, shares: float) -> Tuple[float, float, List[Tuple[float, float]]]:
+        """Return total proceeds, average price, and consumed bid (price, shares)."""
+        remaining = max(0.0, shares)
+        proceeds = 0.0
+        fills: List[Tuple[float, float]] = []
+        for price, available in self.bids_sorted():
+            if remaining <= 1e-12:
+                break
+            quantity = min(remaining, available)
+            proceeds += quantity * price
+            fills.append((price, quantity))
+            remaining -= quantity
+        filled = shares - remaining
+        return proceeds, (proceeds / filled if filled else 0.0), fills
+
+    def consume_bids(self, fills: Sequence[Tuple[float, float]]) -> None:
+        for price, quantity in fills:
+            available = self.bids.get(price, 0.0)
+            remaining = available - quantity
+            if remaining <= 1e-12:
+                self.bids.pop(price, None)
+            else:
+                self.bids[price] = remaining
+
 
 @dataclass
 class ArbitrageOpportunity:
@@ -303,6 +398,12 @@ class ArbitrageOpportunity:
     execution_capital_required: float
     book_timestamp_ms: int
     fingerprint: str
+    merge_gas_usd: float = 0.0
+    is_risk_free: bool = False
+    residual_risk: str = (
+        "sequential FOK legs are not atomic; a first-leg fill with a second-leg "
+        "failure is unwound with FAK and may slip, partially fill, or remain open"
+    )
 
     @property
     def capital_required(self) -> float:
@@ -316,12 +417,14 @@ class BinaryArbitrageScanner:
                  min_return: float = 0.002,
                  safety_buffer_usd: float = 0.02,
                  max_order_usd: float = 100.0,
-                 max_levels: Optional[int] = None):
+                 max_levels: Optional[int] = None,
+                 merge_gas_usd: float = 0.0):
         self.min_net_profit_usd = max(0.0, min_net_profit_usd)
         self.min_return = max(0.0, min_return)
         self.safety_buffer_usd = max(0.0, safety_buffer_usd)
         self.max_order_usd = max(0.01, max_order_usd)
         self.max_levels = max(1, int(max_levels)) if max_levels is not None else None
+        self.merge_gas_usd = max(0.0, float(merge_gas_usd))
 
     @staticmethod
     def _cost_for(book: OrderBook, shares: float,
@@ -351,6 +454,8 @@ class BinaryArbitrageScanner:
         # Negative-risk groups need their own complete-set and redemption
         # semantics. Do not infer them from a two-token price sum.
         if not market.active or market.neg_risk:
+            return None
+        if not yes_book.synced or not no_book.synced:
             return None
         yes_touch = yes_book.best_ask()
         no_touch = no_book.best_ask()
@@ -453,7 +558,7 @@ class BinaryArbitrageScanner:
                 + yes_execution_fee_cap + no_execution_fee_cap
             )
             gross = shares - yes_cost - no_cost
-            net = gross - yes_fee - no_fee - self.safety_buffer_usd
+            net = gross - yes_fee - no_fee - self.safety_buffer_usd - self.merge_gas_usd
             capital = yes_cost + no_cost + yes_fee + no_fee
             result = ArbitrageOpportunity(
                 market_id=market.market_id,
@@ -481,6 +586,8 @@ class BinaryArbitrageScanner:
                 execution_capital_required=execution_capital,
                 book_timestamp_ms=max(yes_book.timestamp_ms, no_book.timestamp_ms),
                 fingerprint=f"{market.market_id}:{yes_book.hash}:{no_book.hash}:{shares:.12f}",
+                merge_gas_usd=self.merge_gas_usd,
+                is_risk_free=False,
             )
             if result.net_profit >= self.min_net_profit_usd and result.return_on_capital >= self.min_return:
                 if best is None or result.net_profit > best.net_profit:
@@ -1159,6 +1266,448 @@ class LiveOrderJournal:
         return record
 
 
+class LiveDirectionalJournal:
+    """Atomic journal for single-leg BUY/SELL fills used by sports/macro/crypto.
+
+    Pair FOK execution stays on LiveOrderJournal. Directional inventory is
+    tracked here so account-wide recon can distinguish owned tokens from
+    unexplained leftovers, and so risk limits see both books of exposure.
+    """
+
+    TERMINAL_STATUSES = {"REJECTED", "CANCELLED", "FLATTENED"}
+    OPEN_STATUSES = {"PENDING", "OPEN", "PARTIAL", "UNKNOWN", "FILLED"}
+
+    def __init__(self, path: str):
+        self.path = path
+        self.state = {"trades": {}, "events": []}
+        self.load()
+
+    def load(self) -> None:
+        try:
+            with open(self.path, "r", encoding="utf-8") as handle:
+                loaded = json.load(handle)
+            if not isinstance(loaded, dict) or not isinstance(loaded.get("trades"), dict):
+                raise ValueError("missing trades")
+            self.state.update(loaded)
+            self.state.setdefault("events", [])
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError, TypeError) as error:
+            raise RuntimeError(f"Directional journal is unreadable: {self.path}") from error
+
+    def save(self) -> None:
+        directory = os.path.dirname(os.path.abspath(self.path)) or "."
+        os.makedirs(directory, exist_ok=True)
+        fd, temp_path = tempfile.mkstemp(prefix=".live-directional-", dir=directory, text=True)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(self.state, handle, indent=2, sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, self.path)
+        except Exception:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+            raise
+
+    def create(self, intent: "DirectionalIntent") -> str:
+        trade_id = f"{intent.source or 'dir'}:{intent.market_id}:{time.time_ns()}"
+        now = time.time()
+        notional = float(intent.shares) * float(intent.limit_price)
+        reserved = 0.0 if intent.side.upper() == "SELL" else max(0.0, notional + float(intent.fee_cap))
+        self.state["trades"][trade_id] = {
+            "trade_id": trade_id,
+            "market_id": intent.market_id,
+            "condition_id": intent.condition_id,
+            "token_id": intent.token_id,
+            "side": intent.side.upper(),
+            "order_type": (intent.order_type or "FOK").upper(),
+            "source": intent.source,
+            "event_id": intent.event_id,
+            "reason": intent.reason,
+            "requested_shares": float(intent.shares),
+            "limit_price": float(intent.limit_price),
+            "capital_reserved": reserved,
+            "order_id": "",
+            "order_status": "",
+            "matched_shares": 0.0,
+            "inventory_shares": 0.0,
+            "fill_details": {},
+            "status": "PENDING",
+            "created_at": now,
+            "updated_at": now,
+            "error": "",
+            "extra": dict(intent.extra or {}),
+        }
+        self.save()
+        return trade_id
+
+    def _record(self, trade_id: str) -> dict:
+        try:
+            return self.state["trades"][trade_id]
+        except KeyError as error:
+            raise KeyError(f"unknown directional trade: {trade_id}") from error
+
+    def update(self, trade_id: str, **changes) -> dict:
+        record = self._record(trade_id)
+        record.update(changes)
+        record["updated_at"] = time.time()
+        self.save()
+        return record
+
+    def incomplete_trades(self) -> List[dict]:
+        open_trades = []
+        for record in self.state["trades"].values():
+            status = str(record.get("status", ""))
+            if status in self.TERMINAL_STATUSES:
+                continue
+            if status == "FILLED" and str(record.get("side") or "").upper() == "SELL":
+                continue
+            open_trades.append(record)
+        return open_trades
+
+    def open_exposure(self) -> float:
+        total = 0.0
+        for record in self.incomplete_trades():
+            reserved = float(record.get("capital_reserved", 0.0))
+            if not math.isfinite(reserved) or reserved < 0.0:
+                raise RuntimeError(
+                    f"directional trade {record.get('trade_id', '')} has invalid capital reservation"
+                )
+            total += reserved
+        return total
+
+    def market_exposure(self, market_id: str) -> float:
+        total = 0.0
+        for record in self.incomplete_trades():
+            if str(record.get("market_id")) != str(market_id):
+                continue
+            reserved = float(record.get("capital_reserved", 0.0))
+            if not math.isfinite(reserved) or reserved < 0.0:
+                raise RuntimeError(
+                    f"directional trade {record.get('trade_id', '')} has invalid capital reservation"
+                )
+            total += reserved
+        return total
+
+    def known_order_ids(self) -> set:
+        known = set()
+        for record in self.state["trades"].values():
+            order_id = str(record.get("order_id") or "")
+            if order_id:
+                known.add(order_id)
+        return known
+
+    def known_inventory_token_ids(self) -> set:
+        known = set()
+        for token_id, shares in self.inventory_by_token().items():
+            if shares > 1e-8:
+                known.add(token_id)
+        return known
+
+    def inventory_by_token(self) -> Dict[str, float]:
+        inventory: Dict[str, float] = {}
+        for record in self.state["trades"].values():
+            token_id = str(record.get("token_id") or "")
+            if not token_id:
+                continue
+            matched = float(record.get("matched_shares") or 0.0)
+            if matched <= 1e-8:
+                continue
+            side = str(record.get("side") or "").upper()
+            if side == "BUY":
+                inventory[token_id] = inventory.get(token_id, 0.0) + matched
+            elif side == "SELL":
+                inventory[token_id] = inventory.get(token_id, 0.0) - matched
+        return {token: shares for token, shares in inventory.items() if abs(shares) > 1e-8}
+
+    def record_for_order(self, order_id: str) -> Optional[dict]:
+        order_id = str(order_id or "")
+        if not order_id:
+            return None
+        for record in self.state["trades"].values():
+            if str(record.get("order_id") or "") == order_id:
+                return record
+        return None
+
+    def set_order_id(self, trade_id: str, order_id: str) -> dict:
+        return self.update(trade_id, order_id=str(order_id))
+
+    def add_fill(self, trade_id: str, shares: float, fill_id: Optional[str] = None,
+                 price: Optional[float] = None, fee_usd: Optional[float] = None) -> dict:
+        record = self._record(trade_id)
+        shares = float(shares)
+        if not math.isfinite(shares) or shares < 0.0:
+            raise ValueError("fill shares must be finite and non-negative")
+        fill_id = str(fill_id or f"fill-{len(record.get('fill_details') or {}) + 1}")
+        details = record.setdefault("fill_details", {})
+        if fill_id not in details:
+            record["matched_shares"] = float(record.get("matched_shares") or 0.0) + shares
+            details[fill_id] = {
+                "shares": shares,
+                "price": None if price is None else float(price),
+                "fee_usd": 0.0 if fee_usd is None else float(fee_usd),
+            }
+        side = str(record.get("side") or "").upper()
+        if side == "BUY":
+            record["inventory_shares"] = float(record.get("matched_shares") or 0.0)
+        requested = float(record.get("requested_shares") or 0.0)
+        matched = float(record.get("matched_shares") or 0.0)
+        if matched + 1e-8 >= requested and requested > 0:
+            record["status"] = "FILLED"
+        elif matched > 1e-8:
+            record["status"] = "PARTIAL"
+        record["updated_at"] = time.time()
+        self.save()
+        return record
+
+    def integrity_issues(self) -> List[str]:
+        issues = []
+        seen_orders = {}
+        for record in self.state["trades"].values():
+            trade_id = str(record.get("trade_id") or "")
+            try:
+                reserved = float(record.get("capital_reserved", 0.0))
+            except (TypeError, ValueError):
+                reserved = float("nan")
+            if not math.isfinite(reserved) or reserved < 0.0:
+                issues.append(f"{trade_id} has invalid capital reservation")
+            try:
+                shares = float(record.get("requested_shares", 0.0))
+            except (TypeError, ValueError):
+                shares = float("nan")
+            if not math.isfinite(shares) or shares <= 0.0:
+                issues.append(f"{trade_id} has invalid requested shares")
+            if str(record.get("side") or "").upper() not in {"BUY", "SELL"}:
+                issues.append(f"{trade_id} has invalid side")
+            if not record.get("token_id"):
+                issues.append(f"{trade_id} has no token id")
+            order_id = str(record.get("order_id") or "")
+            if order_id:
+                previous = seen_orders.get(order_id)
+                if previous and previous != trade_id:
+                    issues.append(f"order {order_id} belongs to multiple directional trades")
+                seen_orders[order_id] = trade_id
+        return issues
+
+    def summary(self) -> dict:
+        return {
+            "trades": len(self.state["trades"]),
+            "open_trades": len(self.incomplete_trades()),
+            "open_exposure": self.open_exposure(),
+            "inventory": self.inventory_by_token(),
+        }
+
+
+@dataclass
+class DirectionalIntent:
+    """One-leg BUY or SELL that must not be jammed into the Yes+No pair FOK path."""
+
+    token_id: str
+    side: str
+    shares: float
+    limit_price: float
+    market_id: str = ""
+    condition_id: str = ""
+    order_type: str = "FOK"
+    source: str = ""
+    event_id: str = ""
+    reason: str = ""
+    fee_cap: float = 0.0
+    extra: dict = None
+
+    def __post_init__(self):
+        self.side = str(self.side or "").upper()
+        self.order_type = str(self.order_type or "FOK").upper()
+        if self.extra is None:
+            self.extra = {}
+
+    @property
+    def notional(self) -> float:
+        return float(self.shares) * float(self.limit_price)
+
+
+@dataclass
+class DirectionalResult:
+    trade_id: str
+    order_id: str
+    shares: float
+    status: str
+    side: str
+
+
+def intent_from_best_ask(market: BinaryMarket, token_id: str, book: OrderBook,
+                         max_order_usd: float, source: str, event_id: str = "",
+                         reason: str = "", order_type: str = "FOK",
+                         max_shares: Optional[float] = None) -> Optional[DirectionalIntent]:
+    """Size a BUY against the live best ask. Returns None if the book cannot fill."""
+    if not book or not book.synced:
+        return None
+    touch = book.best_ask()
+    if not touch:
+        return None
+    price, depth = touch
+    if price <= 0.0 or depth <= 0.0:
+        return None
+    budget_shares = float(max_order_usd) / price if price > 0 else 0.0
+    shares = min(depth, budget_shares)
+    if max_shares is not None:
+        shares = min(shares, float(max_shares))
+    if market.min_order_size > 0.0:
+        if shares + 1e-12 < market.min_order_size:
+            return None
+    if shares <= 1e-8:
+        return None
+    return DirectionalIntent(
+        token_id=str(token_id),
+        side="BUY",
+        shares=shares,
+        limit_price=price,
+        market_id=market.market_id,
+        condition_id=market.condition_id,
+        order_type=order_type,
+        source=source,
+        event_id=event_id,
+        reason=reason,
+    )
+
+
+def intent_from_inventory_bid(market: BinaryMarket, token_id: str, book: OrderBook,
+                              shares: float, source: str, event_id: str = "",
+                              reason: str = "", order_type: str = "FOK") -> Optional[DirectionalIntent]:
+    """Size a SELL of owned inventory against the live best bid."""
+    if not book or not book.synced or shares <= 1e-8:
+        return None
+    touch = book.best_bid()
+    if not touch:
+        return None
+    price, depth = touch
+    sell_shares = min(float(shares), depth)
+    if sell_shares <= 1e-8:
+        return None
+    return DirectionalIntent(
+        token_id=str(token_id),
+        side="SELL",
+        shares=sell_shares,
+        limit_price=price,
+        market_id=market.market_id,
+        condition_id=market.condition_id,
+        order_type=order_type,
+        source=source,
+        event_id=event_id,
+        reason=reason,
+    )
+
+
+class PaperDirectionalExecutor:
+    """Immediate paper fill for directional research/execution flags."""
+
+    def __init__(self, journal: LiveDirectionalJournal):
+        self.journal = journal
+
+    def execute(self, intent: DirectionalIntent) -> DirectionalResult:
+        if intent.shares <= 0.0 or intent.limit_price <= 0.0:
+            raise ValueError("cannot execute an empty directional intent")
+        if intent.side not in {"BUY", "SELL"}:
+            raise ValueError("directional side must be BUY or SELL")
+        trade_id = self.journal.create(intent)
+        self.journal.set_order_id(trade_id, f"paper-{trade_id}")
+        record = self.journal.add_fill(trade_id, intent.shares, fill_id=f"paper-{trade_id}",
+                                       price=intent.limit_price, fee_usd=0.0)
+        return DirectionalResult(
+            trade_id=trade_id,
+            order_id=str(record.get("order_id") or ""),
+            shares=float(record.get("matched_shares") or 0.0),
+            status=str(record.get("status") or ""),
+            side=intent.side,
+        )
+
+
+class DirectionalExecutor:
+    """Single-leg official CLOB execution, journaled separately from pair FOK."""
+
+    def __init__(self, client_executor: "OfficialFOKExecutor",
+                 journal: LiveDirectionalJournal,
+                 risk: Optional["LiveRiskController"] = None):
+        self.client_executor = client_executor
+        self.journal = journal
+        self.risk = risk
+
+    async def execute(self, intent: DirectionalIntent) -> DirectionalResult:
+        if intent.shares <= 0.0 or intent.limit_price <= 0.0:
+            raise ValueError("cannot execute an empty directional intent")
+        if intent.side not in {"BUY", "SELL"}:
+            raise ValueError("directional side must be BUY or SELL")
+        if intent.order_type not in {"FOK", "FAK"}:
+            raise ValueError("directional order type must be FOK or FAK")
+        if self.risk:
+            self.risk.check_directional(intent.notional + float(intent.fee_cap), intent.market_id)
+        if intent.side == "BUY":
+            await self.client_executor.preflight(required_usd=intent.notional + float(intent.fee_cap))
+            order_kwargs = {
+                "token_id": intent.token_id,
+                "side": "BUY",
+                "amount": f"{intent.notional:.6f}",
+                "max_spend": f"{intent.notional + float(intent.fee_cap):.6f}",
+                "max_price": f"{intent.limit_price:.6f}",
+                "order_type": intent.order_type,
+            }
+        else:
+            await self.client_executor.preflight(required_usd=0.0)
+            order_kwargs = {
+                "token_id": intent.token_id,
+                "side": "SELL",
+                "shares": f"{intent.shares:.6f}",
+                "min_price": f"{intent.limit_price:.6f}",
+                "order_type": intent.order_type,
+            }
+        trade_id = self.journal.create(intent)
+        try:
+            response = await self.client_executor._call("place_market_order", **order_kwargs)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            self.journal.update(trade_id, status="UNKNOWN", error=f"order outcome is unknown: {error}")
+            raise UnhedgedPairError(
+                "directional order outcome is unknown; reconcile before placing new orders"
+            ) from error
+        filled = _filled_shares(response, side=intent.side)
+        order_id = str(_response_value(response, "order_id", "orderID", default="") or "")
+        if order_id:
+            self.journal.set_order_id(trade_id, order_id)
+        if not _response_ok(response):
+            self.journal.update(
+                trade_id, status="REJECTED",
+                error=str(_response_value(response, "message", "errorMsg", default="directional order rejected")),
+            )
+            raise RuntimeError(
+                f"directional {intent.side} {intent.order_type} rejected: "
+                f"{_response_value(response, 'message', 'errorMsg', default='unknown error')}"
+            )
+        if filled is None or filled <= 1e-8:
+            self.journal.update(trade_id, status="REJECTED", error="response did not confirm a fill")
+            raise RuntimeError("directional response did not confirm a fill")
+        if intent.order_type == "FOK" and filled + 1e-8 < intent.shares:
+            self.journal.update(trade_id, status="REJECTED", error="FOK did not fill in full")
+            raise RuntimeError("directional FOK did not fill in full")
+        economics = _trade_fill_economics(response)
+        record = self.journal.add_fill(
+            trade_id, filled, fill_id=order_id or "placement",
+            price=economics["price"] if economics["price"] is not None else intent.limit_price,
+            fee_usd=economics["fee_usd"],
+        )
+        return DirectionalResult(
+            trade_id=trade_id,
+            order_id=order_id,
+            shares=float(record.get("matched_shares") or 0.0),
+            status=str(record.get("status") or ""),
+            side=intent.side,
+        )
+
+
 class LiveRiskController:
     """Persistent fail-closed gate for live order admission.
 
@@ -1174,8 +1723,12 @@ class LiveRiskController:
                  max_total_exposure_fraction: float = 0.25,
                  max_market_exposure_fraction: float = 0.05,
                  max_open_pairs: int = 10,
-                 max_daily_loss_usd: float = 0.0):
+                 max_daily_loss_usd: float = 0.0,
+                 extra_journals: Optional[Sequence[LiveDirectionalJournal]] = None,
+                 max_open_directional: int = 5):
         self.journal = journal
+        self.extra_journals = list(extra_journals or [])
+        self.max_open_directional = max(0, int(max_open_directional))
         self.equity_usd = float(equity_usd)
         self.state_path = state_path
         self.kill_switch_path = kill_switch_path
@@ -1198,6 +1751,9 @@ class LiveRiskController:
             "last_balance_usd": None,
             "last_allowance_usd": None,
             "last_account_snapshot_at": None,
+            "flatten_required": False,
+            "flatten_completed": False,
+            "flatten_result": {},
         }
         self.load()
         self._roll_day()
@@ -1246,6 +1802,8 @@ class LiveRiskController:
     def halt(self, reason: str) -> None:
         self.state["halted"] = True
         self.state["halt_reason"] = str(reason)
+        if not self.state.get("flatten_completed"):
+            self.state["flatten_required"] = True
         self.save()
 
     def record_realized_pnl(self, pnl_usd: float) -> None:
@@ -1261,9 +1819,20 @@ class LiveRiskController:
         self.state["last_account_snapshot_at"] = time.time()
         self.save()
 
+    def extra_exposure(self) -> float:
+        return sum(journal.open_exposure() for journal in self.extra_journals)
+
+    def extra_market_exposure(self, market_id: str) -> float:
+        return sum(journal.market_exposure(market_id) for journal in self.extra_journals)
+
+    def extra_open_count(self) -> int:
+        return sum(len(journal.incomplete_trades()) for journal in self.extra_journals)
+
     def check_startup(self) -> None:
         self._roll_day()
-        issues = self.journal.integrity_issues()
+        issues = list(self.journal.integrity_issues())
+        for extra in self.extra_journals:
+            issues.extend(extra.integrity_issues())
         if issues:
             self.halt("live journal integrity failure: " + "; ".join(issues))
             raise RiskHaltError(self.state["halt_reason"])
@@ -1317,18 +1886,48 @@ class LiveRiskController:
             self.halt("daily loss limit reached")
             raise RiskHaltError(self.state["halt_reason"])
 
+    def poll_kill_switch(self) -> bool:
+        """Halt if the operator file or env flag appears after startup."""
+        if self.state.get("halted"):
+            return True
+        if os.getenv("POLYMARKET_KILL_SWITCH", "").strip() == "1":
+            self.halt("POLYMARKET_KILL_SWITCH=1")
+            return True
+        if self.kill_switch_path and os.path.exists(self.kill_switch_path):
+            self.halt(f"kill-switch file exists: {self.kill_switch_path}")
+            return True
+        return False
+
     def check(self, opportunity: ArbitrageOpportunity) -> None:
         self.check_startup()
         records = self.journal.incomplete_pairs()
         required = float(opportunity.execution_capital_required)
-        total = self.journal.open_exposure()
-        market = self.journal.market_exposure(opportunity.market_id)
+        total = self.journal.open_exposure() + self.extra_exposure()
+        market = self.journal.market_exposure(opportunity.market_id) + self.extra_market_exposure(opportunity.market_id)
         if len(records) >= self.max_open_pairs:
             raise RiskHaltError("maximum number of open live pairs reached")
         if total + required > self.equity_usd * self.max_total_exposure_fraction + 1e-9:
             raise RiskHaltError("live total exposure limit")
         if market + required > self.equity_usd * self.max_market_exposure_fraction + 1e-9:
             raise RiskHaltError("live market exposure limit")
+
+    def check_directional(self, notional: float, market_id: str = "") -> None:
+        """Admit a single-leg trade against the same live exposure budget."""
+        self.check_startup()
+        required = float(notional)
+        if not math.isfinite(required) or required < 0.0:
+            raise RiskHaltError("directional notional is invalid")
+        if self.max_open_directional <= 0:
+            raise RiskHaltError("directional execution is disabled by risk limits")
+        if self.extra_open_count() >= self.max_open_directional:
+            raise RiskHaltError("maximum number of open directional trades reached")
+        total = self.journal.open_exposure() + self.extra_exposure()
+        if total + required > self.equity_usd * self.max_total_exposure_fraction + 1e-9:
+            raise RiskHaltError("live total exposure limit")
+        if market_id:
+            market = self.journal.market_exposure(market_id) + self.extra_market_exposure(market_id)
+            if market + required > self.equity_usd * self.max_market_exposure_fraction + 1e-9:
+                raise RiskHaltError("live market exposure limit")
 
 
 @dataclass
@@ -1440,17 +2039,20 @@ class OfficialFOKExecutor:
     def __init__(self, client, rollback_min_price: float = 0.0001,
                  journal: Optional[LiveOrderJournal] = None,
                  max_retries: int = 3, auto_merge: bool = False,
-                 auto_redeem: bool = True):
+                 auto_redeem: bool = True,
+                 directional_journal: Optional[LiveDirectionalJournal] = None):
         self.client = client
         self.rollback_min_price = max(0.0001, min(1.0, rollback_min_price))
         self.journal = journal
+        self.directional_journal = directional_journal
         self.max_retries = max(0, int(max_retries))
         self.auto_merge = bool(auto_merge)
         self.auto_redeem = bool(auto_redeem)
         self.user_stream_healthy = False
 
     @classmethod
-    async def create_from_env(cls, journal: Optional[LiveOrderJournal] = None):
+    async def create_from_env(cls, journal: Optional[LiveOrderJournal] = None,
+                              directional_journal: Optional[LiveDirectionalJournal] = None):
         private_key = os.getenv("POLYMARKET_PRIVATE_KEY", "").strip()
         if not private_key or private_key.lower().startswith("your_"):
             raise RuntimeError("POLYMARKET_PRIVATE_KEY is missing or is still a placeholder")
@@ -1466,6 +2068,7 @@ class OfficialFOKExecutor:
         return cls(
             client,
             journal=journal,
+            directional_journal=directional_journal,
             auto_merge=os.getenv("AUTO_MERGE_COMPLETE_SETS", "0") == "1",
             auto_redeem=os.getenv("AUTO_REDEEM_RESOLVED_POSITIONS", "1") == "1",
         )
@@ -1548,13 +2151,21 @@ class OfficialFOKExecutor:
         return {"balance": balance, "allowance": allowance}
 
     async def reconcile(self, stale_after_seconds: float = 30.0,
-                        recover_orphans: bool = True) -> List[dict]:
-        """Re-read unfinished pairs and optionally scan for orphaned orders."""
+                        recover_orphans: bool = True,
+                        scan_account: Optional[bool] = None) -> List[dict]:
+        """Re-read unfinished pairs and optionally scan the whole account.
+
+        Known-pair recovery is not enough: an external order, leftover
+        conditional-token balance, or unexplained collateral move is inventory
+        this process does not own and must not trade around.
+        """
         if not self.journal:
             return []
         issues = self.journal.integrity_issues()
         if issues:
             raise UnhedgedPairError("live journal integrity failure: " + "; ".join(issues))
+        if scan_account is None:
+            scan_account = recover_orphans
         conditions = sorted({
             str(record.get("condition_id", ""))
             for record in self.journal.incomplete_pairs()
@@ -1563,8 +2174,10 @@ class OfficialFOKExecutor:
         open_orders: Dict[str, object] = {}
         account_trades: List[object] = []
         trade_watermarks = self.journal.state.setdefault("trade_watermarks", {})
+        if scan_account:
+            open_orders.update(await self._list_open_orders())
         for condition_id in conditions:
-            if recover_orphans:
+            if recover_orphans and not scan_account:
                 open_orders.update(await self._list_open_orders(market=condition_id))
             after = self._trade_query_after(condition_id, trade_watermarks)
             account_trades.extend(
@@ -1657,6 +2270,8 @@ class OfficialFOKExecutor:
                 raise UnhedgedPairError(f"pair {record['pair_id']} is not fully hedged after reconciliation")
             await self._reconcile_conditional_balances(refreshed)
             reconciled.append(refreshed)
+        if scan_account:
+            await self._reconcile_external_account_state(open_orders)
         return reconciled
 
     def _recover_orphan_order_ids(self, open_orders: Dict[str, object],
@@ -2031,6 +2646,165 @@ class OfficialFOKExecutor:
                     f"{balance:.8f}, below required {required:.8f}"
                 )
 
+    async def _list_positions(self) -> List[object]:
+        """Best-effort account position list; missing SDK methods skip the scan."""
+        for name in ("list_positions", "get_positions", "get_current_positions"):
+            method = getattr(self.client, name, None)
+            if method is None:
+                continue
+            result = method()
+            result = await result if inspect.isawaitable(result) else result
+            if isinstance(result, (list, tuple)):
+                return list(result)
+            if isinstance(result, dict):
+                items = result.get("data", result.get("positions", result.get("items", [])))
+                if isinstance(items, (list, tuple)):
+                    return list(items)
+        return []
+
+    def _known_live_order_ids(self) -> set[str]:
+        known = set()
+        if self.journal:
+            for record in self.journal.incomplete_pairs():
+                for field in ("yes_order_id", "no_order_id"):
+                    order_id = str(record.get(field) or "")
+                    if order_id:
+                        known.add(order_id)
+        if self.directional_journal:
+            known |= self.directional_journal.known_order_ids()
+        return known
+
+    def _known_live_token_ids(self) -> set[str]:
+        known = set()
+        if self.journal:
+            for record in self.journal.incomplete_pairs():
+                for field in ("yes_token_id", "no_token_id"):
+                    token_id = str(record.get(field) or "")
+                    if token_id:
+                        known.add(token_id)
+        if self.directional_journal:
+            known |= self.directional_journal.known_inventory_token_ids()
+        return known
+
+    async def _reconcile_external_account_state(self, open_orders: Dict[str, object]) -> None:
+        """Halt when the account holds orders or tokens this journal does not own."""
+        known_orders = self._known_live_order_ids()
+        external_orders = sorted(order_id for order_id in open_orders if order_id not in known_orders)
+        if external_orders:
+            raise UnhedgedPairError(
+                "account has open orders outside the live journal: " + ", ".join(external_orders)
+            )
+        known_tokens = self._known_live_token_ids()
+        external_positions = []
+        for position in await self._list_positions():
+            token_id = str(_response_value(position, "token_id", "asset_id", "assetId", default="") or "")
+            size = _numeric_value(position, "size", "balance", "shares", "position")
+            if not token_id or size is None or size <= 1e-8:
+                continue
+            if token_id not in known_tokens:
+                external_positions.append(f"{token_id}:{size}")
+        if external_positions:
+            raise UnhedgedPairError(
+                "account has conditional-token inventory outside the live journal: "
+                + ", ".join(external_positions)
+            )
+
+    async def cancel_all_open_orders(self) -> List[str]:
+        """Cancel every resting order; missing IDs are an error, not a skip."""
+        cancelled: List[str] = []
+        cancel_all = getattr(self.client, "cancel_all_orders", None) or getattr(self.client, "cancel_all", None)
+        if cancel_all is not None:
+            result = cancel_all()
+            result = await result if inspect.isawaitable(result) else result
+            if isinstance(result, (list, tuple)):
+                cancelled.extend(str(item) for item in result)
+            elif isinstance(result, dict):
+                items = result.get("cancelled", result.get("order_ids", result.get("orders", [])))
+                if isinstance(items, (list, tuple)):
+                    cancelled.extend(str(item) for item in items)
+        orders = await self._list_open_orders()
+        remaining = [order_id for order_id in orders if order_id not in set(cancelled)]
+        for order_id in remaining:
+            await self._call("cancel_order", order_id=order_id)
+            cancelled.append(order_id)
+        leftover = await self._list_open_orders()
+        if leftover:
+            raise UnhedgedPairError(
+                "open orders remain after cancel-all: " + ", ".join(sorted(leftover))
+            )
+        return cancelled
+
+    async def _inventory_snapshot(self) -> dict:
+        snapshot = {
+            "open_orders": [],
+            "pairs": [],
+            "conditional_balances": [],
+        }
+        try:
+            snapshot["open_orders"] = sorted(await self._list_open_orders())
+        except Exception as error:
+            snapshot["open_orders_error"] = str(error)
+        if self.journal:
+            for record in self.journal.incomplete_pairs():
+                snapshot["pairs"].append({
+                    "pair_id": record.get("pair_id"),
+                    "status": record.get("status"),
+                    "yes_matched_shares": record.get("yes_matched_shares"),
+                    "no_matched_shares": record.get("no_matched_shares"),
+                    "error": record.get("error", ""),
+                })
+                for leg in ("yes", "no"):
+                    token_id = str(record.get(f"{leg}_token_id") or "")
+                    if not token_id:
+                        continue
+                    try:
+                        balance = await self._conditional_balance(token_id)
+                        snapshot["conditional_balances"].append({
+                            "token_id": token_id, "shares": balance, "leg": leg,
+                            "pair_id": record.get("pair_id"),
+                        })
+                    except Exception as error:
+                        snapshot["conditional_balances"].append({
+                            "token_id": token_id, "error": str(error), "leg": leg,
+                            "pair_id": record.get("pair_id"),
+                        })
+        if self.directional_journal:
+            snapshot["directional"] = self.directional_journal.summary()
+            snapshot["directional_inventory"] = self.directional_journal.inventory_by_token()
+        return snapshot
+
+    async def flatten_on_halt(self, reason: str) -> dict:
+        """Cancel resting orders and snapshot leftover inventory. Do not dump fills."""
+        cancelled = await self.cancel_all_open_orders()
+        inventory = await self._inventory_snapshot()
+        result = {
+            "reason": str(reason),
+            "cancelled_order_ids": cancelled,
+            "inventory": inventory,
+            "note": "matched inventory is not auto-sold; residual pairs need manual handling",
+        }
+        if self.journal:
+            self.journal.state["halt_inventory"] = result
+            self.journal.save()
+        return result
+
+    async def apply_halt_actions(self, risk: "LiveRiskController") -> dict:
+        """Run cancel-all once after a persisted halt, then leave inventory for review."""
+        if not risk.state.get("halted"):
+            return {}
+        if risk.state.get("flatten_completed") and not risk.state.get("flatten_required"):
+            return dict(risk.state.get("flatten_result") or {})
+        result = await self.flatten_on_halt(risk.state.get("halt_reason") or "live risk halt")
+        risk.state["flatten_required"] = False
+        risk.state["flatten_completed"] = True
+        risk.state["flatten_result"] = {
+            "cancelled_order_ids": result.get("cancelled_order_ids", []),
+            "open_orders": result.get("inventory", {}).get("open_orders", []),
+            "pairs": result.get("inventory", {}).get("pairs", []),
+        }
+        risk.save()
+        return result
+
     def _update_pair_status(self, record: dict) -> dict:
         requested = float(record["requested_shares"])
         yes = float(record["yes_matched_shares"])
@@ -2058,10 +2832,43 @@ class OfficialFOKExecutor:
         self.journal.save()
         return record
 
+    def _handle_directional_user_event(self, record: dict, event, event_type: str) -> dict:
+        """Apply a user-stream fill to a directional trade. BUY and SELL are both valid."""
+        trade_id = str(record["trade_id"])
+        event_side = str(_response_value(event, "side", default="") or "").upper()
+        expected = str(record.get("side") or "").upper()
+        if event_side and expected and event_side != expected:
+            raise UnhedgedPairError(
+                f"directional event {record.get('order_id')} has unexpected side {event_side}"
+            )
+        event_token = str(_response_value(event, "token_id", "asset_id", "assetId", default="") or "")
+        if event_token and event_token != str(record.get("token_id") or ""):
+            raise UnhedgedPairError(
+                f"directional event {record.get('order_id')} has unexpected token {event_token}"
+            )
+        matched = _filled_shares(event, side=expected or event_side)
+        if event_type == "trade" or _response_value(event, "trade_id", "tradeId", default=None) is not None:
+            fill_id = _response_value(event, "trade_id", "tradeId", "id", default=None)
+            if matched is None:
+                matched = _response_value(event, "size", "amount", default=None)
+            if matched is not None:
+                economics = _trade_fill_economics(event)
+                return self.directional_journal.add_fill(
+                    trade_id, float(matched), str(fill_id) if fill_id else None,
+                    price=economics["price"], fee_usd=economics["fee_usd"],
+                )
+        elif matched is not None:
+            return self.directional_journal.add_fill(trade_id, float(matched))
+        if event_type == "order":
+            order_status = _response_value(event, "status", "state", default=None)
+            if order_status is not None:
+                return self.directional_journal.update(
+                    trade_id, order_status=str(order_status).upper()
+                )
+        return self.directional_journal._record(trade_id)
+
     def handle_user_event(self, event) -> Optional[dict]:
-        """Apply one order/trade event and return the affected pair."""
-        if not self.journal:
-            return None
+        """Apply one order/trade event and return the affected pair or directional trade."""
         if isinstance(event, dict):
             event = event.get("data", event)
         event_type = str(_response_value(event, "event_type", "type", default="")).lower()
@@ -2070,6 +2877,12 @@ class OfficialFOKExecutor:
             event = payload
         order_id = _response_value(event, "order_id", "orderID", "orderId", "taker_order_id", "id", default="")
         token_id = str(_response_value(event, "token_id", "asset_id", "assetId", default=""))
+        if self.directional_journal and order_id:
+            directional = self.directional_journal.record_for_order(order_id)
+            if directional is not None:
+                return self._handle_directional_user_event(directional, event, event_type)
+        if not self.journal:
+            return None
         record = self.journal.pair_for_order(order_id) if order_id else None
         # A token can be present in multiple unrelated account orders. Never
         # attribute a user event by token alone; REST reconciliation can recover

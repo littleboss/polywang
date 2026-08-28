@@ -11,22 +11,26 @@ Polymarket 确定性二元套利与钱包流量情报机器人。
 pip install requests websockets
 
 # 跑单元测试
-python3 -m unittest -v test_polymarket_edge test_arbitrage_core test_arbitrage_bot test_whale_intelligence test_market_replay test_sports_channel test_predictive_models
+python3 -m unittest -v test_polymarket_edge test_arbitrage_core test_arbitrage_bot test_whale_intelligence test_market_replay test_sports_channel test_predictive_models test_directional_executor
 ```
 
 历史盘口回放使用 Gamma 市场 JSON 和原始 CLOB 事件 JSONL，并复用线上同一套盘口/手续费/深度扫描逻辑：
 
 ```bash
-python3 market_replay.py --markets markets.json --events market-events.jsonl --consume-fills
+python3 market_replay.py --markets fixtures/replay/markets.json --events fixtures/replay/events.jsonl --consume-fills
 ```
+
+仓库自带 `fixtures/replay/` 作为可提交的示例数据集。回放会按事件里的 `fee_rate_bps` 回填费率，并用排队/拒单/第二腿失败模型估计成交；`executed_net_profit` 仍然是模拟值。
 
 live 或 paper 运行时设置 `MARKET_EVENT_LOG=market-events.jsonl` 可记录收到的 raw/typed market event、源类型和本机接收时间，之后可直接作为盘口回放输入。记录器只保存事件，不会把订单响应或成交假设写成历史成交；成交真实性仍需单独保存 `live-orders.json` 并做对账。
 
 回放结果只是“按记录盘口可见的机会报告”，还需要用真实订单回报校验成交率、延迟、拒单和实际手续费，不能把回放净收益直接当成可实现 PnL。启用 `--consume-fills` 和执行延迟后，`executed_net_profit` 只代表通过模拟深度、价格上限和新鲜度检查的回放成交；顶层 `net_profit` 仍是所有可见信号的汇总，不能替代真实 PnL。
 
-`sports_channel.py` 提供官方 Sports Channel 消费器和保守的延迟闸门。live 模式默认启动该频道（可用 `ENABLE_SPORTS_CHANNEL=0` 关闭观测）；它要求体育事件源时间戳、盘口时间戳、比赛 live 状态和新状态变化同时满足，缺少时间戳时只记录观察，不生成下单信号。当前体育事件仍不会绕过 deterministic Yes/No 风控直接下单。
+`sports_channel.py` 在默认配置下只记日志。设置 `ENABLE_SPORTS_EXECUTION=1`（实盘还需 `ENABLE_SPORTS_LIVE=1`）、`SPORTS_MARKET_MAP` 以及通过校准/边际闸门后，候选会走独立的方向性 BUY 执行器，而不是 Yes+No 组合 FOK。
 
-`macro_model.py` 和 `crypto_model.py` 只提供带时间戳的预测信号接口，不会自动下单。两者都要求通过持久化 `CalibrationTracker` 获得最小样本和样本外 Brier 证据；没有独立数据源、真实结算回填和回放结果时，信号保持不可交易。
+`macro_model.py` 从 `MACRO_FEED_PATH` JSONL 读取带时间戳的 actual/consensus/std，按 `event_id` 去重，并可用 `MACRO_MARKET_MAP` 绑定指标到市场。`crypto_model.py` 从 `CRYPTO_REFERENCE_FEED_PATH` 读取独立参考概率，或用 spot/strike/vol/T 计算数字期权 `N(d2)`；进入对侧 Polymarket token，退出用 SELL 平自有库存，不用 CEX 期货对冲。两者默认 `executable=false`，只有显式执行开关、样本外校准和风控限额同时满足才会下单。
+
+启动时会读取本地 `.env`（不覆盖已有环境变量）。模板见 `.env.example`。实盘循环会写 `live-health.json`；`python3 arbitrage_bot.py --health` 可查看。收到 SIGINT/SIGTERM 时，默认 `LIVE_CANCEL_ON_SHUTDOWN=1` 会撤销未完成订单。方向性库存记在 `live-directional.json`，计入同一套暴露限额。
 
 ## 确定性二元套利引擎
 
@@ -36,7 +40,7 @@ live 或 paper 运行时设置 `MARKET_EVENT_LOG=market-events.jsonl` 可记录�
 python3 arbitrage_bot.py --markets 100 --cash 1000
 ```
 
-它只研究 Yes 和 No 两腿同时买入后合计支付 1.00 的二元市场。机会必须使用订单簿中的实际 ask 和深度，并覆盖两腿 taker 费用、资金安全缓冲和最大仓位；纸面成交写入 `paper-ledger.json`，程序重启后会恢复账本。
+它只研究 Yes 和 No 两腿同时买入后合计支付 1.00 的二元市场。机会必须使用订单簿中的实际 ask 和深度，并覆盖两腿 taker 费用、可选 merge gas（`MERGE_GAS_USD`）、资金安全缓冲和最大仓位；纸面成交写入 `paper-ledger.json`，程序重启后会恢复账本。两腿仍是顺序 FOK，不是原子交易，`is_risk_free` 恒为 false。
 
 新引擎只有在显式设置 `POLYMARKET_LIVE_CONFIRM=I_UNDERSTAND_THE_RISK`、官方 geoblock 放行、私钥存在且 `polymarket-client` 可用时，才会使用两腿 FOK 执行器。安装和验证官方客户端后才考虑运行：
 
@@ -53,9 +57,9 @@ POLYMARKET_LIVE_CONFIRM=I_UNDERSTAND_THE_RISK \
   .venv/bin/python arbitrage_bot.py --live --preflight --markets 20
 ```
 
-实盘启动顺序是：地理限制检查 → 官方 SDK 账户 preflight → 读取未完成 pair 的 open order / account trades / order 状态 → 核验两腿 conditional-token 余额 → 启动官方 typed market stream、私有 user stream 和持续对账任务。市场流断线后会废弃本地盘口，必须重新收到快照才恢复扫描；持续对账失败会持久化风险 halt。实盘 pair 日志默认写入 `live-orders.json`，也可用 `--live-journal PATH` 指定。日志会保存 pair ID、condition/token ID、两腿订单 ID、请求数量、已确认成交数量、实际成交价格、手续费字段、trade ID、交易哈希、回滚状态和 `PENDING/HEDGED/RESOLVED_PENDING_REDEMPTION/SETTLED/UNHEDGED` 状态。
+实盘启动顺序是：地理限制检查 → 官方 SDK 账户 preflight → 读取未完成 pair 的 open order / account trades / order 状态 → 核验两腿 conditional-token 余额 → 启动官方 typed market stream、私有 user stream 和持续对账任务。市场流断线后会废弃本地盘口，必须重新收到快照才恢复扫描；增量若出现 sequence 断档、hash 链断裂或未知 schema 版本，同样会清空该 token 的盘口。持续对账失败会持久化风险 halt，并撤销账户内全部 open order。启动及定期恢复轮次会扫描 journal 之外的 open order 和条件 token 持仓。实盘 pair 日志默认写入 `live-orders.json`，也可用 `--live-journal PATH` 指定。日志会保存 pair ID、condition/token ID、两腿订单 ID、请求数量、已确认成交数量、实际成交价格、手续费字段、trade ID、交易哈希、回滚状态和 `PENDING/HEDGED/RESOLVED_PENDING_REDEMPTION/SETTLED/UNHEDGED` 状态。
 
-实盘还会从 `live-risk.json` 恢复风险状态。默认总暴露上限为账户权益的 25%，单市场上限为 5%，最多 10 个未结 pair；可分别用 `LIVE_MAX_TOTAL_EXPOSURE_FRACTION`、`LIVE_MAX_MARKET_EXPOSURE_FRACTION`、`LIVE_MAX_OPEN_PAIRS` 和 `LIVE_RISK_EQUITY_USD` 配置。User Stream 负责实时成交回报，REST 对账默认每 15 秒检查已知订单、增量成交和余额，并每 `LIVE_FULL_RECOVERY_CYCLES` 轮（默认 20 轮）做一次 open-order 孤儿恢复；启动时仍会做完整恢复。创建 `live-kill-switch` 文件，或设置 `POLYMARKET_KILL_SWITCH=1`，会持久化停止新单；清除文件不会自动解除已经持久化的 halt，必须人工检查 `live-risk.json` 后再决定是否恢复。已提交但等待超时的 merge/redeem 交易会在后续对账中查询其原 transaction ID/hash，确认成功后自动完成账本，绝不会重新提交。
+实盘还会从 `live-risk.json` 恢复风险状态。默认总暴露上限为账户权益的 25%，单市场上限为 5%，最多 10 个未结 pair；可分别用 `LIVE_MAX_TOTAL_EXPOSURE_FRACTION`、`LIVE_MAX_MARKET_EXPOSURE_FRACTION`、`LIVE_MAX_OPEN_PAIRS` 和 `LIVE_RISK_EQUITY_USD` 配置。User Stream 负责实时成交回报，REST 对账默认每 15 秒检查已知订单、增量成交和余额，并每 `LIVE_FULL_RECOVERY_CYCLES` 轮（默认 20 轮）做一次 open-order 孤儿恢复；启动时仍会做完整恢复。创建 `live-kill-switch` 文件，或设置 `POLYMARKET_KILL_SWITCH=1`，会持久化停止新单并撤销所有未完成订单；已成交库存不会自动市价甩卖。清除文件不会自动解除已经持久化的 halt，必须人工检查 `live-risk.json` 后再决定是否恢复。已提交但等待超时的 merge/redeem 交易会在后续对账中查询其原 transaction ID/hash，确认成功后自动完成账本，绝不会重新提交。
 
 两腿中的第一腿成交而第二腿失败时，程序会使用 FAK 反向平掉第一腿；如果回滚不完整，或私有 user stream / 重启对账发现一条腿成交而另一条腿不足，程序会停止并要求人工对账。`HEDGED` 只表示两腿成交数量均已被确认，市场结算后才变成 `SETTLED`；订单被接受不等于成交。425 matching-engine restart 会有限次数退避重试，503 cancel-only/post-only 状态不会盲目重试。
 
@@ -179,10 +183,11 @@ fee = 股数 × 费率 × p × (1 - p)      # 只对 taker 收取，maker 免费
 | `arbitrage_core.py` | 二元套利扫描、账本、官方 FOK 执行、对账和订单状态机 |
 | `polymarket_edge.py` | 费率模型、边际评估、凯利仓位、校准跟踪、NegRisk 扫描 |
 | `whale_intelligence.py` | 钱包过滤、历史质量、质量加权净流向、结算反馈和持久化 |
-| `market_replay.py` | JSONL 盘口历史回放与机会统计 |
-| `sports_channel.py` | Sports Channel 消费与时间戳延迟闸门 |
-| `macro_model.py` | 宏观事件 surprise 概率模型与校准闸门 |
-| `crypto_model.py` | crypto 市场概率价差 z-score 模型与校准闸门 |
+| `market_replay.py` | JSONL 盘口历史回放、成交模型与费率回填 |
+| `sports_channel.py` | Sports Channel 消费、延迟闸门、映射与可选方向性执行 |
+| `macro_model.py` | 宏观 JSONL 数据源、surprise 模型、去重与校准闸门 |
+| `crypto_model.py` | 参考概率/数字期权适配、z-score、库存与 SELL 平仓 |
+| `.env.example` | 可部署环境变量模板（不含密钥） |
 | `test_*.py` | 单元测试，只用标准库、不联网 |
 
 ## 修改代码时的注意事项

@@ -1,0 +1,4 @@
+{"asks":[{"price":"0.40","size":"10"}],"asset_id":"yes","bids":[],"event_type":"book","hash":"y1","received_at_ms":1700000000000,"sequence":1,"timestamp":"1700000000000"}
+{"asks":[{"price":"0.40","size":"10"}],"asset_id":"no","bids":[],"event_type":"book","hash":"n1","received_at_ms":1700000000000,"sequence":1,"timestamp":"1700000000000"}
+{"asset_id":"yes","event_type":"last_trade_price","fee_rate_bps":0,"price":"0.40","received_at_ms":1700000000500,"sequence":2,"size":"1","timestamp":"1700000000500"}
+{"event_type":"price_change","prev_hash":"y1","price_changes":[{"asset_id":"yes","hash":"y2","price":"0.39","side":"SELL","size":"10"}],"received_at_ms":1700000001000,"sequence":2,"timestamp":"1700000001000"}
