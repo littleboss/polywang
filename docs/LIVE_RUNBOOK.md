@@ -32,7 +32,11 @@ uv run polywang --status --live-journal live-orders.json \
 
 ## 首次小额实盘
 
-建议从极小的 `MAX_ORDER_USD`、单市场暴露和总暴露开始，并保留默认的 `LIVE_MAX_BOOK_LEVELS=1`。用 `MERGE_GAS_USD` 把预计 merge 的 gas 计入扫描净收益。先关闭 `AUTO_MERGE_COMPLETE_SETS`，确认双腿成交、User Stream、撤单、回滚、持续对账和条件 token 余额都正常后，再单独验证小额 merge。两腿 FOK 不是原子成交，不能称为无风险套利。
+选市不再只按 24h 成交量。程序先拉一个更大的活跃市场池（`MARKET_SCAN_POOL`，默认 `max(limit×5, 100)`），再按 **1 tick 错价在扣完 taker 费后还剩多少** 排序：geopolitics（0 费率）和已经走到 0.90+ 的市场排在 0.50 附近的 politics 前面。NegRisk 多结果市场只记日志，不会进入双腿 FOK。
+
+建议从极小的 `MAX_ORDER_USD`、单市场暴露和总暴露开始，并保留默认的 `LIVE_MAX_BOOK_LEVELS=1`。**小额阶段请保持 `AUTO_MERGE_COMPLETE_SETS=0`**：merge 的 gas 是固定成本，`$5` 单子上 `$0.30` gas 就会把 1 tick 的 geopolitics 利润吃掉。只有你实测过一笔 merge 的链上费用后，才把数字填进 `MERGE_GAS_USD` 并打开自动 merge。扫描净收益已经会减掉这个数字；填 `0` 同时又开 merge，等于把成本藏起来。
+
+两腿 FOK 不是原子成交，不能称为无风险套利。先关闭自动 merge，确认双腿成交、User Stream、撤单、回滚、持续对账和条件 token 余额都正常后，再单独验证小额 merge。
 
 实盘需要显式设置：
 

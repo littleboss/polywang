@@ -493,6 +493,110 @@ class NegRiskScanner:
         )
 
 
+@dataclass(frozen=True)
+class ComboUniverseScore:
+    """How many 0.01-style ticks of Yes+No mispricing a market needs after fees.
+
+    Combo arb is a discrete-tick game. Politics at 0.50 needs three ticks;
+    geopolitics and 0.95 politics need one. Ranking by this number, not by
+    volume, is what raises the chance of seeing a tradeable book.
+    """
+    ticks_to_breakeven: int
+    one_tick_net: float
+    favourite_price: float
+    fee_per_set: float
+    implied_yes: Optional[float]
+    price_known: bool
+
+    def sort_key(self) -> tuple:
+        # Unknown mid-prices are scored at p=0.50 (worst-case fee) and sorted last
+        # among equal tick counts so we do not promote a market we cannot locate.
+        return (
+            0 if self.price_known else 1,
+            self.ticks_to_breakeven,
+            -self.one_tick_net,
+            -self.favourite_price,
+        )
+
+
+def combo_arb_universe_score(category: str, implied_yes: Optional[float] = None,
+                             tick_size: float = 0.01,
+                             taker_fee_rate: Optional[float] = None,
+                             fee_exponent: float = 1.0) -> ComboUniverseScore:
+    """Score a binary market for 1-tick combo-arb viability. No network."""
+    tick = float(tick_size) if tick_size and math.isfinite(float(tick_size)) and tick_size > 0 else 0.01
+    price_known = False
+    try:
+        price = float(implied_yes) if implied_yes is not None else None
+    except (TypeError, ValueError):
+        price = None
+    if price is not None and math.isfinite(price) and 0.0 < price < 1.0:
+        price_known = True
+    else:
+        price = 0.50
+    fee_model = PolymarketFeeModel(
+        category, taker_fee_rate=taker_fee_rate, fee_exponent=fee_exponent,
+    )
+    fee_per_set = fee_model.fee_per_share(price, is_taker=True) + fee_model.fee_per_share(
+        1.0 - price, is_taker=True,
+    )
+    one_tick_net = tick - fee_per_set
+    if fee_per_set <= 1e-12:
+        ticks = 1
+    else:
+        ticks = int(math.floor(fee_per_set / tick + 1e-12)) + 1
+    return ComboUniverseScore(
+        ticks_to_breakeven=max(1, ticks),
+        one_tick_net=one_tick_net,
+        favourite_price=max(price, 1.0 - price),
+        fee_per_set=fee_per_set,
+        implied_yes=price if price_known else None,
+        price_known=price_known,
+    )
+
+
+def rank_combo_arb_markets(markets: Sequence) -> list:
+    """Stable-rank binary markets by combo-arb tick distance, then 1-tick net."""
+    scored = []
+    for index, market in enumerate(markets):
+        implied = getattr(market, "implied_yes", None)
+        score = combo_arb_universe_score(
+            getattr(market, "category", "other"),
+            implied_yes=implied,
+            tick_size=getattr(market, "tick_size", 0.01) or 0.01,
+            taker_fee_rate=getattr(market, "taker_fee_rate", None),
+            fee_exponent=getattr(market, "fee_exponent", 1.0) or 1.0,
+        )
+        scored.append((score.sort_key(), index, market, score))
+    scored.sort(key=lambda item: (item[0], item[1]))
+    return [item[2] for item in scored]
+
+
+def merge_gas_clears_at_order_usd(max_order_usd: float, merge_gas_usd: float,
+                                  net_per_share: float = 0.01) -> bool:
+    """True when a 1-tick geopolitics-sized margin can still pay chain gas."""
+    if merge_gas_usd <= 1e-12:
+        return True
+    if max_order_usd <= 0.0 or net_per_share <= 0.0:
+        return False
+    return max_order_usd * net_per_share + 1e-12 >= merge_gas_usd
+
+
+def merge_gas_startup_warning(merge_gas_usd: float, max_order_usd: float,
+                              auto_merge: bool) -> Optional[str]:
+    if auto_merge and merge_gas_usd <= 1e-12:
+        return (
+            "AUTO_MERGE_COMPLETE_SETS is on but MERGE_GAS_USD is 0; "
+            "scan PnL will treat chain merge as free"
+        )
+    if merge_gas_usd > 1e-12 and not merge_gas_clears_at_order_usd(max_order_usd, merge_gas_usd):
+        return (
+            f"MERGE_GAS_USD={merge_gas_usd:.4f} exceeds a 1-tick geopolitics margin "
+            f"at MAX_ORDER_USD={max_order_usd:.2f}; those orders cannot clear gas"
+        )
+    return None
+
+
 @dataclass
 class StrategyCalibration:
     """Accuracy record for one signal source."""

@@ -31,6 +31,45 @@ def _json_list(value):
     return value if isinstance(value, list) else []
 
 
+def _gamma_yes_price(payload: dict, outcomes: Optional[list] = None) -> Optional[float]:
+    """Best-effort Yes probability from a Gamma market object. Missing is None."""
+    names = outcomes if outcomes is not None else _json_list(payload.get("outcomes"))
+    prices = _json_list(payload.get("outcomePrices", payload.get("outcome_prices")))
+    if len(names) != 2 or len(prices) != 2:
+        return None
+    try:
+        by_outcome = {
+            str(outcome).strip().lower(): float(price)
+            for outcome, price in zip(names, prices)
+        }
+    except (TypeError, ValueError):
+        return None
+    price = by_outcome.get("yes")
+    if price is None or not math.isfinite(price) or not (0.0 < price < 1.0):
+        return None
+    return price
+
+
+def _gamma_outcome_prices(payload: dict) -> Optional[Dict[str, float]]:
+    names = _json_list(payload.get("outcomes"))
+    prices = _json_list(payload.get("outcomePrices", payload.get("outcome_prices")))
+    if len(names) < 3 or len(names) != len(prices):
+        return None
+    parsed: Dict[str, float] = {}
+    for name, price in zip(names, prices):
+        try:
+            numeric = float(price)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(numeric) or numeric < 0.0:
+            return None
+        label = str(name).strip()
+        if not label:
+            return None
+        parsed[label] = numeric
+    return parsed if parsed else None
+
+
 def _as_bool(value: object, default: bool = False) -> bool:
     if isinstance(value, bool):
         return value
@@ -87,6 +126,7 @@ class BinaryMarket:
     tick_size: float = 0.01
     taker_fee_rate: Optional[float] = None
     fee_exponent: float = 1.0
+    implied_yes: Optional[float] = None
 
     @classmethod
     def from_gamma(cls, payload: dict) -> Optional["BinaryMarket"]:
@@ -164,6 +204,7 @@ class BinaryMarket:
             tick_size=tick_size,
             taker_fee_rate=fee_rate,
             fee_exponent=fee_exponent,
+            implied_yes=_gamma_yes_price(payload, outcomes),
         )
 
 
