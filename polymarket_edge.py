@@ -39,38 +39,199 @@ CATEGORY_TAKER_FEE_RATES: Dict[str, float] = {
     "geopolitics": 0.0,
 }
 
+# Maker rebate share per category, as a fraction of the taker fee paid on the
+# other side of the fill. Makers pay nothing and collect part of what the taker
+# paid, which is why patience is worth real money here.
+CATEGORY_MAKER_REBATE_SHARES: Dict[str, float] = {
+    "crypto": 0.20,
+    "sports": 0.15,
+    "economics": 0.25,
+    "culture": 0.25,
+    "weather": 0.25,
+    "other": 0.25,
+    "general": 0.25,
+    "finance": 0.25,
+    "politics": 0.25,
+    "tech": 0.25,
+    "mentions": 0.25,
+    "geopolitics": 0.0,
+}
+
+# Everyday names for the market types this bot trades, mapped to the category
+# whose fee schedule actually applies. US macro releases (CPI, payrolls, FOMC,
+# GDP) settle under Economics; anything keyed to a coin price is Crypto.
+CATEGORY_ALIASES: Dict[str, str] = {
+    # US macro
+    "us_macro": "economics",
+    "us-macro": "economics",
+    "usmacro": "economics",
+    "macro": "economics",
+    "cpi": "economics",
+    "inflation": "economics",
+    "fed": "economics",
+    "fomc": "economics",
+    "interest_rates": "economics",
+    "rates": "economics",
+    "nfp": "economics",
+    "payrolls": "economics",
+    "jobs": "economics",
+    "unemployment": "economics",
+    "gdp": "economics",
+    "recession": "economics",
+    # Crypto
+    "btc": "crypto",
+    "bitcoin": "crypto",
+    "eth": "crypto",
+    "ethereum": "crypto",
+    "sol": "crypto",
+    "solana": "crypto",
+    "coin": "crypto",
+    "crypto_prices": "crypto",
+    "digital_assets": "crypto",
+    # Common spellings of existing categories
+    "sport": "sports",
+    "soccer": "sports",
+    "football": "sports",
+    "basketball": "sports",
+    "politics_us": "politics",
+    "election": "politics",
+    "geopolitical": "geopolitics",
+    "world_events": "geopolitics",
+    "technology": "tech",
+    "stocks": "finance",
+    "equities": "finance",
+    "earnings": "finance",
+}
+
 DEFAULT_CATEGORY = "other"
 
 # Fees below this round to zero on the platform.
 MIN_CHARGEABLE_FEE_USDC = 0.00001
 
 
+def resolve_category(name: Optional[str]) -> str:
+    """
+    Maps a free-form market label onto the category whose fee schedule applies.
+
+    Getting this wrong is not cosmetic. Crypto is charged at 0.07 and Politics at
+    0.04, so mislabelling a market misprices every trade in it by nearly a factor
+    of two.
+    """
+    if not name:
+        return DEFAULT_CATEGORY
+    key = name.strip().lower().replace(" ", "_")
+    if key in CATEGORY_TAKER_FEE_RATES:
+        return key
+    return CATEGORY_ALIASES.get(key, DEFAULT_CATEGORY)
+
+
+def fee_rate_from_bps(basis_points) -> float:
+    """
+    Converts a basis-point fee rate into the decimal the fee formula expects.
+
+    The CLOB `/fee-rate` endpoint returns `base_fee` in basis points, so 700 means
+    0.07. Forgetting the division inflates every fee by 10,000x and the bot will
+    refuse every trade it sees.
+
+    Not to be confused with `feeRateBps` in an order payload, which is a ceiling
+    on what the venue may ever charge rather than the rate actually applied.
+    """
+    return float(basis_points) / 10000.0
+
+
 class PolymarketFeeModel:
     """
     The platform's real fee schedule.
 
-    Two properties matter for strategy design and neither survives a flat
+    Three properties matter for strategy design and none survives a flat
     percentage approximation:
 
     1. The fee is quadratic in price, peaking at p = 0.50 and vanishing at both
        extremes. As a share of notional it is `feeRate x (1 - p)`.
-    2. Makers pay nothing. Crossing the spread is a choice with a price tag, so
-       any edge that is not time-critical should be captured with a resting
-       limit order instead.
+    2. Makers pay nothing and are rebated part of what the taker paid. Crossing
+       the spread is a choice with a price tag, so any edge that is not
+       time-critical should be captured with a resting limit order instead.
+    3. The rate is per-market, not per-category. Individual markets can run with
+       fees disabled entirely, so a bot that hardcodes the category table will
+       reject perfectly good trades in them. Prefer `from_market_data` when the
+       live schedule is available and treat the table as the fallback.
     """
 
-    def __init__(self, category: str = DEFAULT_CATEGORY, maker_rebate_share: float = 0.0):
-        self.category = (category or DEFAULT_CATEGORY).strip().lower()
-        self.taker_fee_rate = CATEGORY_TAKER_FEE_RATES.get(self.category, CATEGORY_TAKER_FEE_RATES[DEFAULT_CATEGORY])
-        self.maker_rebate_share = maker_rebate_share
+    def __init__(self,
+                 category: str = DEFAULT_CATEGORY,
+                 maker_rebate_share: Optional[float] = None,
+                 taker_fee_rate: Optional[float] = None,
+                 price_exponent: float = 1.0,
+                 fees_enabled: bool = True,
+                 taker_only: bool = True):
+        self.category = resolve_category(category)
+        self.taker_fee_rate = (
+            CATEGORY_TAKER_FEE_RATES[self.category] if taker_fee_rate is None else float(taker_fee_rate)
+        )
+        self.maker_rebate_share = (
+            CATEGORY_MAKER_REBATE_SHARES.get(self.category, 0.0)
+            if maker_rebate_share is None else float(maker_rebate_share)
+        )
+        # The venue exposes an exponent on the price component. It is 1 today,
+        # which reproduces the documented p x (1 - p) curve, but it is a market
+        # parameter rather than a constant.
+        self.price_exponent = float(price_exponent)
+        self.fees_enabled = bool(fees_enabled)
+        self.taker_only = bool(taker_only)
+
+    @classmethod
+    def from_market_data(cls, market: Dict, fallback_category: str = DEFAULT_CATEGORY) -> "PolymarketFeeModel":
+        """
+        Builds a fee model from a Gamma market payload.
+
+        Reads `feesEnabled` and `feeSchedule` when present and falls back to the
+        category table otherwise, so this is safe to call on partial data.
+        """
+        trading = market.get("trading") if isinstance(market.get("trading"), dict) else market
+        schedule = trading.get("feeSchedule") or {}
+        category = resolve_category(market.get("category") or fallback_category)
+
+        fees_enabled = trading.get("feesEnabled")
+        if fees_enabled is None:
+            fees_enabled = True
+
+        rate = schedule.get("rate")
+        return cls(
+            category=category,
+            taker_fee_rate=float(rate) if rate is not None else None,
+            maker_rebate_share=float(schedule["rebateRate"]) if schedule.get("rebateRate") is not None else None,
+            price_exponent=float(schedule.get("exponent", 1.0)),
+            fees_enabled=bool(fees_enabled),
+            taker_only=bool(schedule.get("takerOnly", True)),
+        )
 
     def fee_usd(self, shares: float, price: float, is_taker: bool = True) -> float:
         """Total fee in USDC for a fill of `shares` at `price`."""
-        if not is_taker or self.taker_fee_rate <= 0.0:
+        if not self.fees_enabled or self.taker_fee_rate <= 0.0:
             return 0.0
+        if not is_taker and self.taker_only:
+            return 0.0
+
         price = _clamp(price, 0.0, 1.0)
-        fee = abs(shares) * self.taker_fee_rate * price * (1.0 - price)
+        price_component = price * (1.0 - price)
+        if self.price_exponent != 1.0:
+            price_component = price_component ** self.price_exponent
+
+        fee = abs(shares) * self.taker_fee_rate * price_component
         return 0.0 if fee < MIN_CHARGEABLE_FEE_USDC else fee
+
+    def maker_rebate_usd(self, shares: float, price: float) -> float:
+        """
+        What a resting order collects when a taker crosses into it.
+
+        Makers do not merely avoid the fee, they are paid a share of it, so the
+        gap between working an order and crossing the spread is wider than the
+        taker fee alone suggests.
+        """
+        if not self.fees_enabled:
+            return 0.0
+        taker_fee = self.fee_usd(shares, price, is_taker=True)
+        return taker_fee * self.maker_rebate_share
 
     def fee_per_share(self, price: float, is_taker: bool = True) -> float:
         return self.fee_usd(1.0, price, is_taker=is_taker)
