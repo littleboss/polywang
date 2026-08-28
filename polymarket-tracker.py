@@ -48,8 +48,11 @@ from polymarket_edge import (
     CalibrationTracker,
     EdgeEvaluator,
     PolymarketFeeModel,
+    resolve_category,
     walk_order_book,
 )
+from polymarket_crypto import CryptoLatencyEngine, RealisedVolatility
+from polymarket_macro import ScheduledEventGuard
 
 # Configure logger
 logging.basicConfig(
@@ -110,8 +113,19 @@ CONFIG = {
     "PAPER_TRADING": env_bool("PAPER_TRADING", True),
     "INITIAL_BALANCE": env_value("INITIAL_BALANCE", 1000.0, float),
     # Fees follow the published schedule, fee = C x rate x p x (1 - p), and the
-    # rate depends on the market category. Only takers pay.
+    # rate depends on the market category. Only takers pay. Everyday labels such
+    # as "us_macro", "cpi", "btc" or "eth" are resolved to the category whose
+    # schedule actually applies.
     "MARKET_CATEGORY": env_value("MARKET_CATEGORY", "sports", str),
+    # Crypto markets are priced from spot rather than from a goal model, so these
+    # only matter when MARKET_CATEGORY resolves to crypto.
+    "CRYPTO_VOL_SAMPLE_SECS": env_value("CRYPTO_VOL_SAMPLE_SECS", 60.0, float),
+    "CRYPTO_VOL_ERROR": env_value("CRYPTO_VOL_ERROR", 0.25, float),
+    "CRYPTO_MIN_SPOT_MOVE_PCT": env_value("CRYPTO_MIN_SPOT_MOVE_PCT", 0.002, float),
+    # Scheduled macro releases are a microsecond race this bot cannot win, so it
+    # stands aside around them rather than being the slow side of the trade.
+    "MACRO_BLACKOUT_BEFORE_SECS": env_value("MACRO_BLACKOUT_BEFORE_SECS", 120.0, float),
+    "MACRO_BLACKOUT_AFTER_SECS": env_value("MACRO_BLACKOUT_AFTER_SECS", 300.0, float),
     "SLIPPAGE_PCT": env_value("SLIPPAGE_PCT", 0.005, float),            # fallback when no book depth is available
     # Minimum net edge per dollar deployed that must survive fees before we trade [2].
     "MIN_NET_PROFIT_MARGIN": env_value(["MIN_NET_PROFIT_MARGIN", "MIN_ARBITRAGE_EDGE_PCT"], 0.02, float),
@@ -568,6 +582,24 @@ class UnifiedPolymarketBot:
         # only sounds confident can be told apart from one that is right.
         self.calibration = CalibrationTracker()
 
+        self.category = resolve_category(CONFIG["MARKET_CATEGORY"])
+
+        # Crypto markets have an observable underlying, so their fair value comes
+        # from a digital option on spot rather than from the sports goal model.
+        self.crypto_engine = CryptoLatencyEngine(
+            volatility_estimator=RealisedVolatility(
+                sample_interval_seconds=CONFIG["CRYPTO_VOL_SAMPLE_SECS"]),
+            min_spot_move_pct=CONFIG["CRYPTO_MIN_SPOT_MOVE_PCT"],
+            volatility_error=CONFIG["CRYPTO_VOL_ERROR"],
+        )
+        # Macro releases land on a published schedule, so there is no latency gap
+        # to exploit, only a race against colocated systems. The guard keeps the
+        # bot out of it.
+        self.event_guard = ScheduledEventGuard(
+            blackout_seconds_before=CONFIG["MACRO_BLACKOUT_BEFORE_SECS"],
+            blackout_seconds_after=CONFIG["MACRO_BLACKOUT_AFTER_SECS"],
+        )
+
     def check_geographic_compliance(self):
         """Checks for US geolocation block explicitly mentioned in the podcast [7]."""
         logger.info("Checking connection geographic compliance...")
@@ -872,6 +904,54 @@ class UnifiedPolymarketBot:
                 return True
         return False
 
+    def process_crypto_spot(self, spot_price, timestamp=None):
+        """Feeds a spot observation into the volatility estimator and the engine."""
+        self.crypto_engine.update_spot(spot_price)
+
+    def process_crypto_market(self, market_id, market_title, strike, days_to_expiry,
+                              outcome="Yes", now=None):
+        """
+        Prices a crypto contract off spot and trades it if the book has not caught up.
+
+        The counterpart of `process_sports_event`, but with the fair value coming
+        from a digital option rather than a goal model, and with the model's own
+        volatility uncertainty setting the position size. Where the sports engine
+        times out a fixed window after a goal, here there is no discrete event to
+        time from, so the trigger is the size of the spot move together with a book
+        that has not moved since.
+        """
+        now = time.time() if now is None else now
+        self.market_names.setdefault(market_id, market_title)
+
+        market_price = self.token_prices[market_id].get(outcome)
+        if market_price is None:
+            return
+
+        seconds_still = max(0.0, now - self.last_book_update_ts.get(market_id, now))
+        dislocation = self.crypto_engine.evaluate(
+            market_id=market_id, strike=strike, market_price=market_price,
+            days_to_expiry=days_to_expiry, seconds_since_book_moved=seconds_still,
+        )
+        if dislocation is None or dislocation.edge <= 0:
+            return
+
+        logger.info(f"₿ [CRYPTO DISLOCATION] {market_title}: {dislocation.describe()}")
+
+        self._dispatch_and_trade(
+            market_id=market_id,
+            market_title=market_title,
+            raw_outcome=outcome,
+            current_price=market_price,
+            target_outcome=outcome,
+            signals={"crypto_spot_dislocation": {"msg": dislocation.describe()}},
+            # Volatility uncertainty, not signal enthusiasm, decides how much of
+            # this the bot is willing to believe.
+            confidence=int(round(60 + 40 * dislocation.confidence)),
+            target_probability=dislocation.fair_probability,
+            days_to_resolution=days_to_expiry,
+        )
+        self.crypto_engine.reset_reference()
+
     def update_book_quote(self, market_id, market_title, outcome, price, timestamp=None):
         """
         Applies an order-book quote update that did not come from a trade.
@@ -969,6 +1049,13 @@ class UnifiedPolymarketBot:
         logger.info(f"===========================================================\n")
 
         if not actionable_trade:
+            return
+
+        # Around a scheduled release our fills are the ones faster participants
+        # declined, so the expected value is negative before fees are counted.
+        blackout = self.event_guard.status()
+        if blackout.in_blackout:
+            logger.warning(f"⏸️  [RELEASE BLACKOUT] Standing down on '{market_title}': {blackout.reason}")
             return
 
         # A strategy that has proven itself worse than a coin flip does not get to

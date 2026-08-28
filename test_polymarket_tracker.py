@@ -10,9 +10,11 @@ Run with:  python3 -m unittest -v test_polymarket_tracker
 """
 
 import importlib.util
+import math
 import os
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -43,6 +45,11 @@ DEFAULT_CONFIG = {
     "PAPER_TRADING": True,
     "INITIAL_BALANCE": 1000.0,
     "MARKET_CATEGORY": "sports",
+    "CRYPTO_VOL_SAMPLE_SECS": 60.0,
+    "CRYPTO_VOL_ERROR": 0.25,
+    "CRYPTO_MIN_SPOT_MOVE_PCT": 0.002,
+    "MACRO_BLACKOUT_BEFORE_SECS": 120.0,
+    "MACRO_BLACKOUT_AFTER_SECS": 300.0,
     "SLIPPAGE_PCT": 0.005,
     "MIN_NET_PROFIT_MARGIN": 0.02,
     "MIN_ARBITRAGE_EDGE_PCT": 0.02,
@@ -417,6 +424,84 @@ class ExecutionIntegrationTests(TrackerTestCase):
                 days_to_resolution=0.05,
             )
         execute_buy.assert_called_once()
+
+
+class CategoryIntegrationTests(TrackerTestCase):
+    config_overrides = {"MARKET_CATEGORY": "btc"}
+
+    def test_category_alias_reaches_the_fee_model(self):
+        bot = self.make_bot()
+        self.assertEqual(bot.category, "crypto")
+        self.assertAlmostEqual(bot.portfolio.fee_model.taker_fee_rate, 0.07)
+
+    def test_a_scheduled_release_blocks_execution(self):
+        bot = self.make_bot()
+        bot.market_names["m1"] = "CPI above 3%"
+        bot.token_prices["m1"]["Yes"] = 0.45
+        bot.event_guard.schedule("cpi", time.time())
+
+        with mock.patch.object(bot.portfolio, "execute_buy") as execute_buy:
+            bot._dispatch_and_trade(
+                market_id="m1", market_title="CPI above 3%", raw_outcome="Yes",
+                current_price=0.45, target_outcome="Yes",
+                signals={"latency": {"msg": "signal"}},
+                confidence=95, target_probability=0.80, days_to_resolution=0.05,
+            )
+        execute_buy.assert_not_called()
+
+    def test_execution_resumes_once_the_release_window_has_passed(self):
+        bot = self.make_bot()
+        bot.market_names["m1"] = "CPI above 3%"
+        bot.token_prices["m1"]["Yes"] = 0.45
+        bot.event_guard.schedule("cpi", time.time() - 3600)
+
+        with mock.patch.object(bot.portfolio, "execute_buy") as execute_buy:
+            bot._dispatch_and_trade(
+                market_id="m1", market_title="CPI above 3%", raw_outcome="Yes",
+                current_price=0.45, target_outcome="Yes",
+                signals={"latency": {"msg": "signal"}},
+                confidence=95, target_probability=0.80, days_to_resolution=0.05,
+            )
+        execute_buy.assert_called_once()
+
+    def test_crypto_market_trades_off_spot_rather_than_a_goal_model(self):
+        import random
+        bot = self.make_bot()
+        bot.update_book_quote("btc-120k", "BTC above $120k", "Yes", 0.30, timestamp=1000.0)
+
+        random.seed(5)
+        price = 118_000.0
+        for _ in range(200):
+            price *= math.exp(random.choice([0.0008, -0.0008]))
+            bot.process_crypto_spot(price)
+        bot.crypto_engine.reset_reference()
+
+        # Spot rips through the strike; the book is still quoting 0.30.
+        bot.process_crypto_spot(price * 1.05)
+
+        with mock.patch.object(bot.portfolio, "execute_buy", return_value=True) as execute_buy:
+            bot.process_crypto_market("btc-120k", "BTC above $120k", strike=120_000.0,
+                                      days_to_expiry=3.0, now=1100.0)
+        execute_buy.assert_called_once()
+
+    def test_a_crypto_market_the_book_already_agrees_with_is_left_alone(self):
+        import random
+        bot = self.make_bot()
+        random.seed(5)
+        price = 118_000.0
+        for _ in range(200):
+            price *= math.exp(random.choice([0.0008, -0.0008]))
+            bot.process_crypto_spot(price)
+        bot.crypto_engine.reset_reference()
+        bot.process_crypto_spot(price * 1.05)
+
+        fair = bot.crypto_engine.evaluate("btc-120k", 120_000.0, 0.30, 3.0, 10.0).fair_probability
+        bot.update_book_quote("btc-120k", "BTC above $120k", "Yes", fair, timestamp=1000.0)
+
+        with mock.patch.object(bot.portfolio, "execute_buy") as execute_buy:
+            bot.process_crypto_market("btc-120k", "BTC above $120k", strike=120_000.0,
+                                      days_to_expiry=3.0, now=1100.0)
+        execute_buy.assert_not_called()
 
 
 class TradeTelemetryTests(TrackerTestCase):
