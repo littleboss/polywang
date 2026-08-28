@@ -16,6 +16,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, Iterable, List, Optional
+import random
 
 from arbitrage_core import (
     ArbitrageOpportunity,
@@ -60,6 +61,23 @@ class JsonlEventRecorder:
 
 
 @dataclass(frozen=True)
+class FillModel:
+    """Replay-only fill assumptions. These are not live fill statistics."""
+
+    fill_probability: float = 1.0
+    rejection_rate: float = 0.0
+    second_leg_failure_rate: float = 0.0
+    queue_ahead_shares: float = 0.0
+    seed: int = 1
+
+    def __post_init__(self):
+        object.__setattr__(self, "fill_probability", min(1.0, max(0.0, float(self.fill_probability))))
+        object.__setattr__(self, "rejection_rate", min(1.0, max(0.0, float(self.rejection_rate))))
+        object.__setattr__(self, "second_leg_failure_rate", min(1.0, max(0.0, float(self.second_leg_failure_rate))))
+        object.__setattr__(self, "queue_ahead_shares", max(0.0, float(self.queue_ahead_shares)))
+
+
+@dataclass(frozen=True)
 class ReplayOpportunity:
     event_index: int
     market_id: str
@@ -89,7 +107,8 @@ class BinaryMarketReplay:
 
     def __init__(self, markets: Iterable[BinaryMarket], scanner: Optional[BinaryArbitrageScanner] = None,
                  consume_fills: bool = False, execution_latency_ms: int = 0,
-                 max_book_age_seconds: Optional[float] = None):
+                 max_book_age_seconds: Optional[float] = None,
+                 fill_model: Optional[FillModel] = None):
         self.markets: Dict[str, BinaryMarket] = {market.market_id: market for market in markets}
         self.token_to_market = {
             token: market
@@ -104,12 +123,16 @@ class BinaryMarketReplay:
             None if max_book_age_seconds is None
             else max(1, int(float(max_book_age_seconds) * 1000))
         )
+        self.fill_model = fill_model or FillModel()
+        self._rng = random.Random(self.fill_model.seed)
         self.opportunities: List[ReplayOpportunity] = []
         self.executed_opportunities: List[ReplayOpportunity] = []
         self.pending = []
         self.execution_stats = {
             "signals": 0, "executed": 0, "latency_missed": 0,
             "stale_missed": 0, "depth_missed": 0, "pending_at_end": 0,
+            "rejected": 0, "queue_missed": 0, "second_leg_failed": 0,
+            "simulated": True,
         }
 
     @staticmethod
@@ -157,6 +180,8 @@ class BinaryMarketReplay:
                     or no_worst > pending["no_worst_price"] + 1e-12):
                 self.execution_stats["latency_missed"] += 1
                 continue
+            if not self._accept_simulated_fill(pending["opportunity"], yes_book, no_book, yes_fills, no_fills):
+                continue
             yes_book.consume_asks(yes_fills)
             no_book.consume_asks(no_fills)
             self.executed_opportunities.append(pending["opportunity"])
@@ -188,20 +213,43 @@ class BinaryMarketReplay:
                 if self.execution_latency_ms == 0:
                     _, _, yes_fills = yes_book.walk_asks(opportunity.shares)
                     _, _, no_fills = no_book.walk_asks(opportunity.shares)
-                    yes_book.consume_asks(yes_fills)
-                    no_book.consume_asks(no_fills)
-                    self.executed_opportunities.append(record)
-                    self.execution_stats["executed"] += 1
+                    if self._accept_simulated_fill(record, yes_book, no_book, yes_fills, no_fills):
+                        yes_book.consume_asks(yes_fills)
+                        no_book.consume_asks(no_fills)
+                        self.executed_opportunities.append(record)
+                        self.execution_stats["executed"] += 1
                 else:
                     self.pending.append({
                         "market_id": market_id,
                         "opportunity": record,
                         "shares": opportunity.shares,
-                        "due_ms": (event_time_ms or opportunity.timestamp_ms) + self.execution_latency_ms,
+                        "due_ms": (event_time_ms or record.timestamp_ms) + self.execution_latency_ms,
                         "yes_worst_price": opportunity.yes_worst_price,
                         "no_worst_price": opportunity.no_worst_price,
                     })
         return found
+
+    def _accept_simulated_fill(self, opportunity: ReplayOpportunity, yes_book, no_book,
+                               yes_fills, no_fills) -> bool:
+        """Apply replay fill/reject/queue assumptions. Result is simulated PnL only."""
+        model = self.fill_model
+        if self._rng.random() < model.rejection_rate:
+            self.execution_stats["rejected"] += 1
+            return False
+        if self._rng.random() > model.fill_probability:
+            self.execution_stats["rejected"] += 1
+            return False
+        if model.queue_ahead_shares > 0.0:
+            yes_available = sum(size for _, size in yes_book.asks_sorted())
+            no_available = sum(size for _, size in no_book.asks_sorted())
+            if (yes_available - model.queue_ahead_shares + 1e-12 < opportunity.shares
+                    or no_available - model.queue_ahead_shares + 1e-12 < opportunity.shares):
+                self.execution_stats["queue_missed"] += 1
+                return False
+        if self._rng.random() < model.second_leg_failure_rate:
+            self.execution_stats["second_leg_failed"] += 1
+            return False
+        return True
 
     def run(self, events: Iterable[dict]) -> List[ReplayOpportunity]:
         for index, event in enumerate(events):
@@ -232,6 +280,7 @@ class BinaryMarketReplay:
             "executed_capital_required": sum(
                 item.capital_required for item in self.executed_opportunities
             ),
+            "pnl_is_simulated": True,
             "execution": dict(self.execution_stats),
             "by_market": by_market,
         }
@@ -265,6 +314,11 @@ def main() -> int:
                         help="delay simulated fills by this many milliseconds")
     parser.add_argument("--max-book-age-seconds", type=float, default=None,
                         help="reject opportunities whose two books are older than this")
+    parser.add_argument("--fill-probability", type=float, default=1.0)
+    parser.add_argument("--rejection-rate", type=float, default=0.0)
+    parser.add_argument("--second-leg-failure-rate", type=float, default=0.0)
+    parser.add_argument("--queue-ahead-shares", type=float, default=0.0)
+    parser.add_argument("--fill-seed", type=int, default=1)
     parser.add_argument("--max-order", type=float, default=100.0)
     parser.add_argument("--min-profit", type=float, default=0.05)
     parser.add_argument("--min-return", type=float, default=0.002)
@@ -288,6 +342,13 @@ def main() -> int:
         consume_fills=args.consume_fills,
         execution_latency_ms=args.execution_latency_ms,
         max_book_age_seconds=args.max_book_age_seconds,
+        fill_model=FillModel(
+            fill_probability=args.fill_probability,
+            rejection_rate=args.rejection_rate,
+            second_leg_failure_rate=args.second_leg_failure_rate,
+            queue_ahead_shares=args.queue_ahead_shares,
+            seed=args.fill_seed,
+        ),
     )
     replay.run(_load_events(args.events))
     print(json.dumps(replay.report(), indent=2, sort_keys=True))

@@ -57,6 +57,21 @@ def _category(raw: object) -> str:
     return aliases.get(value, value if value else "other")
 
 
+# Market-channel schema versions this process can apply. An unknown version is
+# a gap: the local book must be discarded rather than guessed into.
+KNOWN_MARKET_SCHEMA_VERSIONS = frozenset({"", "1", "1.0", "v1"})
+
+
+def _optional_int(value) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        numeric = int(float(value))
+    except (TypeError, ValueError):
+        return None
+    return numeric if numeric >= 0 else None
+
+
 @dataclass(frozen=True)
 class BinaryMarket:
     market_id: str
@@ -153,14 +168,29 @@ class BinaryMarket:
 
 
 class OrderBook:
-    """Local best-effort order book built from official market-channel events."""
+    """Local order book built from official market-channel events.
+
+    Incremental updates are fail-closed: a sequence gap, hash-chain break, or
+    unknown schema version discards the book. Trading on a book that missed an
+    update is worse than standing down until the next snapshot.
+    """
 
     def __init__(self):
         self.bids: Dict[float, float] = {}
         self.asks: Dict[float, float] = {}
         self.timestamp_ms: int = 0
         self.hash: str = ""
+        self.sequence: Optional[int] = None
+        self.schema_version: str = ""
         self.synced: bool = False
+        self.gap_reason: str = ""
+
+    def invalidate(self, reason: str = "unsynced") -> None:
+        """Drop resting levels so a partial book cannot be scanned."""
+        self.bids.clear()
+        self.asks.clear()
+        self.synced = False
+        self.gap_reason = str(reason or "unsynced")
 
     @staticmethod
     def _levels(levels: Iterable[dict]) -> Dict[float, float]:
@@ -176,11 +206,12 @@ class OrderBook:
         return result
 
     def replace_snapshot(self, event: dict) -> bool:
-        if not self._set_meta(event, allow_equal=True):
+        if not self._set_meta(event, allow_equal=True, is_snapshot=True):
             return False
         self.bids = self._levels(_response_value(event, "bids", default=()))
         self.asks = self._levels(_response_value(event, "asks", default=()))
         self.synced = True
+        self.gap_reason = ""
         return True
 
     def apply_change(self, side: str, price: float, size: float,
@@ -196,7 +227,7 @@ class OrderBook:
             return False
         if not (0.0 < price < 1.0):
             return False
-        if event and not self._set_meta(event, level_hash=level_hash, allow_equal=True):
+        if event and not self._set_meta(event, level_hash=level_hash, allow_equal=True, is_snapshot=False):
             return False
         if size <= 0.0:
             book.pop(price, None)
@@ -206,8 +237,42 @@ class OrderBook:
             self.hash = str(level_hash)
         return True
 
+    def _schema_ok(self, event: dict) -> bool:
+        raw = _response_value(event, "schema_version", "version", "clob_version", default="")
+        version = str(raw or "").strip()
+        if version and version not in KNOWN_MARKET_SCHEMA_VERSIONS:
+            self.invalidate(f"unsupported market-channel schema version {version!r}")
+            return False
+        if version:
+            self.schema_version = version
+        return True
+
+    def _sequence_ok(self, event: dict, is_snapshot: bool) -> bool:
+        sequence = _optional_int(_response_value(
+            event, "sequence", "seq", "event_sequence", default=None
+        ))
+        if sequence is None:
+            return True
+        if is_snapshot or self.sequence is None:
+            self.sequence = sequence
+            return True
+        if sequence == self.sequence or sequence == self.sequence + 1:
+            self.sequence = sequence
+            return True
+        self.invalidate(f"sequence gap: expected {self.sequence + 1}, got {sequence}")
+        return False
+
+    def _hash_chain_ok(self, event: dict, is_snapshot: bool) -> bool:
+        prev = _response_value(event, "prev_hash", "previous_hash", "parent_hash", default=None)
+        if is_snapshot or not prev or not self.hash:
+            return True
+        if str(prev) == str(self.hash):
+            return True
+        self.invalidate(f"hash chain break: local {self.hash} != prev {prev}")
+        return False
+
     def _set_meta(self, event: dict, level_hash: Optional[str] = None,
-                  allow_equal: bool = False) -> bool:
+                  allow_equal: bool = False, is_snapshot: bool = False) -> bool:
         try:
             raw_timestamp = _response_value(event, "timestamp", default=0)
             if hasattr(raw_timestamp, "timestamp"):
@@ -231,6 +296,12 @@ class OrderBook:
         except (TypeError, ValueError):
             return False
         if timestamp <= 0:
+            return False
+        if not self._schema_ok(event):
+            return False
+        if not self._sequence_ok(event, is_snapshot=is_snapshot):
+            return False
+        if not self._hash_chain_ok(event, is_snapshot=is_snapshot):
             return False
         raw_hash = level_hash if level_hash is not None else _response_value(event, "hash", default=None)
         if raw_hash:
@@ -303,6 +374,12 @@ class ArbitrageOpportunity:
     execution_capital_required: float
     book_timestamp_ms: int
     fingerprint: str
+    merge_gas_usd: float = 0.0
+    is_risk_free: bool = False
+    residual_risk: str = (
+        "sequential FOK legs are not atomic; a first-leg fill with a second-leg "
+        "failure is unwound with FAK and may slip, partially fill, or remain open"
+    )
 
     @property
     def capital_required(self) -> float:
@@ -316,12 +393,14 @@ class BinaryArbitrageScanner:
                  min_return: float = 0.002,
                  safety_buffer_usd: float = 0.02,
                  max_order_usd: float = 100.0,
-                 max_levels: Optional[int] = None):
+                 max_levels: Optional[int] = None,
+                 merge_gas_usd: float = 0.0):
         self.min_net_profit_usd = max(0.0, min_net_profit_usd)
         self.min_return = max(0.0, min_return)
         self.safety_buffer_usd = max(0.0, safety_buffer_usd)
         self.max_order_usd = max(0.01, max_order_usd)
         self.max_levels = max(1, int(max_levels)) if max_levels is not None else None
+        self.merge_gas_usd = max(0.0, float(merge_gas_usd))
 
     @staticmethod
     def _cost_for(book: OrderBook, shares: float,
@@ -351,6 +430,8 @@ class BinaryArbitrageScanner:
         # Negative-risk groups need their own complete-set and redemption
         # semantics. Do not infer them from a two-token price sum.
         if not market.active or market.neg_risk:
+            return None
+        if not yes_book.synced or not no_book.synced:
             return None
         yes_touch = yes_book.best_ask()
         no_touch = no_book.best_ask()
@@ -453,7 +534,7 @@ class BinaryArbitrageScanner:
                 + yes_execution_fee_cap + no_execution_fee_cap
             )
             gross = shares - yes_cost - no_cost
-            net = gross - yes_fee - no_fee - self.safety_buffer_usd
+            net = gross - yes_fee - no_fee - self.safety_buffer_usd - self.merge_gas_usd
             capital = yes_cost + no_cost + yes_fee + no_fee
             result = ArbitrageOpportunity(
                 market_id=market.market_id,
@@ -481,6 +562,8 @@ class BinaryArbitrageScanner:
                 execution_capital_required=execution_capital,
                 book_timestamp_ms=max(yes_book.timestamp_ms, no_book.timestamp_ms),
                 fingerprint=f"{market.market_id}:{yes_book.hash}:{no_book.hash}:{shares:.12f}",
+                merge_gas_usd=self.merge_gas_usd,
+                is_risk_free=False,
             )
             if result.net_profit >= self.min_net_profit_usd and result.return_on_capital >= self.min_return:
                 if best is None or result.net_profit > best.net_profit:
@@ -1198,6 +1281,9 @@ class LiveRiskController:
             "last_balance_usd": None,
             "last_allowance_usd": None,
             "last_account_snapshot_at": None,
+            "flatten_required": False,
+            "flatten_completed": False,
+            "flatten_result": {},
         }
         self.load()
         self._roll_day()
@@ -1246,6 +1332,8 @@ class LiveRiskController:
     def halt(self, reason: str) -> None:
         self.state["halted"] = True
         self.state["halt_reason"] = str(reason)
+        if not self.state.get("flatten_completed"):
+            self.state["flatten_required"] = True
         self.save()
 
     def record_realized_pnl(self, pnl_usd: float) -> None:
@@ -1316,6 +1404,18 @@ class LiveRiskController:
         if self.max_daily_loss_usd > 0.0 and float(self.state.get("daily_loss_usd", 0.0)) >= self.max_daily_loss_usd:
             self.halt("daily loss limit reached")
             raise RiskHaltError(self.state["halt_reason"])
+
+    def poll_kill_switch(self) -> bool:
+        """Halt if the operator file or env flag appears after startup."""
+        if self.state.get("halted"):
+            return True
+        if os.getenv("POLYMARKET_KILL_SWITCH", "").strip() == "1":
+            self.halt("POLYMARKET_KILL_SWITCH=1")
+            return True
+        if self.kill_switch_path and os.path.exists(self.kill_switch_path):
+            self.halt(f"kill-switch file exists: {self.kill_switch_path}")
+            return True
+        return False
 
     def check(self, opportunity: ArbitrageOpportunity) -> None:
         self.check_startup()
@@ -1548,13 +1648,21 @@ class OfficialFOKExecutor:
         return {"balance": balance, "allowance": allowance}
 
     async def reconcile(self, stale_after_seconds: float = 30.0,
-                        recover_orphans: bool = True) -> List[dict]:
-        """Re-read unfinished pairs and optionally scan for orphaned orders."""
+                        recover_orphans: bool = True,
+                        scan_account: Optional[bool] = None) -> List[dict]:
+        """Re-read unfinished pairs and optionally scan the whole account.
+
+        Known-pair recovery is not enough: an external order, leftover
+        conditional-token balance, or unexplained collateral move is inventory
+        this process does not own and must not trade around.
+        """
         if not self.journal:
             return []
         issues = self.journal.integrity_issues()
         if issues:
             raise UnhedgedPairError("live journal integrity failure: " + "; ".join(issues))
+        if scan_account is None:
+            scan_account = recover_orphans
         conditions = sorted({
             str(record.get("condition_id", ""))
             for record in self.journal.incomplete_pairs()
@@ -1563,8 +1671,10 @@ class OfficialFOKExecutor:
         open_orders: Dict[str, object] = {}
         account_trades: List[object] = []
         trade_watermarks = self.journal.state.setdefault("trade_watermarks", {})
+        if scan_account:
+            open_orders.update(await self._list_open_orders())
         for condition_id in conditions:
-            if recover_orphans:
+            if recover_orphans and not scan_account:
                 open_orders.update(await self._list_open_orders(market=condition_id))
             after = self._trade_query_after(condition_id, trade_watermarks)
             account_trades.extend(
@@ -1657,6 +1767,8 @@ class OfficialFOKExecutor:
                 raise UnhedgedPairError(f"pair {record['pair_id']} is not fully hedged after reconciliation")
             await self._reconcile_conditional_balances(refreshed)
             reconciled.append(refreshed)
+        if scan_account:
+            await self._reconcile_external_account_state(open_orders)
         return reconciled
 
     def _recover_orphan_order_ids(self, open_orders: Dict[str, object],
@@ -2030,6 +2142,160 @@ class OfficialFOKExecutor:
                     f"pair {record['pair_id']} winning conditional balance is "
                     f"{balance:.8f}, below required {required:.8f}"
                 )
+
+    async def _list_positions(self) -> List[object]:
+        """Best-effort account position list; missing SDK methods skip the scan."""
+        for name in ("list_positions", "get_positions", "get_current_positions"):
+            method = getattr(self.client, name, None)
+            if method is None:
+                continue
+            result = method()
+            result = await result if inspect.isawaitable(result) else result
+            if isinstance(result, (list, tuple)):
+                return list(result)
+            if isinstance(result, dict):
+                items = result.get("data", result.get("positions", result.get("items", [])))
+                if isinstance(items, (list, tuple)):
+                    return list(items)
+        return []
+
+    def _known_live_order_ids(self) -> set[str]:
+        known = set()
+        if not self.journal:
+            return known
+        for record in self.journal.incomplete_pairs():
+            for field in ("yes_order_id", "no_order_id"):
+                order_id = str(record.get(field) or "")
+                if order_id:
+                    known.add(order_id)
+        return known
+
+    def _known_live_token_ids(self) -> set[str]:
+        known = set()
+        if not self.journal:
+            return known
+        for record in self.journal.incomplete_pairs():
+            for field in ("yes_token_id", "no_token_id"):
+                token_id = str(record.get(field) or "")
+                if token_id:
+                    known.add(token_id)
+        return known
+
+    async def _reconcile_external_account_state(self, open_orders: Dict[str, object]) -> None:
+        """Halt when the account holds orders or tokens this journal does not own."""
+        known_orders = self._known_live_order_ids()
+        external_orders = sorted(order_id for order_id in open_orders if order_id not in known_orders)
+        if external_orders:
+            raise UnhedgedPairError(
+                "account has open orders outside the live journal: " + ", ".join(external_orders)
+            )
+        known_tokens = self._known_live_token_ids()
+        external_positions = []
+        for position in await self._list_positions():
+            token_id = str(_response_value(position, "token_id", "asset_id", "assetId", default="") or "")
+            size = _numeric_value(position, "size", "balance", "shares", "position")
+            if not token_id or size is None or size <= 1e-8:
+                continue
+            if token_id not in known_tokens:
+                external_positions.append(f"{token_id}:{size}")
+        if external_positions:
+            raise UnhedgedPairError(
+                "account has conditional-token inventory outside the live journal: "
+                + ", ".join(external_positions)
+            )
+
+    async def cancel_all_open_orders(self) -> List[str]:
+        """Cancel every resting order; missing IDs are an error, not a skip."""
+        cancelled: List[str] = []
+        cancel_all = getattr(self.client, "cancel_all_orders", None) or getattr(self.client, "cancel_all", None)
+        if cancel_all is not None:
+            result = cancel_all()
+            result = await result if inspect.isawaitable(result) else result
+            if isinstance(result, (list, tuple)):
+                cancelled.extend(str(item) for item in result)
+            elif isinstance(result, dict):
+                items = result.get("cancelled", result.get("order_ids", result.get("orders", [])))
+                if isinstance(items, (list, tuple)):
+                    cancelled.extend(str(item) for item in items)
+        orders = await self._list_open_orders()
+        remaining = [order_id for order_id in orders if order_id not in set(cancelled)]
+        for order_id in remaining:
+            await self._call("cancel_order", order_id=order_id)
+            cancelled.append(order_id)
+        leftover = await self._list_open_orders()
+        if leftover:
+            raise UnhedgedPairError(
+                "open orders remain after cancel-all: " + ", ".join(sorted(leftover))
+            )
+        return cancelled
+
+    async def _inventory_snapshot(self) -> dict:
+        snapshot = {
+            "open_orders": [],
+            "pairs": [],
+            "conditional_balances": [],
+        }
+        try:
+            snapshot["open_orders"] = sorted(await self._list_open_orders())
+        except Exception as error:
+            snapshot["open_orders_error"] = str(error)
+        if self.journal:
+            for record in self.journal.incomplete_pairs():
+                snapshot["pairs"].append({
+                    "pair_id": record.get("pair_id"),
+                    "status": record.get("status"),
+                    "yes_matched_shares": record.get("yes_matched_shares"),
+                    "no_matched_shares": record.get("no_matched_shares"),
+                    "error": record.get("error", ""),
+                })
+                for leg in ("yes", "no"):
+                    token_id = str(record.get(f"{leg}_token_id") or "")
+                    if not token_id:
+                        continue
+                    try:
+                        balance = await self._conditional_balance(token_id)
+                        snapshot["conditional_balances"].append({
+                            "token_id": token_id, "shares": balance, "leg": leg,
+                            "pair_id": record.get("pair_id"),
+                        })
+                    except Exception as error:
+                        snapshot["conditional_balances"].append({
+                            "token_id": token_id, "error": str(error), "leg": leg,
+                            "pair_id": record.get("pair_id"),
+                        })
+        return snapshot
+
+    async def flatten_on_halt(self, reason: str) -> dict:
+        """Cancel resting orders and snapshot leftover inventory. Do not dump fills."""
+        cancelled = await self.cancel_all_open_orders()
+        inventory = await self._inventory_snapshot()
+        result = {
+            "reason": str(reason),
+            "cancelled_order_ids": cancelled,
+            "inventory": inventory,
+            "note": "matched inventory is not auto-sold; residual pairs need manual handling",
+        }
+        if self.journal:
+            self.journal.state["halt_inventory"] = result
+            self.journal.save()
+        return result
+
+    async def apply_halt_actions(self, risk: "LiveRiskController") -> dict:
+        """Run cancel-all once after a persisted halt, then leave inventory for review."""
+        if not risk.state.get("halted"):
+            return {}
+        if risk.state.get("flatten_completed") and not risk.state.get("flatten_required"):
+            return dict(risk.state.get("flatten_result") or {})
+        result = await self.flatten_on_halt(risk.state.get("halt_reason") or "live risk halt")
+        risk.state["flatten_required"] = False
+        risk.state["flatten_completed"] = True
+        risk.state["flatten_result"] = {
+            "cancelled_order_ids": result.get("cancelled_order_ids", []),
+            "open_orders": result.get("inventory", {}).get("open_orders", []),
+            "pairs": result.get("inventory", {}).get("pairs", []),
+        }
+        risk.save()
+        return result
 
     def _update_pair_status(self, record: dict) -> dict:
         requested = float(record["requested_shares"])

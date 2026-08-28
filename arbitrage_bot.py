@@ -19,7 +19,7 @@ from typing import Dict, Iterable, List, Optional
 
 import requests
 from whale_intelligence import WhaleIntelligenceEngine
-from sports_channel import SportsStateTracker, consume_sports_channel
+from sports_channel import SportsStateTracker, SportsLatencyGate, SportsMarketMap, consume_sports_channel, evaluate_sports_candidate
 from market_replay import JsonlEventRecorder
 
 from arbitrage_core import (
@@ -139,11 +139,7 @@ class PaperMarketRunner:
     def invalidate_books(self) -> None:
         """Require fresh snapshots after a market-stream reconnect."""
         for book in self.books.values():
-            book.bids.clear()
-            book.asks.clear()
-            book.timestamp_ms = 0
-            book.hash = ""
-            book.synced = False
+            book.invalidate("market stream reconnect")
 
     async def process(self, event: dict) -> None:
         event_type = _event_name(event.get("event_type", event.get("type", "")) if isinstance(event, dict) else getattr(event, "type", ""))
@@ -220,6 +216,8 @@ class PaperMarketRunner:
             yes_book = self.books.get(market.yes_token_id)
             no_book = self.books.get(market.no_token_id)
             if not yes_book or not no_book:
+                continue
+            if not yes_book.synced or not no_book.synced:
                 continue
             if self.live and not getattr(self.executor, "user_stream_healthy", False):
                 continue
@@ -347,6 +345,9 @@ async def run_user_stream(executor: OfficialFOKExecutor,
         except UnhedgedPairError:
             if risk:
                 risk.halt("user stream found an unhedged live pair")
+                flatten = getattr(executor, "apply_halt_actions", None)
+                if flatten:
+                    await flatten(risk)
             LOG.critical("User stream found an unhedged pair; stopping for manual reconciliation")
             raise
         except Exception as error:
@@ -366,9 +367,13 @@ async def run_reconciliation_loop(executor: OfficialFOKExecutor,
         await asyncio.sleep(interval)
         try:
             risk.record_account_snapshot(await executor.preflight(required_usd=0.0))
+            if risk.poll_kill_switch():
+                await executor.apply_halt_actions(risk)
+                raise RiskHaltError(risk.state.get("halt_reason") or "kill switch")
             reconciled = await executor.reconcile(
                 stale_after_seconds=env_float("STALE_ORDER_SECONDS", 30.0),
                 recover_orphans=(cycle % full_recovery_every == 0),
+                scan_account=(cycle % full_recovery_every == 0),
             )
             cycle += 1
             settled = await executor.settle_hedged_pairs()
@@ -381,13 +386,18 @@ async def run_reconciliation_loop(executor: OfficialFOKExecutor,
             raise
         except Exception as error:
             risk.halt(f"continuous live reconciliation failed: {error}")
+            await executor.apply_halt_actions(risk)
             LOG.critical("LIVE RECONCILIATION HALT: %s", error)
             raise
 
 
-async def run_sports_stream(executor: OfficialFOKExecutor, tracker: SportsStateTracker) -> None:
+async def run_sports_stream(executor: OfficialFOKExecutor, tracker: SportsStateTracker,
+                            runner: Optional[PaperMarketRunner] = None,
+                            mapping: Optional[SportsMarketMap] = None) -> None:
     """Keep the official Sports Channel alive for timestamped observations."""
     backoff = 1.0
+    mapping = mapping or SportsMarketMap()
+    gate = SportsLatencyGate()
 
     async def observe(event) -> None:
         observation = tracker.observe(event)
@@ -396,6 +406,27 @@ async def run_sports_stream(executor: OfficialFOKExecutor, tracker: SportsStateT
                 "SPORTS STATE: game %s | %s | score %s | period %s",
                 observation.game_id, observation.status, observation.score, observation.period,
             )
+        if not mapping.links or runner is None:
+            return
+        link = mapping.resolve(observation.game_id)
+        if link is None:
+            return
+        market = runner.markets.get(link.market_id)
+        if market is None:
+            LOG.info("SPORTS UNMAPPED MARKET: game %s -> market %s not in the live universe",
+                     observation.game_id, link.market_id)
+            return
+        yes_book = runner.books.get(market.yes_token_id)
+        market_ts = yes_book.timestamp_ms if yes_book else 0
+        price = yes_book.best_ask()[0] if yes_book and yes_book.best_ask() else None
+        candidate = evaluate_sports_candidate(
+            observation, gate, mapping, market_ts, market_price=price,
+        )
+        LOG.info(
+            "SPORTS CANDIDATE: %s | %s | eligible=%s executable=%s | %s",
+            candidate.market_id, candidate.direction, candidate.eligible,
+            candidate.executable, candidate.reason,
+        )
 
     while True:
         try:
@@ -445,6 +476,7 @@ def main() -> int:
         safety_buffer_usd=args.buffer,
         max_order_usd=args.max_order,
         max_levels=env_int("LIVE_MAX_BOOK_LEVELS", 1) if args.live else None,
+        merge_gas_usd=env_float("MERGE_GAS_USD", 0.0),
     )
     if args.live:
         geoblock = requests.get("https://polymarket.com/api/geoblock", timeout=5).json()
@@ -466,13 +498,21 @@ def main() -> int:
                 max_open_pairs=env_int("LIVE_MAX_OPEN_PAIRS", 10),
                 max_daily_loss_usd=env_float("LIVE_MAX_DAILY_LOSS_USD", 0.0),
             )
-            risk.check_startup()
             try:
-                await executor.reconcile(stale_after_seconds=env_float("STALE_ORDER_SECONDS", 30.0))
+                risk.check_startup()
+            except RiskHaltError:
+                await executor.apply_halt_actions(risk)
+                raise
+            try:
+                await executor.reconcile(
+                    stale_after_seconds=env_float("STALE_ORDER_SECONDS", 30.0),
+                    scan_account=True,
+                )
             except asyncio.CancelledError:
                 raise
             except Exception as error:
                 risk.halt(f"startup live reconciliation failed: {error}")
+                await executor.apply_halt_actions(risk)
                 raise
             if args.preflight:
                 print(json.dumps({
@@ -497,8 +537,19 @@ def main() -> int:
                 )
             )
             sports_task = None
+            sports_map = SportsMarketMap()
+            raw_map = os.getenv("SPORTS_MARKET_MAP", "").strip()
+            if raw_map:
+                try:
+                    parsed_map = json.loads(raw_map)
+                    if isinstance(parsed_map, dict):
+                        sports_map = SportsMarketMap(parsed_map)
+                except (TypeError, ValueError) as error:
+                    LOG.warning("Ignoring invalid SPORTS_MARKET_MAP: %s", error)
             if os.getenv("ENABLE_SPORTS_CHANNEL", "1") == "1":
-                sports_task = asyncio.create_task(run_sports_stream(executor, SportsStateTracker()))
+                sports_task = asyncio.create_task(
+                    run_sports_stream(executor, SportsStateTracker(), runner, sports_map)
+                )
             tasks = {market_task, user_task, reconcile_task} | ({sports_task} if sports_task else set())
             try:
                 done, pending = await asyncio.wait(
@@ -511,6 +562,11 @@ def main() -> int:
                     if not task.done():
                         task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
+                if risk.state.get("halted"):
+                    try:
+                        await executor.apply_halt_actions(risk)
+                    except Exception as flatten_error:
+                        LOG.critical("HALT CANCEL-ALL FAILED: %s", flatten_error)
                 await executor.close()
 
         try:

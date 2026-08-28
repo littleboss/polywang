@@ -10,6 +10,7 @@ hard rejection, not an inferred edge.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 import time
 from typing import Awaitable, Callable, Dict, Optional
 
@@ -122,6 +123,134 @@ class SportsLatencyGate:
         if delay < self.min_delay_ms or delay > self.max_delay_ms:
             return SportsLatencyDecision(False, delay, "market is not measurably behind the sports source")
         return SportsLatencyDecision(True, delay, "timestamp-proven sports latency gap")
+
+
+@dataclass(frozen=True)
+class SportsMarketLink:
+    game_id: str
+    market_id: str
+    yes_means: str = "home"  # "home" or "away"
+    home_token_id: str = ""
+    away_token_id: str = ""
+
+
+class SportsMarketMap:
+    """Explicit game-to-market map. Unmapped games stay observational."""
+
+    def __init__(self, links: Optional[Dict[str, dict]] = None):
+        self.links: Dict[str, SportsMarketLink] = {}
+        for game_id, payload in (links or {}).items():
+            if not isinstance(payload, dict):
+                continue
+            market_id = str(payload.get("market_id", payload.get("market", "")))
+            if not market_id:
+                continue
+            yes_means = str(payload.get("yes_means", "home")).strip().lower()
+            if yes_means not in {"home", "away"}:
+                yes_means = "home"
+            self.links[str(game_id)] = SportsMarketLink(
+                game_id=str(game_id),
+                market_id=market_id,
+                yes_means=yes_means,
+                home_token_id=str(payload.get("home_token_id", "")),
+                away_token_id=str(payload.get("away_token_id", "")),
+            )
+
+    def resolve(self, game_id: str) -> Optional[SportsMarketLink]:
+        return self.links.get(str(game_id))
+
+
+def parse_score(score: str) -> Optional[tuple[int, int]]:
+    text = str(score or "").replace(":", "-").strip()
+    parts = text.split("-")
+    if len(parts) != 2:
+        return None
+    try:
+        home, away = int(parts[0].strip()), int(parts[1].strip())
+    except (TypeError, ValueError):
+        return None
+    if home < 0 or away < 0:
+        return None
+    return home, away
+
+
+def soccer_fair_probability(score: str, team_focus: str = "home",
+                            minute: float = 70.0) -> Optional[float]:
+    """Coarse in-play home/away win probability. Not a priced trading model."""
+    parsed = parse_score(score)
+    if parsed is None:
+        return None
+    score_home, score_away = parsed
+    remaining = max(0.0, (90.0 - max(0.0, float(minute))) / 90.0)
+    home_xg = 1.45 * remaining
+    away_xg = 1.25 * remaining
+    goal_diff = score_home - score_away
+    if remaining <= 1e-9:
+        if goal_diff > 0:
+            return 1.0 if team_focus == "home" else 0.0
+        if goal_diff < 0:
+            return 0.0 if team_focus == "home" else 1.0
+        return 0.0
+    variance = home_xg + away_xg
+    std = math.sqrt(variance)
+    z_home = (-goal_diff + 0.5 - (home_xg - away_xg)) / std
+    prob_home = 1.0 - 0.5 * (1.0 + math.erf(z_home / math.sqrt(2.0)))
+    if team_focus == "home":
+        return max(0.01, min(0.99, prob_home))
+    z_away = (goal_diff + 0.5 - away_xg + home_xg) / std
+    prob_away = 1.0 - 0.5 * (1.0 + math.erf(z_away / math.sqrt(2.0)))
+    return max(0.01, min(0.99, prob_away))
+
+
+@dataclass(frozen=True)
+class SportsTradeCandidate:
+    game_id: str
+    market_id: str
+    direction: str
+    fair_probability: Optional[float]
+    market_price: Optional[float]
+    eligible: bool
+    reason: str
+    executable: bool = False
+
+
+def evaluate_sports_candidate(observation: SportsObservation,
+                              gate: SportsLatencyGate,
+                              mapping: SportsMarketMap,
+                              market_timestamp_ms: int,
+                              market_price: Optional[float] = None,
+                              now_ms: Optional[int] = None,
+                              minute: float = 70.0) -> SportsTradeCandidate:
+    """Map a sports observation to a research candidate. Never marks executable."""
+    link = mapping.resolve(observation.game_id)
+    if link is None:
+        return SportsTradeCandidate(
+            observation.game_id, "", "NONE", None, market_price, False,
+            "sports event is not mapped to a binary market",
+        )
+    decision = gate.evaluate(observation, market_timestamp_ms, now_ms=now_ms)
+    fair = soccer_fair_probability(observation.score, team_focus=link.yes_means, minute=minute)
+    direction = "BUY_YES" if link.yes_means == "home" else "BUY_NO"
+    parsed = parse_score(observation.score)
+    if parsed:
+        home, away = parsed
+        leading = home > away if link.yes_means == "home" else away > home
+        direction = "BUY_YES" if leading else "BUY_NO"
+    if not decision.eligible:
+        return SportsTradeCandidate(
+            observation.game_id, link.market_id, direction, fair, market_price,
+            False, decision.reason,
+        )
+    if fair is None:
+        return SportsTradeCandidate(
+            observation.game_id, link.market_id, direction, None, market_price,
+            False, "score cannot be parsed into a fair value",
+        )
+    return SportsTradeCandidate(
+        observation.game_id, link.market_id, direction, fair, market_price,
+        True, "mapped latency candidate; not routed to the binary FOK executor",
+        executable=False,
+    )
 
 
 async def consume_sports_channel(client, on_event: Callable[[object], Awaitable[None]]) -> None:

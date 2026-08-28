@@ -363,6 +363,34 @@ class CalibrationTests(unittest.TestCase):
             tracker.record("bad", 0.95, 0)
         self.assertIn("COIN FLIP", tracker.report())
 
+    def test_walk_forward_and_drift_gate_live_readiness(self):
+        tracker = CalibrationTracker(min_samples=4)
+        for _ in range(8):
+            tracker.record("good", 0.9, 1)
+            tracker.record("good", 0.1, 0)
+        self.assertTrue(tracker.is_live_ready("good"))
+        self.assertIsNotNone(tracker.strategies["good"].walk_forward_brier())
+        self.assertLess(tracker.strategies["good"].walk_forward_brier(), 0.25)
+        params = tracker.recommended_parameters("good")
+        self.assertTrue(params["live_ready"])
+        self.assertGreaterEqual(params["min_edge_over_breakeven"], 0.02)
+
+        drifted = CalibrationTracker(min_samples=4)
+        for _ in range(20):
+            drifted.record("late", 0.9, 1)
+        for _ in range(20):
+            drifted.record("late", 0.9, 0)
+        self.assertTrue(drifted.has_drifted("late", window=20, threshold=0.08))
+        self.assertFalse(drifted.is_live_ready("late"))
+
+    def test_wilson_interval_contains_the_hit_rate(self):
+        record = StrategyCalibration("mixed")
+        for i in range(40):
+            record.record(0.7, 1 if i < 28 else 0)
+        low, high = record.hit_rate_interval()
+        self.assertLessEqual(low, record.hit_rate)
+        self.assertGreaterEqual(high, record.hit_rate)
+
 
 class WangTransformTests(unittest.TestCase):
     def test_debiasing_lowers_the_yes_estimate(self):

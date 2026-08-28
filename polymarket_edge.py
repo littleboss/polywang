@@ -539,6 +539,34 @@ class StrategyCalibration:
             return None
         return self.mean_forecast - self.hit_rate
 
+    def rolling_brier(self, window: int) -> Optional[float]:
+        if not self.forecasts:
+            return None
+        sample = self.forecasts[-max(1, int(window)):]
+        return sum((p - o) ** 2 for p, o in sample) / len(sample)
+
+    def hit_rate_interval(self, z: float = 1.96) -> Optional[Tuple[float, float]]:
+        """Wilson score interval for realised hit rate."""
+        n = self.count
+        if n <= 0:
+            return None
+        hits = sum(o for _, o in self.forecasts)
+        p = hits / n
+        z2 = z * z
+        denom = 1.0 + z2 / n
+        center = (p + z2 / (2.0 * n)) / denom
+        margin = z * math.sqrt((p * (1.0 - p) + z2 / (4.0 * n)) / n) / denom
+        return max(0.0, center - margin), min(1.0, center + margin)
+
+    def walk_forward_brier(self, train_fraction: float = 0.7) -> Optional[float]:
+        if self.count < 4:
+            return None
+        split = max(1, min(self.count - 1, int(self.count * train_fraction)))
+        held_out = self.forecasts[split:]
+        if not held_out:
+            return None
+        return sum((p - o) ** 2 for p, o in held_out) / len(held_out)
+
     def reliability_table(self, buckets: int = 5) -> List[Tuple[str, int, float, float]]:
         """Forecast bucket, sample count, mean forecast, realised frequency."""
         grouped: Dict[int, List[Tuple[float, int]]] = {}
@@ -635,11 +663,67 @@ class CalibrationTracker:
     def is_live_ready(self, strategy: str) -> bool:
         """Require evidence before a predictive signal can reach live trading."""
         record = self.strategies.get(strategy)
-        return bool(
-            record is not None
-            and record.count >= self.min_samples
-            and self.is_trustworthy(strategy)
-        )
+        if record is None or record.count < self.min_samples or not self.is_trustworthy(strategy):
+            return False
+        if self.has_drifted(strategy):
+            return False
+        oos = record.walk_forward_brier()
+        if oos is not None and oos >= self.WORSE_THAN_UNINFORMATIVE:
+            return False
+        return True
+
+    def has_drifted(self, strategy: str, window: int = 20, threshold: float = 0.08) -> bool:
+        """Recent Brier worse than the prior window by more than `threshold`."""
+        record = self.strategies.get(strategy)
+        if record is None or record.count < max(self.min_samples, window * 2):
+            return False
+        recent = record.rolling_brier(window)
+        older = record.forecasts[:-window]
+        if recent is None or not older:
+            return False
+        prior = sum((p - o) ** 2 for p, o in older[-window:]) / min(window, len(older))
+        return recent - prior > threshold
+
+    def recommended_parameters(self, strategy: str) -> dict:
+        """Shrink confidence and raise the edge hurdle when the record is noisy."""
+        record = self.strategies.get(strategy)
+        defaults = {
+            "estimate_confidence": 0.5,
+            "min_edge_over_breakeven": 0.02,
+            "live_ready": False,
+            "reason": "insufficient samples",
+        }
+        if record is None or record.count < self.min_samples:
+            return defaults
+        interval = record.hit_rate_interval()
+        width = (interval[1] - interval[0]) if interval else 1.0
+        bias = abs(record.bias or 0.0)
+        confidence = max(0.05, min(0.5, 0.5 - bias - 0.5 * max(0.0, width - 0.2)))
+        min_edge = max(0.02, 0.02 + bias + 0.5 * width)
+        ready = self.is_live_ready(strategy)
+        if self.has_drifted(strategy):
+            reason = "recent forecasts drifted versus the prior window"
+        elif not ready:
+            reason = "out-of-sample Brier is not yet informative"
+        else:
+            reason = "rolling calibration updated edge and confidence"
+        return {
+            "estimate_confidence": confidence,
+            "min_edge_over_breakeven": min_edge,
+            "live_ready": ready,
+            "brier": record.brier_score,
+            "walk_forward_brier": record.walk_forward_brier(),
+            "bias": record.bias,
+            "hit_rate_interval": interval,
+            "reason": reason,
+        }
+
+    def apply_recommended_edge(self, evaluator, strategy: str):
+        """Optionally retune an EdgeEvaluator from persisted calibration."""
+        params = self.recommended_parameters(strategy)
+        evaluator.estimate_confidence = float(params["estimate_confidence"])
+        evaluator.min_edge_over_breakeven = float(params["min_edge_over_breakeven"])
+        return params
 
     def underperformers(self) -> List[str]:
         return [name for name in self.strategies if not self.is_trustworthy(name)]

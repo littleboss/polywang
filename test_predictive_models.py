@@ -62,6 +62,60 @@ class PredictiveModelTests(unittest.TestCase):
             restored = CalibrationTracker(min_samples=1, path=path)
             self.assertTrue(restored.is_live_ready("macro"))
 
+    def test_macro_event_is_deduplicated_and_can_require_a_market_map(self):
+        tracker = CalibrationTracker(min_samples=2)
+        tracker.record("macro-event-v1", 0.9, 1)
+        tracker.record("macro-event-v1", 0.1, 0)
+        model = MacroEventModel(tracker, min_edge=0.01, surprise_weight=1.0,
+                                market_map={"cpi": "m-cpi"})
+        release = MacroRelease("e1", "cpi", 5.0, 4.0, 0.5, 1_700_000_000_000)
+        first = model.predict(release, 0.5, 1_700_000_001_000)
+        second = model.predict(release, 0.5, 1_700_000_001_000)
+        self.assertTrue(first.eligible)
+        self.assertEqual(first.market_id, "m-cpi")
+        self.assertFalse(first.executable)
+        self.assertFalse(second.eligible)
+        self.assertIn("duplicate", second.reason)
+        unmapped = MacroEventModel(tracker, min_edge=0.01, surprise_weight=1.0,
+                                   market_map={"other": "m-x"})
+        self.assertIn("mapped", unmapped.predict(release, 0.5, 1_700_000_001_000).reason)
+
+    def test_crypto_sell_and_inventory_are_not_executable_on_the_fok_pair_executor(self):
+        tracker = CalibrationTracker(min_samples=1)
+        tracker.record("crypto-spread-v1", 0.9, 1)
+        history_time = 1_700_000_000_000
+
+        def warm(model, market_id="m"):
+            for index in range(12):
+                market_p = 0.50 + (0.01 if index % 2 == 0 else -0.01)
+                model.observe(
+                    CryptoObservation(market_id, market_p, 0.5, history_time + index),
+                    history_time + index,
+                )
+
+        sell_model = CryptoStatArbModel(tracker, entry_zscore=1.0, exit_zscore=0.2, max_inventory=1)
+        warm(sell_model)
+        sell = sell_model.observe(CryptoObservation("m", 0.9, 0.5, history_time + 12), history_time + 12)
+        self.assertEqual(sell.direction, "SELL_MARKET")
+        self.assertFalse(sell.eligible)
+        self.assertIn("FOK", sell.reason)
+
+        buy_model = CryptoStatArbModel(tracker, entry_zscore=1.0, exit_zscore=0.5)
+        warm(buy_model)
+        buy = buy_model.observe(CryptoObservation("m", 0.2, 0.5, history_time + 12), history_time + 12)
+        self.assertEqual(buy.direction, "BUY_MARKET")
+        self.assertTrue(buy.eligible)
+        self.assertFalse(buy.executable)
+        inventory_model = CryptoStatArbModel(tracker, entry_zscore=1.0, exit_zscore=0.5)
+        warm(inventory_model)
+        inventory_model.inventory.positions["m"] = "BUY_MARKET"
+        held = inventory_model.observe(
+            CryptoObservation("m", 0.50, 0.5, history_time + 12),
+            history_time + 12,
+        )
+        self.assertEqual(held.action, "EXIT")
+        self.assertFalse(held.executable)
+
 
 if __name__ == "__main__":
     unittest.main()

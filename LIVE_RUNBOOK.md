@@ -13,7 +13,7 @@
 
 ## 首次小额实盘
 
-建议从极小的 `MAX_ORDER_USD`、单市场暴露和总暴露开始，并保留默认的 `LIVE_MAX_BOOK_LEVELS=1`。先关闭 `AUTO_MERGE_COMPLETE_SETS`，确认双腿成交、User Stream、撤单、回滚、持续对账和条件 token 余额都正常后，再单独验证小额 merge。
+建议从极小的 `MAX_ORDER_USD`、单市场暴露和总暴露开始，并保留默认的 `LIVE_MAX_BOOK_LEVELS=1`。用 `MERGE_GAS_USD` 把预计 merge 的 gas 计入扫描净收益。先关闭 `AUTO_MERGE_COMPLETE_SETS`，确认双腿成交、User Stream、撤单、回滚、持续对账和条件 token 余额都正常后，再单独验证小额 merge。两腿 FOK 不是原子成交，不能称为无风险套利。
 
 实盘需要显式设置：
 
@@ -42,7 +42,8 @@ LIVE_MAX_MARKET_EXPOSURE_FRACTION=0.01 \
 - `live-risk.json`：确认暴露、每日亏损和 halt 状态没有异常。
 - `market-events.jsonl`：保留原始/typed 市场事件和本机接收时间，用于事后回放。
 - 重点区分 `HEDGED`、`RESOLVED_PENDING_REDEMPTION` 和 `SETTLED`；市场已判定不等于抵押品已到账。
-- User Stream 是实时来源，REST 是兜底；常规对账使用已知订单和增量成交水位，启动及定期恢复轮次才扫描 open-order 孤儿。不要把 REST 查询返回的历史成交数量直接当成本轮新增成交。
+- User Stream 是实时来源，REST 是兜底；常规对账使用已知订单和增量成交水位，启动及定期恢复轮次会扫描账户内全部 open order 和外部持仓。任何 journal 之外的订单或条件 token 都会 halt。不要把 REST 查询返回的历史成交数量直接当成本轮新增成交。
+- 市场频道增量必须连续：`sequence` 断档、`prev_hash` 对不上或未知 `schema_version` 会清空本地盘口，直到下一张 snapshot。丢失增量后不得继续用残缺盘口下单。
 
 ## 链上交易超时
 
@@ -50,4 +51,4 @@ LIVE_MAX_MARKET_EXPOSURE_FRACTION=0.01 \
 
 ## 停机
 
-创建 `live-kill-switch` 文件或设置 `POLYMARKET_KILL_SWITCH=1` 会持久化停止新单。停机前先等待或人工处理未完成 pair；清除文件不会自动解除已持久化的风险 halt，必须检查账本、账户余额和链上状态后再决定是否恢复。
+创建 `live-kill-switch` 文件或设置 `POLYMARKET_KILL_SWITCH=1` 会持久化停止新单，并立刻撤销账户内所有未完成订单。匹配到的条件 token 库存不会自动市价平仓，会写入 `live-risk.json` / journal 的 `halt_inventory` 供人工处理。清除文件不会自动解除已持久化的风险 halt。

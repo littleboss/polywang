@@ -121,6 +121,38 @@ class ReplayTests(unittest.TestCase):
         self.assertEqual(report["execution"]["executed"], 1)
         self.assertEqual(report["executed_opportunities"], 1)
         self.assertGreater(report["executed_net_profit"], 0.0)
+        self.assertTrue(report["pnl_is_simulated"])
+
+    def test_fill_model_queue_and_second_leg_failure_are_counted_as_simulated(self):
+        from market_replay import FillModel
+        market = BinaryMarket("m1", "c1", "Test", "yes", "no", category="geopolitics")
+        replay = BinaryMarketReplay(
+            [market],
+            scanner=BinaryArbitrageScanner(min_net_profit_usd=0.01, min_return=0.0, safety_buffer_usd=0.0),
+            consume_fills=True,
+            fill_model=FillModel(queue_ahead_shares=10, second_leg_failure_rate=0.0, seed=1),
+        )
+        for token in ("yes", "no"):
+            replay.process({
+                "event_type": "book", "asset_id": token, "timestamp": "1700000000000",
+                "hash": token, "asks": [{"price": "0.40", "size": "10"}], "bids": [],
+            })
+        self.assertEqual(replay.report()["execution"]["queue_missed"], 1)
+        self.assertEqual(replay.report()["executed_opportunities"], 0)
+
+        failing = BinaryMarketReplay(
+            [market],
+            scanner=BinaryArbitrageScanner(min_net_profit_usd=0.01, min_return=0.0, safety_buffer_usd=0.0),
+            consume_fills=True,
+            fill_model=FillModel(second_leg_failure_rate=1.0, seed=7),
+        )
+        for token in ("yes", "no"):
+            failing.process({
+                "event_type": "book", "asset_id": token, "timestamp": "1700000000000",
+                "hash": token, "asks": [{"price": "0.40", "size": "10"}], "bids": [],
+            })
+        self.assertEqual(failing.report()["execution"]["second_leg_failed"], 1)
+        self.assertTrue(failing.report()["pnl_is_simulated"])
 
 
 if __name__ == "__main__":

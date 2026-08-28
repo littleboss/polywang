@@ -70,11 +70,13 @@ class MacroRelease:
 class MacroSignal:
     strategy: str
     event_id: str
+    market_id: str
     market_price: float
     fair_probability: float
     edge: float
     eligible: bool
     reason: str
+    executable: bool = False
 
 
 class MacroEventModel:
@@ -83,7 +85,8 @@ class MacroEventModel:
     def __init__(self, tracker: CalibrationTracker, strategy: str = "macro-event-v1",
                  prior_weight: float = 1.0, surprise_weight: float = 0.35,
                  intercept: float = 0.0, min_edge: float = 0.03,
-                 max_age_seconds: float = 120.0):
+                 max_age_seconds: float = 120.0,
+                 market_map: Optional[dict] = None):
         self.tracker = tracker
         self.strategy = strategy
         self.prior_weight = float(prior_weight)
@@ -91,25 +94,39 @@ class MacroEventModel:
         self.intercept = float(intercept)
         self.min_edge = max(0.0, float(min_edge))
         self.max_age_ms = max(1, int(float(max_age_seconds) * 1000))
+        self.market_map = {str(key): str(value) for key, value in (market_map or {}).items()}
+        self.seen_event_ids = set()
 
     def predict(self, release: MacroRelease, market_price: float,
-                now_ms: int) -> MacroSignal:
+                now_ms: int, market_id: str = "") -> MacroSignal:
+        mapped = str(market_id or self.market_map.get(release.indicator, "") or "")
+        if release.event_id in self.seen_event_ids:
+            return MacroSignal(self.strategy, release.event_id, mapped, market_price, market_price,
+                               0.0, False, "duplicate macro event_id")
         price = _clamp(market_price)
         fair = _sigmoid(self.intercept + self.prior_weight * _logit(price)
                         + self.surprise_weight * release.surprise_z)
         edge = fair - price
         fresh = 0 <= int(now_ms) - release.released_at_ms <= self.max_age_ms
         ready = self.tracker.is_live_ready(self.strategy)
-        eligible = fresh and ready and abs(edge) >= self.min_edge
-        if not fresh:
+        if not mapped and self.market_map:
+            reason = "macro indicator is not mapped to a market"
+            eligible = False
+        elif not fresh:
             reason = "macro release is outside freshness window"
+            eligible = False
         elif not ready:
             reason = "macro model lacks out-of-sample calibration evidence"
+            eligible = False
         elif abs(edge) < self.min_edge:
             reason = "macro edge is below execution threshold"
+            eligible = False
         else:
             reason = "calibrated macro signal passed freshness and edge gates"
-        return MacroSignal(self.strategy, release.event_id, price, fair, edge, eligible, reason)
+            eligible = True
+        self.seen_event_ids.add(release.event_id)
+        return MacroSignal(self.strategy, release.event_id, mapped, price, fair, edge,
+                           eligible, reason, executable=False)
 
     def record_settlement(self, signal: MacroSignal, yes_won: bool) -> None:
         self.tracker.record(signal.strategy, signal.fair_probability, int(bool(yes_won)))
