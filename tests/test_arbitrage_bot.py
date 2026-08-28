@@ -86,5 +86,147 @@ class SettlementMappingTests(unittest.TestCase):
             self.assertIn("updated_at", payload)
 
 
+class ResearchExecutionPathTests(unittest.TestCase):
+    def _runner(self, directory, market=None):
+        from polywang.arbitrage_core import LiveDirectionalJournal, PaperDirectionalExecutor
+        binary = market or BinaryMarket("m1", "c1", "Test", "yes-token", "no-token")
+        runner = PaperMarketRunner(
+            [binary], os.path.join(directory, "ledger.json"), 100.0,
+            BinaryArbitrageScanner(min_net_profit_usd=0.01, min_return=0.0, safety_buffer_usd=0.0),
+        )
+        journal = LiveDirectionalJournal(os.path.join(directory, "dir.json"))
+        runner.directional_executor = PaperDirectionalExecutor(journal)
+        return runner, binary, journal
+
+    def _synced_book(self, ask=0.42, bid=0.40, timestamp_ms=1_700_000_000_000):
+        from polywang.arbitrage_core import OrderBook
+        book = OrderBook()
+        book.asks = {ask: 20.0}
+        book.bids = {bid: 20.0}
+        book.synced = True
+        book.timestamp_ms = timestamp_ms
+        return book
+
+    def test_runner_skips_cross_leg_timestamp_skew(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ, {"WHALE_STATE_PATH": "", "MAX_LEG_SKEW_MS": "500"}, clear=False,
+        ):
+            market = BinaryMarket("m1", "c1", "Test", "yes-token", "no-token")
+            runner = PaperMarketRunner(
+                [market], os.path.join(directory, "ledger.json"), 100.0,
+                BinaryArbitrageScanner(min_net_profit_usd=0.01, min_return=0.0, safety_buffer_usd=0.0),
+            )
+            runner.max_book_age_seconds = 1e9
+            now = int(__import__("time").time() * 1000)
+            asyncio.run(runner.process({
+                "event_type": "book", "asset_id": "yes-token", "timestamp": str(now),
+                "hash": "y", "asks": [{"price": "0.40", "size": "10"}], "bids": [],
+            }))
+            asyncio.run(runner.process({
+                "event_type": "book", "asset_id": "no-token", "timestamp": str(now + 2000),
+                "hash": "n", "asks": [{"price": "0.40", "size": "10"}], "bids": [],
+            }))
+            self.assertEqual(runner.ledger.state["positions"], {})
+
+    def test_sports_candidate_fills_through_directional_executor(self):
+        from polywang.arbitrage_bot import process_sports_observation
+        from polywang.polymarket_edge import CalibrationTracker
+        from polywang.sports_channel import SportsLatencyGate, SportsMarketMap, SportsStateTracker
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ, {"WHALE_STATE_PATH": "", "MAX_ORDER_USD": "10"}, clear=False,
+        ):
+            market = BinaryMarket("m-home", "c1", "Test", "yes-token", "no-token")
+            runner, _, journal = self._runner(directory, market)
+            runner.books["yes-token"] = self._synced_book(ask=0.42)
+            calibration = CalibrationTracker(min_samples=2)
+            calibration.record("sports-latency-v1", 0.9, 1)
+            calibration.record("sports-latency-v1", 0.1, 0)
+            runner.calibration = calibration
+            observation = SportsStateTracker().observe({
+                "gameId": "g1", "status": "LIVE", "live": True, "ended": False,
+                "score": "2-0", "period": "70'", "source_timestamp": 1_700_000_004_000,
+            }, received_at_ms=1_700_000_005_000)
+            mapping = SportsMarketMap({"g1": {"market_id": "m-home", "yes_means": "home"}})
+            candidate = asyncio.run(process_sports_observation(
+                observation, runner, mapping,
+                SportsLatencyGate(max_age_seconds=5, min_delay_ms=100, max_delay_ms=5_000),
+                runner.directional_executor, allow_execution=True, min_edge=0.03,
+            ))
+            self.assertTrue(candidate.executable)
+            self.assertGreater(journal.open_exposure(), 0.0)
+            self.assertAlmostEqual(journal.inventory_by_token()["yes-token"], 20.0)
+
+    def test_macro_vendor_jsonl_fills_through_directional_executor(self):
+        from polywang.arbitrage_bot import process_macro_release
+        from polywang.macro_model import MacroEventModel, MacroRelease
+        from polywang.polymarket_edge import CalibrationTracker
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ, {"WHALE_STATE_PATH": "", "MAX_ORDER_USD": "10"}, clear=False,
+        ):
+            runner, _, journal = self._runner(directory)
+            runner.books["yes-token"] = self._synced_book(ask=0.50)
+            tracker = CalibrationTracker(min_samples=2)
+            tracker.record("macro-event-v1", 0.9, 1)
+            tracker.record("macro-event-v1", 0.1, 0)
+            runner.calibration = tracker
+            model = MacroEventModel(
+                tracker, min_edge=0.01, surprise_weight=1.0, market_map={"cpi": "m1"},
+            )
+            model.allow_execution = True
+            release = MacroRelease.from_payload({
+                "id": "e-print", "indicator": "cpi", "print": 5.0,
+                "forecast": 4.0, "stdev": 0.5, "timestamp": 1_700_000_000,
+            })
+            signal = asyncio.run(process_macro_release(
+                runner, model, release, now_ms=1_700_000_001_000,
+            ))
+            self.assertTrue(signal.executable)
+            self.assertGreater(journal.open_exposure(), 0.0)
+
+    def test_crypto_buy_then_exit_sells_inventory(self):
+        from polywang.arbitrage_bot import process_crypto_quote
+        from polywang.crypto_model import CryptoObservation, CryptoReferenceQuote, CryptoStatArbModel
+        from polywang.polymarket_edge import CalibrationTracker
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ, {"WHALE_STATE_PATH": "", "MAX_ORDER_USD": "10"}, clear=False,
+        ):
+            runner, _, journal = self._runner(directory)
+            history_time = 1_700_000_000_000
+            book = self._synced_book(ask=0.20, bid=0.19, timestamp_ms=history_time + 12)
+            runner.books["yes-token"] = book
+            tracker = CalibrationTracker(min_samples=1)
+            tracker.record("crypto-spread-v1", 0.9, 1)
+            model = CryptoStatArbModel(
+                tracker, entry_zscore=1.0, exit_zscore=0.5, allow_execution=True,
+                max_reference_lag_ms=1_000,
+            )
+            for index in range(12):
+                market_p = 0.50 + (0.01 if index % 2 == 0 else -0.01)
+                model.observe(
+                    CryptoObservation("m1", market_p, 0.5, history_time + index,
+                                      market_timestamp_ms=history_time + index),
+                    history_time + index,
+                )
+            buy = asyncio.run(process_crypto_quote(
+                runner, model,
+                CryptoReferenceQuote("m1", history_time + 12, 0.5, source="fixture"),
+                now_ms=history_time + 12,
+            ))
+            self.assertEqual(buy.action, "ENTER")
+            self.assertTrue(buy.executable)
+            self.assertIn("yes-token", journal.inventory_by_token())
+            book.asks = {0.50: 20.0}
+            book.bids = {0.49: 20.0}
+            book.timestamp_ms = history_time + 13
+            exit_signal = asyncio.run(process_crypto_quote(
+                runner, model,
+                CryptoReferenceQuote("m1", history_time + 13, 0.5, source="fixture"),
+                now_ms=history_time + 13,
+            ))
+            self.assertEqual(exit_signal.action, "EXIT")
+            self.assertEqual(journal.inventory_by_token(), {})
+            self.assertIsNone(model.inventory.get("m1"))
+
+
 if __name__ == "__main__":
     unittest.main()

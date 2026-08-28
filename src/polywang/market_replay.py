@@ -110,7 +110,8 @@ class BinaryMarketReplay:
     def __init__(self, markets: Iterable[BinaryMarket], scanner: Optional[BinaryArbitrageScanner] = None,
                  consume_fills: bool = False, execution_latency_ms: int = 0,
                  max_book_age_seconds: Optional[float] = None,
-                 fill_model: Optional[FillModel] = None):
+                 fill_model: Optional[FillModel] = None,
+                 max_leg_skew_ms: int = 1000):
         self.markets: Dict[str, BinaryMarket] = {market.market_id: market for market in markets}
         self.token_to_market = {
             token: market
@@ -125,6 +126,7 @@ class BinaryMarketReplay:
             None if max_book_age_seconds is None
             else max(1, int(float(max_book_age_seconds) * 1000))
         )
+        self.max_leg_skew_ms = max(0, int(max_leg_skew_ms))
         self.fill_model = fill_model or FillModel()
         self._rng = random.Random(self.fill_model.seed)
         self.opportunities: List[ReplayOpportunity] = []
@@ -135,7 +137,7 @@ class BinaryMarketReplay:
             "signals": 0, "executed": 0, "latency_missed": 0,
             "stale_missed": 0, "depth_missed": 0, "pending_at_end": 0,
             "rejected": 0, "queue_missed": 0, "second_leg_failed": 0,
-            "fee_backfills": 0,
+            "fee_backfills": 0, "unsynced_skipped": 0, "skew_missed": 0,
             "simulated": True,
         }
 
@@ -194,8 +196,11 @@ class BinaryMarketReplay:
             market = self.markets[pending["market_id"]]
             yes_book = self.books.get(market.yes_token_id)
             no_book = self.books.get(market.no_token_id)
-            if not yes_book or not no_book or not yes_book.timestamp_ms or not no_book.timestamp_ms:
+            if not yes_book or not no_book or not yes_book.synced or not no_book.synced:
                 self.execution_stats["depth_missed"] += 1
+                continue
+            if abs(yes_book.timestamp_ms - no_book.timestamp_ms) > self.max_leg_skew_ms:
+                self.execution_stats["skew_missed"] += 1
                 continue
             if self.max_book_age_ms is not None and now_ms - min(yes_book.timestamp_ms, no_book.timestamp_ms) > self.max_book_age_ms:
                 self.execution_stats["stale_missed"] += 1
@@ -228,6 +233,12 @@ class BinaryMarketReplay:
             yes_book = self.books.get(market.yes_token_id)
             no_book = self.books.get(market.no_token_id)
             if not yes_book or not no_book:
+                continue
+            if not yes_book.synced or not no_book.synced:
+                self.execution_stats["unsynced_skipped"] += 1
+                continue
+            if abs(yes_book.timestamp_ms - no_book.timestamp_ms) > self.max_leg_skew_ms:
+                self.execution_stats["skew_missed"] += 1
                 continue
             if (self.max_book_age_ms is not None and event_time_ms > 0
                     and event_time_ms - min(yes_book.timestamp_ms, no_book.timestamp_ms) > self.max_book_age_ms):
@@ -345,6 +356,8 @@ def main() -> int:
                         help="delay simulated fills by this many milliseconds")
     parser.add_argument("--max-book-age-seconds", type=float, default=None,
                         help="reject opportunities whose two books are older than this")
+    parser.add_argument("--max-leg-skew-ms", type=int, default=1000,
+                        help="reject opportunities whose Yes/No book timestamps differ by more than this")
     parser.add_argument("--fill-probability", type=float, default=1.0)
     parser.add_argument("--rejection-rate", type=float, default=0.0)
     parser.add_argument("--second-leg-failure-rate", type=float, default=0.0)
@@ -373,6 +386,7 @@ def main() -> int:
         consume_fills=args.consume_fills,
         execution_latency_ms=args.execution_latency_ms,
         max_book_age_seconds=args.max_book_age_seconds,
+        max_leg_skew_ms=args.max_leg_skew_ms,
         fill_model=FillModel(
             fill_probability=args.fill_probability,
             rejection_rate=args.rejection_rate,

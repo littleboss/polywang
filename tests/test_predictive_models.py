@@ -18,6 +18,23 @@ class PredictiveModelTests(unittest.TestCase):
             "reference_probability": 0.5, "timestamp_ms": 1700000000000,
         }))
 
+    def test_macro_release_accepts_vendor_field_aliases(self):
+        release = MacroRelease.from_payload({
+            "id": "e-print", "indicator": "cpi", "print": 5.0,
+            "forecast": 4.0, "stdev": 0.5, "timestamp": 1_700_000_000,
+        })
+        self.assertIsNotNone(release)
+        self.assertEqual(release.event_id, "e-print")
+        self.assertAlmostEqual(release.actual, 5.0)
+        self.assertAlmostEqual(release.consensus, 4.0)
+        self.assertEqual(release.released_at_ms, 1_700_000_000_000)
+        survey = MacroRelease.from_payload({
+            "event_id": "e2", "series": "nfp", "actual": 200.0,
+            "survey": 180.0, "sigma": 10.0, "timestamp_ms": 1_700_000_001_000,
+        })
+        self.assertEqual(survey.indicator, "nfp")
+        self.assertAlmostEqual(survey.consensus, 180.0)
+
     def test_macro_model_rejects_until_calibration_is_ready(self):
         tracker = CalibrationTracker(min_samples=2)
         model = MacroEventModel(tracker, min_edge=0.01)
@@ -161,6 +178,26 @@ class PredictiveModelTests(unittest.TestCase):
         exit_signal = model.observe(CryptoObservation("m", 0.50, 0.5, history_time + 13), history_time + 13)
         self.assertEqual(exit_signal.action, "EXIT")
         self.assertTrue(exit_signal.executable)
+
+    def test_crypto_lag_uses_market_book_timestamp_not_wall_clock(self):
+        tracker = CalibrationTracker(min_samples=1)
+        tracker.record("crypto-spread-v1", 0.9, 1)
+        model = CryptoStatArbModel(tracker, entry_zscore=1.0, max_reference_lag_ms=1_000)
+        history_time = 1_700_000_000_000
+        for index in range(12):
+            market_p = 0.50 + (0.01 if index % 2 == 0 else -0.01)
+            model.observe(CryptoObservation("m", market_p, 0.5, history_time + index), history_time + index)
+        lagged = model.observe(
+            CryptoObservation("m", 0.2, 0.5, history_time + 12, market_timestamp_ms=history_time + 5_000),
+            history_time + 12,
+        )
+        self.assertFalse(lagged.eligible)
+        self.assertIn("basis", lagged.reason)
+        aligned = model.observe(
+            CryptoObservation("m", 0.2, 0.5, history_time + 13, market_timestamp_ms=history_time + 13),
+            history_time + 13,
+        )
+        self.assertTrue(aligned.eligible)
 
 
 if __name__ == "__main__":

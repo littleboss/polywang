@@ -1100,6 +1100,55 @@ class LiveExecutorTests(unittest.TestCase):
             asyncio.run(executor.apply_halt_actions(risk))
             self.assertEqual(client.cancelled, ["resting-1"])
 
+    def test_kill_switch_faks_directional_inventory_but_not_hedged_pairs(self):
+        from polywang.arbitrage_core import DirectionalIntent, LiveDirectionalJournal, PaperDirectionalExecutor
+
+        class FlattenClient(FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.open = []
+
+            async def list_open_orders(self, **kwargs):
+                return list(self.open)
+
+            async def cancel_order(self, **kwargs):
+                return {"ok": True, "order_id": kwargs["order_id"]}
+
+            async def get_balance_allowance(self, **kwargs):
+                if kwargs.get("asset_type") == "CONDITIONAL":
+                    return {"balance": "10000000", "allowances": {"c": "0"}}
+                return await super().get_balance_allowance(**kwargs)
+
+        with tempfile.TemporaryDirectory() as directory:
+            pairs = LiveOrderJournal(os.path.join(directory, "live.json"))
+            directional = LiveDirectionalJournal(os.path.join(directory, "dir.json"))
+            asyncio.run(OfficialFOKExecutor(FakeClient(), journal=pairs).execute(self.opportunity()))
+            next(iter(pairs.state["pairs"].values()))["status"] = "HEDGED"
+            pairs.save()
+            PaperDirectionalExecutor(directional).execute(DirectionalIntent(
+                token_id="yes-token", side="BUY", shares=5, limit_price=0.40, market_id="m1",
+            ))
+            self.assertAlmostEqual(directional.inventory_by_token()["yes-token"], 5.0)
+            client = FlattenClient()
+            executor = OfficialFOKExecutor(
+                client, journal=LiveOrderJournal(pairs.path), directional_journal=directional,
+            )
+            risk = LiveRiskController(
+                executor.journal, equity_usd=100.0,
+                state_path=os.path.join(directory, "risk.json"),
+                kill_switch_path="", extra_journals=[directional],
+            )
+            risk.halt("manual kill")
+            flatten = asyncio.run(executor.apply_halt_actions(risk))
+            sells = [call for call in client.calls if call.get("side") == "SELL"]
+            self.assertEqual(len(sells), 1)
+            self.assertEqual(sells[0]["order_type"], "FAK")
+            self.assertEqual(sells[0]["token_id"], "yes-token")
+            self.assertNotIn("yes-token", directional.inventory_by_token())
+            self.assertEqual(len(flatten["inventory"]["pairs"]), 1)
+            self.assertIn("not auto-sold", flatten["note"])
+            self.assertEqual(len(flatten["directional_flatten"]["flattened"]), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

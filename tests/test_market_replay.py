@@ -175,6 +175,26 @@ class ReplayTests(unittest.TestCase):
         self.assertGreaterEqual(replay.report()["opportunities"], 1)
         self.assertGreaterEqual(replay.execution_stats["fee_backfills"], 1)
         self.assertTrue(replay.report()["pnl_is_simulated"])
+        self.assertFalse(replay.books["yes"].synced)
+        self.assertGreaterEqual(replay.execution_stats["unsynced_skipped"], 1)
+
+    def test_replay_skips_cross_leg_timestamp_skew(self):
+        market = BinaryMarket("m1", "c1", "Test", "yes", "no", category="geopolitics")
+        replay = BinaryMarketReplay(
+            [market],
+            scanner=BinaryArbitrageScanner(min_net_profit_usd=0.01, min_return=0.0, safety_buffer_usd=0.0),
+            max_leg_skew_ms=500,
+        )
+        replay.process({
+            "event_type": "book", "asset_id": "yes", "timestamp": "1700000000000", "hash": "y1",
+            "asks": [{"price": "0.40", "size": "10"}], "bids": [],
+        })
+        found = replay.process({
+            "event_type": "book", "asset_id": "no", "timestamp": "1700000002000", "hash": "n1",
+            "asks": [{"price": "0.40", "size": "10"}], "bids": [],
+        })
+        self.assertEqual(found, [])
+        self.assertEqual(replay.execution_stats["skew_missed"], 1)
 
 
 if __name__ == "__main__":
