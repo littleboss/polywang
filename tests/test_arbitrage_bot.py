@@ -86,6 +86,60 @@ class SettlementMappingTests(unittest.TestCase):
             self.assertIn("updated_at", payload)
 
 
+class UniverseSelectionTests(unittest.TestCase):
+    def test_fetch_markets_ranks_by_breakeven_ticks_not_volume_order(self):
+        from polywang.arbitrage_bot import fetch_markets
+        rows = [
+            {
+                "id": "vol-mid", "conditionId": "c1", "question": "Busy mid",
+                "clobTokenIds": '["y1", "n1"]', "outcomes": '["Yes", "No"]',
+                "outcomePrices": '["0.50", "0.50"]', "category": "politics",
+                "active": True, "closed": False,
+            },
+            {
+                "id": "geo", "conditionId": "c2", "question": "Geopolitics",
+                "clobTokenIds": '["y2", "n2"]', "outcomes": '["Yes", "No"]',
+                "outcomePrices": '["0.55", "0.45"]', "category": "geopolitics",
+                "active": True, "closed": False,
+            },
+            {
+                "id": "extreme", "conditionId": "c3", "question": "Extreme politics",
+                "clobTokenIds": '["y3", "n3"]', "outcomes": '["Yes", "No"]',
+                "outcomePrices": '["0.95", "0.05"]', "category": "politics",
+                "active": True, "closed": False,
+            },
+        ]
+
+        def getter(params):
+            self.assertEqual(params["order"], "volume_24hr")
+            return list(rows)
+
+        selected = fetch_markets(2, get=getter, pool=3)
+        self.assertEqual([market.market_id for market in selected], ["geo", "extreme"])
+
+    def test_fetch_markets_logs_negrisk_without_selecting_it(self):
+        from polywang.arbitrage_bot import fetch_markets
+        rows = [
+            {
+                "id": "nr", "conditionId": "cnr", "question": "Who wins",
+                "clobTokenIds": '["a", "b", "c", "d"]',
+                "outcomes": '["A", "B", "C", "D"]',
+                "outcomePrices": '["0.30", "0.25", "0.20", "0.15"]',
+                "negRisk": True, "active": True, "closed": False,
+            },
+            {
+                "id": "bin", "conditionId": "cb", "question": "Binary",
+                "clobTokenIds": '["y", "n"]', "outcomes": '["Yes", "No"]',
+                "outcomePrices": '["0.40", "0.60"]', "category": "geopolitics",
+                "active": True, "closed": False,
+            },
+        ]
+        with self.assertLogs("arbitrage-bot", level="INFO") as captured:
+            selected = fetch_markets(5, get=lambda params: rows, pool=5)
+        self.assertEqual([market.market_id for market in selected], ["bin"])
+        self.assertTrue(any("NEGRISK OBSERVE" in line for line in captured.output))
+
+
 class ResearchExecutionPathTests(unittest.TestCase):
     def _runner(self, directory, market=None):
         from polywang.arbitrage_core import LiveDirectionalJournal, PaperDirectionalExecutor

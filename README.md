@@ -45,7 +45,7 @@ live 或 paper 运行时设置 `MARKET_EVENT_LOG=market-events.jsonl` 可记录�
 uv run polywang --markets 100 --cash 1000
 ```
 
-它只研究 Yes 和 No 两腿同时买入后合计支付 1.00 的二元市场。机会必须使用订单簿中的实际 ask 和深度，并覆盖两腿 taker 费用、可选 merge gas（`MERGE_GAS_USD`）、资金安全缓冲和最大仓位；纸面成交写入 `paper-ledger.json`，程序重启后会恢复账本。两腿仍是顺序 FOK，不是原子交易，`is_risk_free` 恒为 false。
+它只研究 Yes 和 No 两腿同时买入后合计支付 1.00 的二元市场。选市会先拉一个按成交量过滤的候选池（`MARKET_SCAN_POOL`），再按「1 tick 错价扣完 taker 费后是否仍为正」排序，所以 geopolitics 和极端价位会排在 0.50 附近的高费率市场前面。NegRisk 多结果市场只观测、不走双腿 FOK。机会必须使用订单簿中的实际 ask 和深度，并覆盖两腿 taker 费用、可选 merge gas（`MERGE_GAS_USD`）、资金安全缓冲和最大仓位；纸面成交写入 `paper-ledger.json`，程序重启后会恢复账本。两腿仍是顺序 FOK，不是原子交易，`is_risk_free` 恒为 false。小额阶段保持 `AUTO_MERGE_COMPLETE_SETS=0`：merge gas 是固定成本，未实测就填 0 并打开自动 merge 会把亏损单显示成盈利。
 
 新引擎只有在显式设置 `POLYMARKET_LIVE_CONFIRM=I_UNDERSTAND_THE_RISK`、官方 geoblock 放行、私钥存在且安装了 live extra 时，才会使用两腿 FOK 执行器：
 

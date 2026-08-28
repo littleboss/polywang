@@ -45,6 +45,19 @@ class MarketAndBookTests(unittest.TestCase):
         self.assertAlmostEqual(parsed.taker_fee_rate, 0.02)
         self.assertEqual(parsed.fee_exponent, 2.0)
 
+    def test_gamma_market_parses_implied_yes_from_outcome_prices(self):
+        parsed = BinaryMarket.from_gamma({
+            "id": "7", "conditionId": "c7", "question": "Test",
+            "clobTokenIds": '["y", "n"]', "outcomes": '["Yes", "No"]',
+            "outcomePrices": '["0.95", "0.05"]', "category": "politics",
+        })
+        self.assertAlmostEqual(parsed.implied_yes, 0.95)
+        missing = BinaryMarket.from_gamma({
+            "id": "7", "conditionId": "c7", "question": "Test",
+            "clobTokenIds": '["y", "n"]', "outcomes": '["Yes", "No"]',
+        })
+        self.assertIsNone(missing.implied_yes)
+
     def test_gamma_market_rejects_incomplete_or_duplicate_identifiers(self):
         self.assertIsNone(BinaryMarket.from_gamma({
             "id": "", "conditionId": "c7", "clobTokenIds": '["y", "n"]',

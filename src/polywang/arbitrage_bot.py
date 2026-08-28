@@ -27,8 +27,10 @@ from .sports_channel import (
 from .market_replay import JsonlEventRecorder
 from .macro_model import JsonlMacroFeed, MacroEventModel, MacroRelease
 from .crypto_model import CryptoObservation, CryptoStatArbModel, JsonlCryptoFeed
-from .polymarket_edge import CalibrationTracker, EdgeEvaluator
-
+from .polymarket_edge import (
+    CalibrationTracker, EdgeEvaluator, NegRiskScanner,
+    combo_arb_universe_score, merge_gas_startup_warning, rank_combo_arb_markets,
+)
 from .arbitrage_core import (
     BinaryArbitrageScanner,
     BinaryMarket,
@@ -49,6 +51,7 @@ from .arbitrage_core import (
     intent_from_best_ask,
     intent_from_inventory_bid,
     _event_name,
+    _gamma_outcome_prices,
 )
 
 
@@ -110,24 +113,83 @@ def write_health(path: str, payload: dict) -> None:
         handle.write("\n")
 
 
-def fetch_markets(limit: int) -> List[BinaryMarket]:
-    """Fetch active binary markets and keep only markets with two outcomes."""
-    response = requests.get(
-        GAMMA_URL,
-        params={"closed": "false", "active": "true", "limit": limit, "order": "volume_24hr", "ascending": "false"},
-        timeout=10,
-    )
-    response.raise_for_status()
-    payload = response.json()
-    rows = payload if isinstance(payload, list) else payload.get("data", [])
-    markets = []
+def fetch_markets(limit: int, *, get=None, pool: Optional[int] = None) -> List[BinaryMarket]:
+    """Fetch a volume-ordered pool, then keep the binary markets closest to combo-arb breakeven."""
+    getter = get or _http_get_gamma
+    keep = max(1, int(limit))
+    pool_size = int(pool if pool is not None else env_int("MARKET_SCAN_POOL", max(keep * 5, 100)))
+    pool_size = max(keep, pool_size)
+    rows = _fetch_gamma_rows(pool_size, getter)
+    binary: List[BinaryMarket] = []
     for row in rows:
         if not isinstance(row, dict):
             continue
         parsed = BinaryMarket.from_gamma(row)
-        if parsed and parsed.active:
-            markets.append(parsed)
-    return markets
+        if parsed and parsed.active and not parsed.neg_risk:
+            binary.append(parsed)
+        elif env_bool("ENABLE_NEGRISK_OBSERVE", True):
+            _log_negrisk_observation(row)
+    ranked = rank_combo_arb_markets(binary)
+    selected = ranked[:keep]
+    if selected:
+        head = selected[0]
+        score = combo_arb_universe_score(
+            head.category, head.implied_yes, tick_size=head.tick_size,
+            taker_fee_rate=head.taker_fee_rate, fee_exponent=head.fee_exponent,
+        )
+        LOG.info(
+            "Universe: %d binary candidates ranked, keeping %d; "
+            "top %s ticks_to_breakeven=%d one_tick_net=%.4f implied_yes=%s",
+            len(binary), len(selected), head.category, score.ticks_to_breakeven,
+            score.one_tick_net,
+            "unknown" if head.implied_yes is None else f"{head.implied_yes:.3f}",
+        )
+    return selected
+
+
+def _http_get_gamma(params: dict) -> list:
+    response = requests.get(GAMMA_URL, params=params, timeout=10)
+    response.raise_for_status()
+    payload = response.json()
+    rows = payload if isinstance(payload, list) else payload.get("data", [])
+    return rows if isinstance(rows, list) else []
+
+
+def _fetch_gamma_rows(pool: int, getter) -> list:
+    page_size = min(100, max(1, int(pool)))
+    rows: list = []
+    offset = 0
+    while len(rows) < pool:
+        batch = getter({
+            "closed": "false",
+            "active": "true",
+            "limit": min(page_size, pool - len(rows)),
+            "offset": offset,
+            "order": "volume_24hr",
+            "ascending": "false",
+        })
+        if not isinstance(batch, list) or not batch:
+            break
+        rows.extend(item for item in batch if isinstance(item, dict))
+        offset += len(batch)
+        if len(batch) < page_size:
+            break
+    return rows[:pool]
+
+
+def _log_negrisk_observation(row: dict) -> None:
+    """Log a NegRisk complete-set dislocation. Never route it to the binary FOK executor."""
+    prices = _gamma_outcome_prices(row)
+    if not prices:
+        return
+    market_id = str(row.get("id", row.get("conditionId", "")) or "")
+    opportunity = NegRiskScanner(min_net_margin=0.01).scan(market_id, prices)
+    if opportunity is None or not opportunity.tradeable:
+        return
+    LOG.info(
+        "NEGRISK OBSERVE: %s | %s | %s | not routed to the binary FOK executor",
+        opportunity.market_id, opportunity.direction, opportunity.note,
+    )
 
 
 def _events(payload) -> Iterable[dict]:
@@ -795,6 +857,11 @@ def main() -> int:
         max_levels=env_int("LIVE_MAX_BOOK_LEVELS", 1) if args.live else None,
         merge_gas_usd=env_float("MERGE_GAS_USD", 0.0),
     )
+    gas_warning = merge_gas_startup_warning(
+        env_float("MERGE_GAS_USD", 0.0), args.max_order, env_bool("AUTO_MERGE_COMPLETE_SETS"),
+    )
+    if gas_warning:
+        LOG.warning("%s", gas_warning)
     if args.live:
         geoblock = requests.get("https://polymarket.com/api/geoblock", timeout=5).json()
         if geoblock.get("blocked"):
