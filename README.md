@@ -4,20 +4,25 @@ Polymarket 确定性二元套利与钱包流量情报机器人。
 
 核心目标是先验证可锁定的 Yes/No 组合价差，再将真实钱包流量作为独立的统计确认信号。钱包协同不是无风险套利，也不会绕过确定性套利执行器的风控。
 
+依赖用 [UV](https://docs.astral.sh/uv/) 和 `pyproject.toml` 管理，源码在 `src/polywang/`。
+
 ## 快速开始
 
 ```bash
-# 纸面市场流需要 Python 3.10+、requests 和 websockets；不需要任何密钥
-pip install requests websockets
+# 安装 UV 后，创建虚拟环境并装上纸面交易依赖（Python 3.11+）
+uv sync
 
-# 跑单元测试
-python3 -m unittest -v test_polymarket_edge test_arbitrage_core test_arbitrage_bot test_whale_intelligence test_market_replay test_sports_channel test_predictive_models test_directional_executor
+# 跑单元测试（不联网）
+uv run python -m unittest discover -s tests -v
+
+# 纸面扫描，不需要密钥
+uv run polywang --markets 100 --cash 1000
 ```
 
 历史盘口回放使用 Gamma 市场 JSON 和原始 CLOB 事件 JSONL，并复用线上同一套盘口/手续费/深度扫描逻辑：
 
 ```bash
-python3 market_replay.py --markets fixtures/replay/markets.json --events fixtures/replay/events.jsonl --consume-fills
+uv run polywang-replay --markets fixtures/replay/markets.json --events fixtures/replay/events.jsonl --consume-fills
 ```
 
 仓库自带 `fixtures/replay/` 作为可提交的示例数据集。回放会按事件里的 `fee_rate_bps` 回填费率，并用排队/拒单/第二腿失败模型估计成交；`executed_net_profit` 仍然是模拟值。
@@ -26,35 +31,35 @@ live 或 paper 运行时设置 `MARKET_EVENT_LOG=market-events.jsonl` 可记录�
 
 回放结果只是“按记录盘口可见的机会报告”，还需要用真实订单回报校验成交率、延迟、拒单和实际手续费，不能把回放净收益直接当成可实现 PnL。启用 `--consume-fills` 和执行延迟后，`executed_net_profit` 只代表通过模拟深度、价格上限和新鲜度检查的回放成交；顶层 `net_profit` 仍是所有可见信号的汇总，不能替代真实 PnL。
 
-`sports_channel.py` 在默认配置下只记日志。设置 `ENABLE_SPORTS_EXECUTION=1`（实盘还需 `ENABLE_SPORTS_LIVE=1`）、`SPORTS_MARKET_MAP` 以及通过校准/边际闸门后，候选会走独立的方向性 BUY 执行器，而不是 Yes+No 组合 FOK。
+`src/polywang/sports_channel.py` 在默认配置下只记日志。设置 `ENABLE_SPORTS_EXECUTION=1`（实盘还需 `ENABLE_SPORTS_LIVE=1`）、`SPORTS_MARKET_MAP` 以及通过校准/边际闸门后，候选会走独立的方向性 BUY 执行器，而不是 Yes+No 组合 FOK。
 
-`macro_model.py` 从 `MACRO_FEED_PATH` JSONL 读取带时间戳的 actual/consensus/std，按 `event_id` 去重，并可用 `MACRO_MARKET_MAP` 绑定指标到市场。`crypto_model.py` 从 `CRYPTO_REFERENCE_FEED_PATH` 读取独立参考概率，或用 spot/strike/vol/T 计算数字期权 `N(d2)`；进入对侧 Polymarket token，退出用 SELL 平自有库存，不用 CEX 期货对冲。两者默认 `executable=false`，只有显式执行开关、样本外校准和风控限额同时满足才会下单。
+`src/polywang/macro_model.py` 从 `MACRO_FEED_PATH` JSONL 读取带时间戳的 actual/consensus/std，按 `event_id` 去重，并可用 `MACRO_MARKET_MAP` 绑定指标到市场。`src/polywang/crypto_model.py` 从 `CRYPTO_REFERENCE_FEED_PATH` 读取独立参考概率，或用 spot/strike/vol/T 计算数字期权 `N(d2)`；进入对侧 Polymarket token，退出用 SELL 平自有库存，不用 CEX 期货对冲。两者默认 `executable=false`，只有显式执行开关、样本外校准和风控限额同时满足才会下单。
 
-启动时会读取本地 `.env`（不覆盖已有环境变量）。模板见 `.env.example`。实盘循环会写 `live-health.json`；`python3 arbitrage_bot.py --health` 可查看。收到 SIGINT/SIGTERM 时，默认 `LIVE_CANCEL_ON_SHUTDOWN=1` 会撤销未完成订单。方向性库存记在 `live-directional.json`，计入同一套暴露限额。
+启动时会读取本地 `.env`（不覆盖已有环境变量）。模板见 `.env.example`。实盘循环会写 `live-health.json`；`uv run polywang --health` 可查看。收到 SIGINT/SIGTERM 时，默认 `LIVE_CANCEL_ON_SHUTDOWN=1` 会撤销未完成订单。方向性库存记在 `live-directional.json`，计入同一套暴露限额。
 
 ## 确定性二元套利引擎
 
-项目现在另外提供一个独立的、默认纸面交易的二元套利引擎：
+纸面模式是默认路径：
 
 ```bash
-python3 arbitrage_bot.py --markets 100 --cash 1000
+uv run polywang --markets 100 --cash 1000
 ```
 
 它只研究 Yes 和 No 两腿同时买入后合计支付 1.00 的二元市场。机会必须使用订单簿中的实际 ask 和深度，并覆盖两腿 taker 费用、可选 merge gas（`MERGE_GAS_USD`）、资金安全缓冲和最大仓位；纸面成交写入 `paper-ledger.json`，程序重启后会恢复账本。两腿仍是顺序 FOK，不是原子交易，`is_risk_free` 恒为 false。
 
-新引擎只有在显式设置 `POLYMARKET_LIVE_CONFIRM=I_UNDERSTAND_THE_RISK`、官方 geoblock 放行、私钥存在且 `polymarket-client` 可用时，才会使用两腿 FOK 执行器。安装和验证官方客户端后才考虑运行：
+新引擎只有在显式设置 `POLYMARKET_LIVE_CONFIRM=I_UNDERSTAND_THE_RISK`、官方 geoblock 放行、私钥存在且安装了 live extra 时，才会使用两腿 FOK 执行器：
 
 ```bash
-.venv/bin/python -m pip install polymarket-client
+uv sync --extra live
 POLYMARKET_LIVE_CONFIRM=I_UNDERSTAND_THE_RISK \
-  .venv/bin/python arbitrage_bot.py --live --markets 100
+  uv run polywang --live --markets 100
 ```
 
 正式启动前可先只做账户和账本检查，不启动行情流、不下单：
 
 ```bash
 POLYMARKET_LIVE_CONFIRM=I_UNDERSTAND_THE_RISK \
-  .venv/bin/python arbitrage_bot.py --live --preflight --markets 20
+  uv run polywang --live --preflight --markets 20
 ```
 
 实盘启动顺序是：地理限制检查 → 官方 SDK 账户 preflight → 读取未完成 pair 的 open order / account trades / order 状态 → 核验两腿 conditional-token 余额 → 启动官方 typed market stream、私有 user stream 和持续对账任务。市场流断线后会废弃本地盘口，必须重新收到快照才恢复扫描；增量若出现 sequence 断档、hash 链断裂或未知 schema 版本，同样会清空该 token 的盘口。持续对账失败会持久化风险 halt，并撤销账户内全部 open order。启动及定期恢复轮次会扫描 journal 之外的 open order 和条件 token 持仓。实盘 pair 日志默认写入 `live-orders.json`，也可用 `--live-journal PATH` 指定。日志会保存 pair ID、condition/token ID、两腿订单 ID、请求数量、已确认成交数量、实际成交价格、手续费字段、trade ID、交易哈希、回滚状态和 `PENDING/HEDGED/RESOLVED_PENDING_REDEMPTION/SETTLED/UNHEDGED` 状态。
@@ -73,7 +78,7 @@ POLYMARKET_LIVE_CONFIRM=I_UNDERSTAND_THE_RISK \
 
 ## 大鲸情报层
 
-`whale_intelligence.py` 是独立的钱包流量情报层，由新引擎消费公开市场交易事件。它会过滤匿名或格式错误的钱包地址，按 `trade_id` 去重，保存每个钱包的交易量、持仓、结算次数、已实现 PnL 和收缩后的质量分数，并计算最近窗口内按钱包质量加权的市场净买卖压力。
+`src/polywang/whale_intelligence.py` 是独立的钱包流量情报层，由扫描器消费公开市场交易事件。它会过滤匿名或格式错误的钱包地址，按 `trade_id` 去重，保存每个钱包的交易量、持仓、结算次数、已实现 PnL 和收缩后的质量分数，并计算最近窗口内按钱包质量加权的市场净买卖压力。
 
 默认只有同时满足以下条件的交易才会被标记为可跟随的大鲸流：名义金额达到阈值、钱包有足够的历史结算样本、历史质量分数过线、近期压力方向一致。协同信号还必须属于同一 outcome、同一方向，达到最少钱包数和总金额，并限制最大单钱包金额占比；至少需要一个历史上合格的钱包。否则只记录为 `LARGE TRADE` 观察，不再把它升级为大鲸反转交易。钱包历史默认保存到 `whale-intelligence.json`，可通过 `WHALE_STATE_PATH` 修改。
 
@@ -106,9 +111,9 @@ fee = 股数 × 费率 × p × (1 - p)      # 只对 taker 收取，maker 免费
 
 如果使用环境变量文件，请由操作者自行创建 `.env`，并确保它不提交到 git。**`.env` 包含私钥，绝对不要提交到 git。**
 
-小额实盘的启动、监控、链上交易超时和停机流程见 [LIVE_RUNBOOK.md](LIVE_RUNBOOK.md)。
+小额实盘的启动、监控、链上交易超时和停机流程见 [docs/LIVE_RUNBOOK.md](docs/LIVE_RUNBOOK.md)。
 
-查看本地 live journal 状态（不联网、不读取私钥）：`python3 arbitrage_bot.py --status --live-journal live-orders.json`。
+查看本地 live journal 状态（不联网、不读取私钥）：`uv run polywang --status --live-journal live-orders.json`。
 
 ## 安全防线
 
@@ -177,22 +182,38 @@ fee = 股数 × 费率 × p × (1 - p)      # 只对 taker 收取，maker 免费
 
 ## 文件结构
 
-| 文件 | 职责 |
+```
+.
+├── pyproject.toml          # 项目元数据、依赖、命令入口
+├── uv.lock                 # UV 锁定的精确版本
+├── .python-version         # 本仓库使用的 Python 版本
+├── .env.example            # 可部署环境变量模板（不含密钥）
+├── src/polywang/           # 可安装的 Python 包
+│   ├── __main__.py         # python -m polywang
+│   ├── arbitrage_bot.py    # 市场流、纸面/实盘编排
+│   ├── arbitrage_core.py   # 扫描、账本、FOK、对账、方向性执行
+│   ├── polymarket_edge.py  # 费率、边际、凯利、校准、NegRisk
+│   ├── whale_intelligence.py
+│   ├── market_replay.py
+│   ├── sports_channel.py
+│   ├── macro_model.py
+│   └── crypto_model.py
+├── tests/                  # 单元测试，只用标准库、不联网
+├── fixtures/               # 可提交的回放/宏观/crypto 示例数据
+└── docs/LIVE_RUNBOOK.md    # 小额实盘手册
+```
+
+命令入口：
+
+| 命令 | 作用 |
 |------|------|
-| `arbitrage_bot.py` | 市场流、钱包流、纸面交易和实盘启动编排 |
-| `arbitrage_core.py` | 二元套利扫描、账本、官方 FOK 执行、对账和订单状态机 |
-| `polymarket_edge.py` | 费率模型、边际评估、凯利仓位、校准跟踪、NegRisk 扫描 |
-| `whale_intelligence.py` | 钱包过滤、历史质量、质量加权净流向、结算反馈和持久化 |
-| `market_replay.py` | JSONL 盘口历史回放、成交模型与费率回填 |
-| `sports_channel.py` | Sports Channel 消费、延迟闸门、映射与可选方向性执行 |
-| `macro_model.py` | 宏观 JSONL 数据源、surprise 模型、去重与校准闸门 |
-| `crypto_model.py` | 参考概率/数字期权适配、z-score、库存与 SELL 平仓 |
-| `.env.example` | 可部署环境变量模板（不含密钥） |
-| `test_*.py` | 单元测试，只用标准库、不联网 |
+| `uv run polywang` | 纸面/实盘扫描器 |
+| `uv run polywang-replay` | 历史盘口回放 |
+| `uv run python -m unittest discover -s tests` | 测试 |
 
 ## 修改代码时的注意事项
 
-1. 先跑 paper mode，再跑 `python3 -m unittest`。
+1. 用 `uv sync` 装依赖，再用 `uv run` 跑命令，不要混用系统 `pip`。
 2. 费率测试是**直接对照官方费率表**写的，不是对照实现写的。如果公式被改错，测试会发现。
 3. 实盘下单必须确认订单响应、私有 user stream 和重启对账；不能把订单被接受当作双腿成交。
 4. `debias_market_price` 用 Wang 变换估计物理概率（λ≈0.176，基于已结算合约标定）。

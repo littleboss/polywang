@@ -19,14 +19,14 @@ from datetime import datetime
 from typing import Dict, Iterable, List, Optional
 import random
 
-from arbitrage_core import (
+from .arbitrage_core import (
     ArbitrageOpportunity,
     BinaryArbitrageScanner,
     BinaryMarket,
     OrderBook,
     handle_market_event,
 )
-from polymarket_edge import PolymarketFeeModel
+from .polymarket_edge import PolymarketFeeModel
 
 
 class JsonlEventRecorder:

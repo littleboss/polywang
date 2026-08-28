@@ -6,11 +6,11 @@
 
 1. 使用专用小额钱包，不要在仓库、`.env`、日志或 shell 历史中保存私钥。复制 `.env.example` 为 `.env` 后只在本机填写。
 2. 确认账户所在地符合 Polymarket 官方地理限制；不要使用代理绕过限制。
-3. 安装锁定版本的依赖：`polymarket-client==0.6.0`。
-4. 先用 `MARKET_EVENT_LOG` 记录至少一段真实 CLOB 事件，再用 `market_replay.py --markets fixtures/replay/markets.json --events fixtures/replay/events.jsonl` 检查盘口快照、增量 sequence、费用回填和深度。
+3. 用 UV 安装锁定依赖：`uv sync --extra live`（会装上 `polymarket-client==0.6.0`）。
+4. 先用 `MARKET_EVENT_LOG` 记录至少一段真实 CLOB 事件，再用 `uv run polywang-replay --markets fixtures/replay/markets.json --events fixtures/replay/events.jsonl` 检查盘口快照、增量 sequence、费用回填和深度。
 5. 先以 paper 模式核对机会数量、盘口年龄、可见深度和预期净边际；回放收益不等于可成交收益。
-6. 正式启动前先运行 `--live --preflight`；它只检查 geoblock、账户余额/allowance、账本完整性和已有订单恢复，不启动行情流，也不下单。
-7. `python3 arbitrage_bot.py --health` 读取 `live-health.json`。进程在跑时应周期性更新该文件。
+6. 正式启动前先运行 `uv run polywang --live --preflight`；它只检查 geoblock、账户余额/allowance、账本完整性和已有订单恢复，不启动行情流，也不下单。
+7. `uv run polywang --health` 读取 `live-health.json`。进程在跑时应周期性更新该文件。
 
 ## 首次小额实盘
 
@@ -31,14 +31,14 @@ POLYMARKET_PRIVATE_KEY="$POLYMARKET_PRIVATE_KEY" \
 MAX_ORDER_USD=5 \
 LIVE_MAX_TOTAL_EXPOSURE_FRACTION=0.01 \
 LIVE_MAX_MARKET_EXPOSURE_FRACTION=0.01 \
-.venv/bin/python arbitrage_bot.py --live --markets 20 --max-order 5
+uv run polywang --live --markets 20 --max-order 5
 ```
 
 启动时程序必须通过 geoblock、账户余额/allowance、未完成订单和成交恢复、账本完整性以及风险状态检查。任何 `UNHEDGED`、条件 token 余额不足、对账错误或 kill switch 都应停止新单。
 
 ## 日常监控
 
-- 可先运行 `python3 arbitrage_bot.py --status --live-journal live-orders.json` 查看 pair 状态、暴露、PnL、未确认结算和 `UNHEDGED` 列表；该命令不联网、不读取私钥。
+- 可先运行 `uv run polywang --status --live-journal live-orders.json` 查看 pair 状态、暴露、PnL、未确认结算和 `UNHEDGED` 列表；该命令不联网、不读取私钥。
 - `live-orders.json`：确认每个 pair 的两腿订单、实际成交、手续费、交易 hash 和状态。
 - `live-risk.json`：确认暴露、每日亏损和 halt 状态没有异常。
 - `market-events.jsonl`：保留原始/typed 市场事件和本机接收时间，用于事后回放。

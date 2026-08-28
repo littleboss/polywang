@@ -19,7 +19,7 @@ import time
 from decimal import Decimal, ROUND_DOWN
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-from polymarket_edge import PolymarketFeeModel
+from .polymarket_edge import PolymarketFeeModel
 
 
 def _json_list(value):
@@ -2059,7 +2059,7 @@ class OfficialFOKExecutor:
         try:
             from polymarket import AsyncSecureClient
         except ImportError as error:
-            raise RuntimeError("Install the official SDK with: python3 -m pip install polymarket-client") from error
+            raise RuntimeError("Install the official SDK with: uv sync --extra live") from error
         kwargs = {"private_key": private_key}
         wallet = os.getenv("POLYMARKET_WALLET_ADDRESS", "").strip()
         if wallet:

@@ -3,7 +3,7 @@ import os
 import tempfile
 import unittest
 
-from arbitrage_core import (
+from polywang.arbitrage_core import (
     BinaryMarket,
     DirectionalExecutor,
     DirectionalIntent,

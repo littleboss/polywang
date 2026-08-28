@@ -1,6 +1,6 @@
 import unittest
 
-from sports_channel import SportsLatencyGate, SportsStateTracker
+from polywang.sports_channel import SportsLatencyGate, SportsStateTracker
 
 
 class SportsChannelTests(unittest.TestCase):
@@ -45,7 +45,7 @@ class SportsChannelTests(unittest.TestCase):
         self.assertFalse(duplicate.changed)
 
     def test_unmapped_game_is_observational_only(self):
-        from sports_channel import SportsMarketMap, evaluate_sports_candidate
+        from polywang.sports_channel import SportsMarketMap, evaluate_sports_candidate
         tracker = SportsStateTracker()
         observation = tracker.observe({
             "gameId": 12, "status": "LIVE", "live": True, "ended": False,
@@ -59,7 +59,7 @@ class SportsChannelTests(unittest.TestCase):
         self.assertIn("not mapped", candidate.reason)
 
     def test_mapped_latency_candidate_is_not_routed_to_the_fok_executor(self):
-        from sports_channel import SportsMarketMap, evaluate_sports_candidate
+        from polywang.sports_channel import SportsMarketMap, evaluate_sports_candidate
         tracker = SportsStateTracker()
         observation = tracker.observe({
             "gameId": "g1", "status": "LIVE", "live": True, "ended": False,
@@ -77,7 +77,7 @@ class SportsChannelTests(unittest.TestCase):
         self.assertGreater(candidate.fair_probability, 0.5)
 
     def test_allow_execution_marks_a_mapped_candidate_executable(self):
-        from sports_channel import SportsMarketMap, evaluate_sports_candidate
+        from polywang.sports_channel import SportsMarketMap, evaluate_sports_candidate
         tracker = SportsStateTracker()
         observation = tracker.observe({
             "gameId": "g1", "status": "LIVE", "live": True, "ended": False,

@@ -6,7 +6,7 @@ import time
 from types import SimpleNamespace
 from unittest import mock
 
-from arbitrage_core import (
+from polywang.arbitrage_core import (
     BinaryArbitrageScanner,
     BinaryMarket,
     JsonLedger,

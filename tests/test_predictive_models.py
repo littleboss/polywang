@@ -2,9 +2,9 @@ import os
 import tempfile
 import unittest
 
-from crypto_model import CryptoObservation, CryptoStatArbModel
-from macro_model import MacroEventModel, MacroRelease
-from polymarket_edge import CalibrationTracker
+from polywang.crypto_model import CryptoObservation, CryptoStatArbModel
+from polywang.macro_model import MacroEventModel, MacroRelease
+from polywang.polymarket_edge import CalibrationTracker
 
 
 class PredictiveModelTests(unittest.TestCase):
@@ -117,7 +117,7 @@ class PredictiveModelTests(unittest.TestCase):
         self.assertFalse(held.executable)
 
     def test_macro_jsonl_feed_and_execution_flag(self):
-        from macro_model import JsonlMacroFeed, MacroEventModel, MacroRelease
+        from polywang.macro_model import JsonlMacroFeed, MacroEventModel, MacroRelease
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "macro.jsonl")
             with open(path, "w", encoding="utf-8") as handle:
@@ -137,7 +137,7 @@ class PredictiveModelTests(unittest.TestCase):
         self.assertEqual(signal.direction, "BUY_YES")
 
     def test_crypto_reference_adapter_and_directional_sell_entry(self):
-        from crypto_model import CryptoReferenceAdapter, CryptoStatArbModel, digital_call_probability
+        from polywang.crypto_model import CryptoReferenceAdapter, CryptoStatArbModel, digital_call_probability
         probability = digital_call_probability(65000, 60000, 0.55, 0.08)
         self.assertIsNotNone(probability)
         self.assertGreater(probability, 0.5)

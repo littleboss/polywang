@@ -2,7 +2,7 @@ import os
 import tempfile
 import unittest
 
-from whale_intelligence import WhaleIntelligenceEngine, normalize_wallet
+from polywang.whale_intelligence import WhaleIntelligenceEngine, normalize_wallet
 
 
 WALLET_A = "0x" + "a" * 40

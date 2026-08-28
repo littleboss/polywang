@@ -19,14 +19,14 @@ import time
 from typing import Dict, Iterable, List, Optional
 
 import requests
-from whale_intelligence import WhaleIntelligenceEngine
-from sports_channel import SportsStateTracker, SportsLatencyGate, SportsMarketMap, consume_sports_channel, evaluate_sports_candidate
-from market_replay import JsonlEventRecorder
-from macro_model import JsonlMacroFeed, MacroEventModel, MacroRelease
-from crypto_model import CryptoObservation, CryptoStatArbModel, JsonlCryptoFeed
-from polymarket_edge import CalibrationTracker, EdgeEvaluator
+from .whale_intelligence import WhaleIntelligenceEngine
+from .sports_channel import SportsStateTracker, SportsLatencyGate, SportsMarketMap, consume_sports_channel, evaluate_sports_candidate
+from .market_replay import JsonlEventRecorder
+from .macro_model import JsonlMacroFeed, MacroEventModel, MacroRelease
+from .crypto_model import CryptoObservation, CryptoStatArbModel, JsonlCryptoFeed
+from .polymarket_edge import CalibrationTracker, EdgeEvaluator
 
-from arbitrage_core import (
+from .arbitrage_core import (
     BinaryArbitrageScanner,
     BinaryMarket,
     DirectionalExecutor,
@@ -334,7 +334,7 @@ async def run_market_stream(runner: PaperMarketRunner, token_ids: List[str]) -> 
     try:
         import websockets
     except ImportError as error:
-        raise SystemExit("Install websockets for the paper market stream: python3 -m pip install websockets") from error
+        raise SystemExit("Install websockets for the paper market stream: uv sync") from error
 
     backoff = 1.0
     recorder = JsonlEventRecorder(os.getenv("MARKET_EVENT_LOG", ""), source="market")

@@ -4,8 +4,8 @@ import tempfile
 import unittest
 from unittest import mock
 
-from arbitrage_bot import PaperMarketRunner, load_dotenv, run_user_stream, write_health
-from arbitrage_core import BinaryArbitrageScanner, BinaryMarket, UnhedgedPairError
+from polywang.arbitrage_bot import PaperMarketRunner, load_dotenv, run_user_stream, write_health
+from polywang.arbitrage_core import BinaryArbitrageScanner, BinaryMarket, UnhedgedPairError
 
 
 class SettlementMappingTests(unittest.TestCase):
@@ -59,7 +59,7 @@ class SettlementMappingTests(unittest.TestCase):
         async def failing_consumer(_executor):
             raise UnhedgedPairError("one leg missing")
 
-        with mock.patch("arbitrage_bot.consume_user_stream", failing_consumer):
+        with mock.patch("polywang.arbitrage_bot.consume_user_stream", failing_consumer):
             with self.assertRaises(UnhedgedPairError):
                 asyncio.run(run_user_stream(executor, risk))
         self.assertIn("unhedged", risk.reason)

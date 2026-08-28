@@ -2,9 +2,13 @@ import json
 import os
 import tempfile
 import unittest
+from pathlib import Path
 
-from market_replay import BinaryMarketReplay, JsonlEventRecorder
-from arbitrage_core import BinaryArbitrageScanner, BinaryMarket
+from polywang.market_replay import BinaryMarketReplay, JsonlEventRecorder
+from polywang.arbitrage_core import BinaryArbitrageScanner, BinaryMarket
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+REPLAY_FIXTURES = REPO_ROOT / "fixtures" / "replay"
 
 
 class ReplayTests(unittest.TestCase):
@@ -124,7 +128,7 @@ class ReplayTests(unittest.TestCase):
         self.assertTrue(report["pnl_is_simulated"])
 
     def test_fill_model_queue_and_second_leg_failure_are_counted_as_simulated(self):
-        from market_replay import FillModel
+        from polywang.market_replay import FillModel
         market = BinaryMarket("m1", "c1", "Test", "yes", "no", category="geopolitics")
         replay = BinaryMarketReplay(
             [market],
@@ -155,8 +159,8 @@ class ReplayTests(unittest.TestCase):
         self.assertTrue(failing.report()["pnl_is_simulated"])
 
     def test_committed_fixture_replays_with_sequence_and_fee_backfill(self):
-        from market_replay import BinaryMarketReplay, FillModel, _load_events, _load_json
-        raw = _load_json("fixtures/replay/markets.json")
+        from polywang.market_replay import BinaryMarketReplay, FillModel, _load_events, _load_json
+        raw = _load_json(str(REPLAY_FIXTURES / "markets.json"))
         markets = [
             parsed for row in raw
             for parsed in [BinaryMarket.from_gamma(row)] if parsed
@@ -167,7 +171,7 @@ class ReplayTests(unittest.TestCase):
             consume_fills=True,
             fill_model=FillModel(rejection_rate=0.0, fill_probability=1.0, seed=1),
         )
-        replay.run(_load_events("fixtures/replay/events.jsonl"))
+        replay.run(_load_events(str(REPLAY_FIXTURES / "events.jsonl")))
         self.assertGreaterEqual(replay.report()["opportunities"], 1)
         self.assertGreaterEqual(replay.execution_stats["fee_backfills"], 1)
         self.assertTrue(replay.report()["pnl_is_simulated"])

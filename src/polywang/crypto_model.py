@@ -15,7 +15,7 @@ import math
 import os
 from typing import Deque, Dict, List, Optional
 
-from polymarket_edge import CalibrationTracker
+from .polymarket_edge import CalibrationTracker
 
 
 def _clamp(value: float) -> float:

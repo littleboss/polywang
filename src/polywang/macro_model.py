@@ -15,7 +15,7 @@ import math
 import os
 from typing import Iterable, List, Optional
 
-from polymarket_edge import CalibrationTracker
+from .polymarket_edge import CalibrationTracker
 
 
 def _clamp(value: float, low: float = 1e-6, high: float = 1.0 - 1e-6) -> float:
