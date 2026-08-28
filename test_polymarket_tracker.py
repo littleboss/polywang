@@ -42,11 +42,15 @@ tracker_mod = _load_tracker_module()
 DEFAULT_CONFIG = {
     "PAPER_TRADING": True,
     "INITIAL_BALANCE": 1000.0,
-    "SIMULATED_FEE_PCT": 0.015,
+    "MARKET_CATEGORY": "sports",
     "SLIPPAGE_PCT": 0.005,
-    "SETTLEMENT_FEE_PCT": 0.015,
-    "MIN_NET_PROFIT_MARGIN": 0.05,
-    "MIN_ARBITRAGE_EDGE_PCT": 0.05,
+    "MIN_NET_PROFIT_MARGIN": 0.02,
+    "MIN_ARBITRAGE_EDGE_PCT": 0.02,
+    "HURDLE_APR": 0.15,
+    "MIN_EDGE_OVER_BREAKEVEN": 0.02,
+    "KELLY_FRACTION": 0.25,
+    "MAX_POSITION_FRACTION": 0.10,
+    "ESTIMATE_CONFIDENCE": 0.5,
     "SPORTS_LATENCY_THRESHOLD_SECS": 5,
     "TIME_DECAY_WEIGHT": 1.0,
     "STOP_LOSS_ENABLED": True,
@@ -117,42 +121,55 @@ class FrictionGuardTests(TrackerTestCase):
         self.portfolio = tracker_mod.FrictionAwarePortfolioEngine(1000.0)
 
     def test_blocks_near_certain_contract_with_no_room_for_fees(self):
-        # 0.97 leaves 3 cents of upside; fees and slippage cost more than that.
-        eligible, quote = self.portfolio.evaluate_roi_eligibility(0.97, 0.95)
-        self.assertFalse(eligible)
-        self.assertLess(quote["spec_net_edge"], tracker_mod.CONFIG["MIN_NET_PROFIT_MARGIN"])
+        # 0.97 leaves 3 cents of upside and the model only claims 0.95, so the
+        # trade is underwater before any friction is counted.
+        assessment = self.portfolio.evaluate_roi_eligibility(0.97, 0.95)
+        self.assertFalse(assessment.accepted)
+        self.assertLess(assessment.ev_per_share, 0.0)
 
     def test_allows_a_genuine_latency_gap(self):
         # Buying at 0.45 something the model prices at 0.76 clears friction easily.
-        eligible, quote = self.portfolio.evaluate_roi_eligibility(0.45, 0.76)
-        self.assertTrue(eligible)
-        self.assertGreater(quote["binding_edge"], tracker_mod.CONFIG["MIN_NET_PROFIT_MARGIN"])
+        assessment = self.portfolio.evaluate_roi_eligibility(0.45, 0.76, days_to_resolution=0.05)
+        self.assertTrue(assessment.accepted)
+        self.assertGreater(assessment.ev_per_dollar, tracker_mod.CONFIG["MIN_NET_PROFIT_MARGIN"])
 
-    def test_blocks_wide_spread_when_probability_does_not_support_it(self):
-        # A cheap contract looks great on the win-case formula alone, but a 20%
-        # chance of paying out makes it negative expected value. The binding edge
-        # has to reflect that, otherwise the guard waves through lottery tickets.
-        eligible, quote = self.portfolio.evaluate_roi_eligibility(0.30, 0.20)
-        self.assertFalse(eligible)
-        self.assertGreater(quote["spec_net_edge"], 0.0)
-        self.assertLess(quote["expected_net_edge"], 0.0)
+    def test_blocks_a_cheap_contract_the_model_does_not_actually_like(self):
+        # A 0.30 contract the model rates at 0.20 is a losing bet however cheap
+        # the entry looks in absolute terms.
+        assessment = self.portfolio.evaluate_roi_eligibility(0.30, 0.20)
+        self.assertFalse(assessment.accepted)
+        self.assertLess(assessment.ev_per_share, 0.0)
 
-    def test_settlement_fee_is_charged_separately_from_the_entry_fee(self):
-        quote = self.portfolio.quote_friction(0.50, 1.0)
-        self.assertAlmostEqual(quote["settlement_fee"], 0.015)
-        self.assertAlmostEqual(quote["market_fee"], quote["entry_price"] * 0.015)
-        self.assertAlmostEqual(
-            quote["total_friction"],
-            quote["slippage_cost"] + quote["market_fee"] + quote["settlement_fee"],
-        )
+    def test_uses_the_published_fee_formula_rather_than_a_flat_percentage(self):
+        # Sports rate is 0.05, so the fee per share is 0.05 * p * (1 - p).
+        assessment = self.portfolio.evaluate_roi_eligibility(0.50, 0.90)
+        self.assertAlmostEqual(assessment.fee_per_share, 0.05 * 0.50 * 0.50, places=6)
 
-    def test_raising_the_fee_can_flip_an_acceptable_trade_to_blocked(self):
-        marginal_price, marginal_prob = 0.45, 0.56
-        self.assertTrue(self.portfolio.evaluate_roi_eligibility(marginal_price, marginal_prob)[0])
+        cheap_for_favourites = self.portfolio.evaluate_roi_eligibility(0.97, 0.99)
+        self.assertAlmostEqual(cheap_for_favourites.fee_per_share, 0.05 * 0.97 * 0.03, places=6)
+        self.assertLess(cheap_for_favourites.fee_per_share, assessment.fee_per_share)
 
-        with mock.patch.dict(tracker_mod.CONFIG, {"SIMULATED_FEE_PCT": 0.20, "SETTLEMENT_FEE_PCT": 0.20}):
-            expensive = tracker_mod.FrictionAwarePortfolioEngine(1000.0)
-            self.assertFalse(expensive.evaluate_roi_eligibility(marginal_price, marginal_prob)[0])
+    def test_a_dearer_category_can_flip_an_acceptable_trade_to_blocked(self):
+        marginal_price, marginal_prob = 0.50, 0.5320
+        cheap = tracker_mod.FrictionAwarePortfolioEngine(1000.0, category="geopolitics")
+        self.assertTrue(cheap.evaluate_roi_eligibility(marginal_price, marginal_prob,
+                                                       days_to_resolution=1).accepted)
+
+        expensive = tracker_mod.FrictionAwarePortfolioEngine(1000.0, category="crypto")
+        self.assertFalse(expensive.evaluate_roi_eligibility(marginal_price, marginal_prob,
+                                                            days_to_resolution=1).accepted)
+
+    def test_a_slow_market_is_rejected_even_when_the_edge_is_real(self):
+        quick = self.portfolio.evaluate_roi_eligibility(0.97, 0.998, days_to_resolution=2)
+        slow = self.portfolio.evaluate_roi_eligibility(0.97, 0.998, days_to_resolution=365)
+        self.assertAlmostEqual(quick.ev_per_dollar, slow.ev_per_dollar, places=9)
+        self.assertTrue(quick.accepted)
+        self.assertFalse(slow.accepted)
+
+    def test_position_size_scales_with_the_edge(self):
+        thin = self.portfolio.evaluate_roi_eligibility(0.45, 0.55, days_to_resolution=0.05)
+        fat = self.portfolio.evaluate_roi_eligibility(0.45, 0.85, days_to_resolution=0.05)
+        self.assertGreater(fat.recommended_stake_usd, thin.recommended_stake_usd)
 
 
 class LimitPriceGuardTests(TrackerTestCase):
@@ -345,6 +362,61 @@ class PortfolioAccountingTests(TrackerTestCase):
         position = self.portfolio.positions["m1"]["Yes"]
         self.assertGreater(position["avg_price"], 0.40)
         self.assertLess(position["avg_price"], 0.60)
+
+
+class ExecutionIntegrationTests(TrackerTestCase):
+    def test_buy_prices_off_the_book_when_depth_is_available(self):
+        portfolio = tracker_mod.FrictionAwarePortfolioEngine(10000.0)
+        thin_book = [(0.45, 100), (0.60, 5000)]
+
+        portfolio.execute_buy("m1", "Market", "Yes", 0.45, 500.0, book_levels=thin_book)
+        entry = portfolio.positions["m1"]["Yes"]["avg_price"]
+
+        # 100 shares at 0.45 then the rest at 0.60, so the real fill is far worse
+        # than a flat slippage percentage would suggest.
+        self.assertGreater(entry, 0.45 * 1.005)
+        self.assertLess(entry, 0.60)
+
+    def test_resolution_charges_no_fee(self):
+        portfolio = tracker_mod.FrictionAwarePortfolioEngine(1000.0)
+        portfolio.execute_buy("m1", "Market", "Yes", 0.50, 100.0)
+        fees_after_entry = portfolio.total_fees_paid
+
+        portfolio.settle_market("m1", "Market", "Yes")
+        self.assertEqual(portfolio.total_fees_paid, fees_after_entry)
+
+    def test_a_discredited_strategy_cannot_open_positions(self):
+        bot = self.make_bot()
+        bot.market_names["m1"] = "Market"
+        bot.token_prices["m1"]["Yes"] = 0.45
+
+        for _ in range(40):
+            bot.calibration.record("whale_overreaction", 0.9, 0)
+        self.assertFalse(bot.calibration.is_trustworthy("whale_overreaction"))
+
+        with mock.patch.object(bot.portfolio, "execute_buy") as execute_buy:
+            bot._dispatch_and_trade(
+                market_id="m1", market_title="Market", raw_outcome="Yes",
+                current_price=0.45, target_outcome="Yes",
+                signals={"whale_overreaction": {"msg": "whale"}},
+                confidence=95, target_probability=0.80,
+            )
+        execute_buy.assert_not_called()
+
+    def test_an_untested_strategy_is_still_allowed_to_trade(self):
+        bot = self.make_bot()
+        bot.market_names["m1"] = "Market"
+        bot.token_prices["m1"]["Yes"] = 0.45
+
+        with mock.patch.object(bot.portfolio, "execute_buy") as execute_buy:
+            bot._dispatch_and_trade(
+                market_id="m1", market_title="Market", raw_outcome="Yes",
+                current_price=0.45, target_outcome="Yes",
+                signals={"brand_new_strategy": {"msg": "signal"}},
+                confidence=95, target_probability=0.80,
+                days_to_resolution=0.05,
+            )
+        execute_buy.assert_called_once()
 
 
 class TradeTelemetryTests(TrackerTestCase):

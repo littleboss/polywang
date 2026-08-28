@@ -44,6 +44,13 @@ try:
 except ImportError:
     HAS_ASYNC_WS = False
 
+from polymarket_edge import (
+    CalibrationTracker,
+    EdgeEvaluator,
+    PolymarketFeeModel,
+    walk_order_book,
+)
+
 # Configure logger
 logging.basicConfig(
     level=logging.INFO,
@@ -102,12 +109,21 @@ CONFIG = {
     # Friction Controls [14]
     "PAPER_TRADING": env_bool("PAPER_TRADING", True),
     "INITIAL_BALANCE": env_value("INITIAL_BALANCE", 1000.0, float),
-    "SIMULATED_FEE_PCT": env_value("SIMULATED_FEE_PCT", 0.015, float),  # 1.5% average platform fee [7]
-    "SLIPPAGE_PCT": env_value("SLIPPAGE_PCT", 0.005, float),            # 0.5% expected execution slippage
-    # Charged on the winning payout at resolution, separately from the entry fee.
-    "SETTLEMENT_FEE_PCT": env_value("SETTLEMENT_FEE_PCT", None, float),  # None -> mirror SIMULATED_FEE_PCT
-    # Minimum net edge per contract that must survive fees + slippage before we trade [2].
-    "MIN_NET_PROFIT_MARGIN": env_value(["MIN_NET_PROFIT_MARGIN", "MIN_ARBITRAGE_EDGE_PCT"], 0.05, float),
+    # Fees follow the published schedule, fee = C x rate x p x (1 - p), and the
+    # rate depends on the market category. Only takers pay.
+    "MARKET_CATEGORY": env_value("MARKET_CATEGORY", "sports", str),
+    "SLIPPAGE_PCT": env_value("SLIPPAGE_PCT", 0.005, float),            # fallback when no book depth is available
+    # Minimum net edge per dollar deployed that must survive fees before we trade [2].
+    "MIN_NET_PROFIT_MARGIN": env_value(["MIN_NET_PROFIT_MARGIN", "MIN_ARBITRAGE_EDGE_PCT"], 0.02, float),
+    # Return this capital could earn elsewhere. Locking funds in a slow market has
+    # a cost even when the trade eventually wins.
+    "HURDLE_APR": env_value("HURDLE_APR", 0.15, float),
+    # A price near 1.00 leaves almost no room, so demand a margin above break-even
+    # that the model can actually resolve rather than betting on rounding error.
+    "MIN_EDGE_OVER_BREAKEVEN": env_value("MIN_EDGE_OVER_BREAKEVEN", 0.02, float),
+    "KELLY_FRACTION": env_value("KELLY_FRACTION", 0.25, float),
+    "MAX_POSITION_FRACTION": env_value("MAX_POSITION_FRACTION", 0.10, float),
+    "ESTIMATE_CONFIDENCE": env_value("ESTIMATE_CONFIDENCE", 0.5, float),
 
     # Sports Latency Arbitrage Specific Parameters [20]
     # How long the exploit window stays open after a goal is detected. Past this the
@@ -134,9 +150,6 @@ CONFIG = {
     "POLY_PRIVATE_KEY": os.getenv("POLY_PRIVATE_KEY", ""),
     "HTTP_PROXY": os.getenv("HTTP_PROXY", "")
 }
-
-if CONFIG["SETTLEMENT_FEE_PCT"] is None:
-    CONFIG["SETTLEMENT_FEE_PCT"] = CONFIG["SIMULATED_FEE_PCT"]
 
 # Kept as an alias so existing scripts referencing the old key keep working.
 CONFIG["MIN_ARBITRAGE_EDGE_PCT"] = CONFIG["MIN_NET_PROFIT_MARGIN"]
@@ -192,67 +205,44 @@ class FrictionAwarePortfolioEngine:
     Simulation environment for tracking trades, accounting for slippage, 
     settlement rules, and the transaction fees that often kill low-risk edges [14].
     """
-    def __init__(self, initial_cash):
+    def __init__(self, initial_cash, category=None):
         self.cash = initial_cash
         self.positions = {} # {market_id: {outcome: {"contracts": X, "avg_price": Y}}}
         self.trade_history = []
-        self.fee_pct = CONFIG["SIMULATED_FEE_PCT"]
         self.slippage_pct = CONFIG["SLIPPAGE_PCT"]
-        self.settlement_fee_pct = CONFIG["SETTLEMENT_FEE_PCT"]
         self.total_fees_paid = 0.0
 
-    def quote_friction(self, current_price, target_probability):
+        self.fee_model = PolymarketFeeModel(category or CONFIG["MARKET_CATEGORY"])
+        self.evaluator = EdgeEvaluator(
+            fee_model=self.fee_model,
+            min_ev_per_dollar=CONFIG["MIN_NET_PROFIT_MARGIN"],
+            hurdle_apr=CONFIG["HURDLE_APR"],
+            min_edge_over_breakeven=CONFIG["MIN_EDGE_OVER_BREAKEVEN"],
+            kelly_fraction=CONFIG["KELLY_FRACTION"],
+            max_position_fraction=CONFIG["MAX_POSITION_FRACTION"],
+            estimate_confidence=CONFIG["ESTIMATE_CONFIDENCE"],
+        )
+
+    def evaluate_roi_eligibility(self, current_price, target_probability,
+                                 days_to_resolution=1.0, is_taker=True, confidence=None):
         """
-        Breaks a candidate entry down into every cost component that stands between
-        the raw price and the money that actually lands back in the account [14].
+        Gate used by the execution path.
 
-        Two edges are produced because they answer different questions:
-
-        - `spec_net_edge` is the headline formula from the maintenance doc,
-          (1.00 - Price) - (Market Fee + Slippage + Settlement Fee). It describes the
-          best case: what a contract nets if the position resolves as a winner.
-        - `expected_net_edge` weights that payout by the model's probability, so an
-          80%-likely outcome bought at 0.75 is correctly treated as thin rather than
-          as a guaranteed 0.25 gain.
-
-        A trade must clear the margin on both measures. This is the specific failure
-        mode from the podcast: a high hit rate that still loses money because every
-        individual win was too small to pay for its own fees [1, 9].
+        Delegates to the edge evaluator so the decision uses the platform's real
+        fee schedule rather than a flat percentage. That distinction is not
+        cosmetic: as a share of notional the true fee is `rate x (1 - price)`, so a
+        flat 1.5% assumption overstates the cost of a 0.97 contract by a factor of
+        ten and understates a 0.10 contract by three, which is enough to invert the
+        verdict on both.
         """
-        price = max(0.0, min(0.999, float(current_price)))
-        probability = max(0.0, min(1.0, float(target_probability)))
-
-        slippage_cost = price * self.slippage_pct
-        entry_price = min(0.995, price + slippage_cost)
-        market_fee = entry_price * self.fee_pct
-        # The settlement fee is only charged on payouts that actually happen, so the
-        # expected cost scales with the win probability.
-        settlement_fee = 1.0 * self.settlement_fee_pct * probability
-
-        spec_net_edge = (1.0 - price) - (market_fee + slippage_cost + settlement_fee)
-        expected_net_edge = probability - entry_price - market_fee - settlement_fee
-
-        return {
-            "price": price,
-            "probability": probability,
-            "entry_price": entry_price,
-            "slippage_cost": slippage_cost,
-            "market_fee": market_fee,
-            "settlement_fee": settlement_fee,
-            "total_friction": slippage_cost + market_fee + settlement_fee,
-            "spec_net_edge": spec_net_edge,
-            "expected_net_edge": expected_net_edge,
-            "binding_edge": min(spec_net_edge, expected_net_edge),
-        }
-
-    def evaluate_roi_eligibility(self, current_price, target_probability):
-        """
-        Gate used by the execution path: returns whether the binding edge clears
-        MIN_NET_PROFIT_MARGIN, plus the full cost breakdown for the alert log.
-        """
-        quote = self.quote_friction(current_price, target_probability)
-        is_eligible = quote["binding_edge"] >= CONFIG["MIN_NET_PROFIT_MARGIN"]
-        return is_eligible, quote
+        return self.evaluator.assess(
+            price=current_price,
+            fair_probability=target_probability,
+            bankroll=self.cash,
+            days_to_resolution=days_to_resolution,
+            is_taker=is_taker,
+            confidence=confidence,
+        )
 
     def enforce_limit_price(self, live_price, max_allowed_price, market_title, outcome):
         """
@@ -272,21 +262,45 @@ class FrictionAwarePortfolioEngine:
         )
         return False
 
-    def execute_buy(self, market_id, market_title, outcome, price, usd_allocation):
-        """Simulates buying an outcome token with slippage and commission fees."""
-        fee = usd_allocation * self.fee_pct
-        effective_budget = usd_allocation - fee
-        
-        if effective_budget <= 0 or self.cash < usd_allocation:
+    def execute_buy(self, market_id, market_title, outcome, price, usd_allocation, book_levels=None):
+        """
+        Simulates buying an outcome token.
+
+        When order book depth is supplied the fill is read off the book, because a
+        percentage assumption prices a $50 order and a $5,000 order identically and
+        thin markets do not work that way. The flat slippage figure is only a
+        fallback for when depth is unavailable.
+        """
+        if self.cash < usd_allocation or usd_allocation <= 0:
             logger.error(f"❌ Simulated buy failed: Insufficient cash (${self.cash:.2f} available for ${usd_allocation:.2f} allocation)")
             return False
 
-        # Apply slippage
-        slippage_price = price * (1.0 + self.slippage_pct)
-        if slippage_price >= 1.0:
-            slippage_price = 0.995
+        if book_levels:
+            fill = walk_order_book(book_levels, usd_allocation)
+            if fill.shares <= 0:
+                logger.error("❌ Simulated buy failed: no resting liquidity within reach.")
+                return False
+            slippage_price = fill.average_price
+            spent = fill.budget_filled
+        else:
+            slippage_price = min(0.995, price * (1.0 + self.slippage_pct))
+            spent = usd_allocation
 
-        contracts_bought = effective_budget / slippage_price
+        # Taker fee under the published schedule, quadratic in price rather than
+        # a flat cut of the notional.
+        provisional_shares = spent / slippage_price
+        fee = self.fee_model.fee_usd(provisional_shares, slippage_price, is_taker=True)
+        if spent + fee > self.cash:
+            spent = max(0.0, self.cash - fee)
+            provisional_shares = spent / slippage_price
+            fee = self.fee_model.fee_usd(provisional_shares, slippage_price, is_taker=True)
+
+        contracts_bought = provisional_shares
+        if contracts_bought <= 0:
+            logger.error("❌ Simulated buy failed: allocation too small to buy a contract after fees.")
+            return False
+
+        usd_allocation = spent + fee
         self.cash -= usd_allocation
         self.total_fees_paid += fee
 
@@ -330,7 +344,7 @@ class FrictionAwarePortfolioEngine:
         # subtracts here instead of adding as it does on entry.
         exit_price = max(0.0, price * (1.0 - self.slippage_pct))
         gross_proceeds = contracts * exit_price
-        fee = gross_proceeds * self.fee_pct
+        fee = self.fee_model.fee_usd(contracts, exit_price, is_taker=True)
         net_proceeds = gross_proceeds - fee
 
         self.cash += net_proceeds
@@ -358,7 +372,14 @@ class FrictionAwarePortfolioEngine:
         return True
 
     def settle_market(self, market_id, market_title, winning_outcome):
-        """Settles all contracts for a specific market at expiry (binary 1.00 or 0.00)."""
+        """
+        Settles all contracts for a specific market at expiry (binary 1.00 or 0.00).
+
+        Resolution is free. Polymarket charges only a taker fee at match time, so
+        holding to expiry costs one fee where trading out costs two. That makes
+        patience genuinely cheaper, and it is the opposite of what a model that
+        deducts a settlement fee would tell you.
+        """
         if market_id not in self.positions:
             return
 
@@ -366,17 +387,12 @@ class FrictionAwarePortfolioEngine:
         for outcome, pos_data in list(market_pos.items()):
             contracts = pos_data["contracts"]
             entry_price = pos_data["avg_price"]
-            
+
             payout_per_contract = 1.0 if outcome == winning_outcome else 0.0
-            gross_payout = contracts * payout_per_contract
-            
-            settle_fee = gross_payout * self.fee_pct
-            net_payout = gross_payout - settle_fee
-            
-            self.cash += net_payout
-            self.total_fees_paid += settle_fee
-            
-            net_pnl = net_payout - (contracts * entry_price)
+            payout = contracts * payout_per_contract
+
+            self.cash += payout
+            net_pnl = payout - (contracts * entry_price)
 
             self.trade_history.append({
                 "market": market_title,
@@ -389,8 +405,8 @@ class FrictionAwarePortfolioEngine:
                 f"🏁 [SIMULATED RESOLUTION] Settle event for: {market_title}\n"
                 f"   💰 [SIMULATED SELL SUCCESS] {market_title} ({outcome})\n"
                 f"   Exit Price: ${payout_per_contract:.4f} (Entry: ${entry_price:.4f})\n"
-                f"   Gross Payout: ${gross_payout:.2f} USD | Settle Fee: ${settle_fee:.2f} USD\n"
-                f"   Net PnL (including entry/exit fees): ${net_pnl:.2f} USD"
+                f"   Payout: ${payout:.2f} USD | Resolution fee: $0.00 (free on Polymarket)\n"
+                f"   Net PnL (entry fee already deducted): ${net_pnl:.2f} USD"
             )
 
         del self.positions[market_id]
@@ -533,6 +549,12 @@ class UnifiedPolymarketBot:
         # Last time the order book moved for a market. Compared against the sports
         # feed timestamp to prove the book has not yet reacted to a goal.
         self.last_book_update_ts = {}
+        # Resting depth per (market_id, outcome), used to price fills off the book
+        # instead of assuming a fixed slippage percentage.
+        self.order_books = {}
+        # Days until each market resolves. Capital locked in a slow market has an
+        # opportunity cost that a raw edge number cannot express.
+        self.days_to_resolution = {}
 
         # Open latency-arbitrage theses, keyed by market, so the stop loss knows what
         # real-world condition each position was betting on.
@@ -542,6 +564,9 @@ class UnifiedPolymarketBot:
         self.portfolio = FrictionAwarePortfolioEngine(CONFIG["INITIAL_BALANCE"])
         self.sports_engine = SportsLatencyArbitrageEngine()
         self.order_signer = PolymarketOrderSigner()
+        # Scores each strategy against what actually happened, so a strategy that
+        # only sounds confident can be told apart from one that is right.
+        self.calibration = CalibrationTracker()
 
     def check_geographic_compliance(self):
         """Checks for US geolocation block explicitly mentioned in the podcast [7]."""
@@ -649,7 +674,8 @@ class UnifiedPolymarketBot:
                 # Order-flow signals carry no external ground truth, so the confidence
                 # score is the only probability estimate available. Assuming certainty
                 # here would let the ROI guard wave through near-$1.00 entries.
-                target_probability=min(0.99, score / 100.0)
+                target_probability=min(0.99, score / 100.0),
+                days_to_resolution=self.days_to_resolution.get(market_id, 1.0),
             )
 
     def process_sports_event(self, market_id, game_id, team_home, team_away, score_home, score_away,
@@ -726,6 +752,9 @@ class UnifiedPolymarketBot:
             signals=signals,
             confidence=self._score_latency_arbitrage(price_discrepancy, elapsed_since_goal, window),
             target_probability=fair_prob,
+            # An in-play football market resolves within the hour, which is what
+            # makes a few cents of edge worth chasing at all.
+            days_to_resolution=max(1.0 / 1440.0, (90.0 - minute + 15.0) / 1440.0),
             sports_thesis={
                 "game_id": game_id,
                 "team_focus": team_focus,
@@ -904,7 +933,8 @@ class UnifiedPolymarketBot:
         logger.info(f"Direct Event URL: {url}")
 
     def _dispatch_and_trade(self, market_id, market_title, raw_outcome, current_price, target_outcome,
-                            signals, confidence, target_probability=1.0, sports_thesis=None):
+                            signals, confidence, target_probability=1.0, sports_thesis=None,
+                            days_to_resolution=1.0):
         """Routes identified signals to the trading execution portfolio and outputs alerts."""
         status = "⚠️ OBSERVING SIGNAL"
         actionable_trade = False
@@ -941,33 +971,43 @@ class UnifiedPolymarketBot:
         if not actionable_trade:
             return
 
-        # Evaluate edge vs fees to prevent low-margin negative yields [14].
-        # This runs before any order is built, in paper and live mode alike.
-        is_eligible, quote = self.portfolio.evaluate_roi_eligibility(current_price, target_probability)
+        # A strategy that has proven itself worse than a coin flip does not get to
+        # size positions, however confident this particular signal is.
+        for strategy in signals:
+            if not self.calibration.is_trustworthy(strategy):
+                logger.warning(
+                    f"📉 [CALIBRATION BLOCK] '{strategy}' has a Brier score worse than an uninformative "
+                    f"forecast over its recorded history. Ignoring its signal until it is fixed."
+                )
+                return
 
-        if not is_eligible:
+        # Evaluate edge vs fees before any order is built, in paper and live mode
+        # alike. Uses the platform's real fee schedule, not a flat percentage.
+        assessment = self.portfolio.evaluate_roi_eligibility(
+            current_price, target_probability,
+            days_to_resolution=days_to_resolution,
+            confidence=min(1.0, confidence / 100.0),
+        )
+
+        if not assessment.accepted:
             logger.warning(
-                f"🛡️ [FRICTION BLOCKED] Blocked buying '{target_outcome}' on '{market_title}'!\n"
-                f"   Price: ${quote['price']:.4f} | Modelled Fair Value: {quote['probability']:.2f}\n"
-                f"   Friction: slippage ${quote['slippage_cost']:.4f} + entry fee ${quote['market_fee']:.4f} "
-                f"+ settlement fee ${quote['settlement_fee']:.4f} = ${quote['total_friction']:.4f}\n"
-                f"   Net edge if it wins: ${quote['spec_net_edge']:.4f} | Probability-weighted: ${quote['expected_net_edge']:.4f}\n"
-                f"   Required minimum: ${CONFIG['MIN_NET_PROFIT_MARGIN']:.4f}. High accuracy does not pay for fees this thin [1, 14].\n"
+                f"🛡️ [EDGE REJECTED] '{target_outcome}' on '{market_title}' at ${assessment.price:.4f}: "
+                f"{assessment.reasons[0]}"
             )
+            logger.debug(assessment.explain())
             return
 
-        logger.info(
-            f"✅ [FRICTION PASSED] Net edge ${quote['binding_edge']:.4f} clears the "
-            f"${CONFIG['MIN_NET_PROFIT_MARGIN']:.4f} minimum after ${quote['total_friction']:.4f} of friction."
-        )
+        for warning in assessment.warnings:
+            logger.warning(f"⚠️  {warning}")
+        logger.info(f"✅ [EDGE ACCEPTED] {market_title} ({target_outcome})\n" + assessment.explain())
 
         # Hard ceiling for the order. If the book reprices above this while we are in
         # flight, the fill is refused rather than chasing the post-goal price [20].
-        max_allowed_price = quote["entry_price"]
+        max_allowed_price = assessment.cost_per_share
         signed_order = self.order_signer.sign_limit_order(
             token_id=market_id,
-            price=quote["price"],
-            size=self._position_size(quote["entry_price"]),
+            price=assessment.price,
+            size=assessment.recommended_stake_usd / max(0.01, assessment.cost_per_share),
             max_slippage_price=max_allowed_price,
             side="BUY"
         )
@@ -987,17 +1027,15 @@ class UnifiedPolymarketBot:
             return
 
         if CONFIG["PAPER_TRADING"]:
-            allocation = min(self.portfolio.cash * 0.10, 100.0)
-            bought = self.portfolio.execute_buy(market_id, market_title, target_outcome, live_price, allocation)
+            bought = self.portfolio.execute_buy(
+                market_id, market_title, target_outcome, live_price,
+                assessment.recommended_stake_usd,
+                book_levels=self.order_books.get((market_id, target_outcome)),
+            )
             if bought and sports_thesis:
                 self.open_sports_theses[market_id] = sports_thesis
         else:
             logger.warning("🔴 Live execution path is not enabled in this build; order was signed but not submitted.")
-
-    def _position_size(self, entry_price):
-        """Contracts affordable under the standard 10%-of-cash allocation cap."""
-        allocation = min(self.portfolio.cash * 0.10, 100.0)
-        return allocation / max(0.01, entry_price)
 
 
 class PolymarketOrderSigner:
