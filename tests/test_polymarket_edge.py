@@ -16,6 +16,10 @@ from polywang.polymarket_edge import (
     NegRiskScanner,
     PolymarketFeeModel,
     StrategyCalibration,
+    combo_arb_universe_score,
+    merge_gas_clears_at_order_usd,
+    merge_gas_startup_warning,
+    rank_combo_arb_markets,
     debias_market_price,
     liquidity_adjusted_lambda,
     walk_order_book,
@@ -304,6 +308,39 @@ class NegRiskTests(unittest.TestCase):
         pricey = NegRiskScanner(PolymarketFeeModel("politics"), gas_cost_usd=50.0)
         self.assertGreater(cheap.scan("m", prices, set_size_usd=100).net_margin,
                            pricey.scan("m", prices, set_size_usd=100).net_margin)
+
+
+class ComboUniverseRankTests(unittest.TestCase):
+    def test_politics_mid_needs_three_ticks_extreme_needs_one(self):
+        mid = combo_arb_universe_score("politics", 0.50)
+        extreme = combo_arb_universe_score("politics", 0.95)
+        geo = combo_arb_universe_score("geopolitics", 0.50)
+        self.assertEqual(mid.ticks_to_breakeven, 3)
+        self.assertEqual(extreme.ticks_to_breakeven, 1)
+        self.assertEqual(geo.ticks_to_breakeven, 1)
+        self.assertLess(extreme.fee_per_set, mid.fee_per_set)
+        self.assertAlmostEqual(geo.fee_per_set, 0.0, places=9)
+
+    def test_unknown_price_is_scored_at_the_worst_case_mid(self):
+        unknown = combo_arb_universe_score("politics", None)
+        mid = combo_arb_universe_score("politics", 0.50)
+        self.assertFalse(unknown.price_known)
+        self.assertEqual(unknown.ticks_to_breakeven, mid.ticks_to_breakeven)
+
+    def test_rank_puts_zero_fee_and_extremes_ahead_of_mid_politics(self):
+        from polywang.arbitrage_core import BinaryMarket
+        mid = BinaryMarket("mid", "c", "Mid", "y1", "n1", category="politics", implied_yes=0.50)
+        extreme = BinaryMarket("ext", "c", "Ext", "y2", "n2", category="politics", implied_yes=0.95)
+        geo = BinaryMarket("geo", "c", "Geo", "y3", "n3", category="geopolitics", implied_yes=0.50)
+        ranked = rank_combo_arb_markets([mid, extreme, geo])
+        self.assertEqual([market.market_id for market in ranked], ["geo", "ext", "mid"])
+
+    def test_merge_gas_warning_flags_small_orders_and_hidden_gas(self):
+        self.assertFalse(merge_gas_clears_at_order_usd(5.0, 0.30))
+        self.assertTrue(merge_gas_clears_at_order_usd(100.0, 0.30))
+        self.assertIn("treat chain merge as free", merge_gas_startup_warning(0.0, 5.0, True))
+        self.assertIn("cannot clear gas", merge_gas_startup_warning(0.30, 5.0, False))
+        self.assertIsNone(merge_gas_startup_warning(0.0, 5.0, False))
 
 
 class CalibrationTests(unittest.TestCase):
