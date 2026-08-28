@@ -458,9 +458,12 @@ class SportsLatencyArbitrageEngine:
         # Calculate probability using normal distribution approximation of remaining goals
         # P(Home Win) = P(Home goals remaining - Away goals remaining > -Goal Difference)
         mean_diff = home_xg_rem - away_xg_rem
-        variance = home_xg_rem + away_xg_rem + 0.1 # variance of Poisson difference is sum of means
-        
-        if variance <= 0.1:
+        # Variance of a difference of Poisson variables is the sum of their means.
+        # No padding is added here: a constant floor would keep injecting uncertainty
+        # into the closing minutes, which is exactly when the latency edge is decided.
+        variance = home_xg_rem + away_xg_rem
+
+        if variance <= 1e-9:
             return 1.0 if goal_diff > 0 else (0.0 if goal_diff < 0 else 0.0)
 
         std_dev = math.sqrt(variance)
