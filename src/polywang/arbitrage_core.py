@@ -715,7 +715,7 @@ class JsonLedger:
             raise KeyError(position_id)
         if raw.get("settled"):
             return float(raw.get("payout", 0.0))
-        payout = float(raw["shares"])
+        payout = float(raw["shares"]) * float(raw.get("payout_per_share", 1.0))
         raw["settled"] = True
         raw["payout"] = payout
         self.state["cash"] = float(self.state["cash"]) + payout
@@ -1804,10 +1804,14 @@ class LiveRiskController:
                  max_open_pairs: int = 10,
                  max_daily_loss_usd: float = 0.0,
                  extra_journals: Optional[Sequence[LiveDirectionalJournal]] = None,
-                 max_open_directional: int = 5):
+                 max_open_directional: int = 5,
+                 negrisk_journal=None,
+                 max_open_negrisk: int = 2):
         self.journal = journal
         self.extra_journals = list(extra_journals or [])
+        self.negrisk_journal = negrisk_journal
         self.max_open_directional = max(0, int(max_open_directional))
+        self.max_open_negrisk = max(0, int(max_open_negrisk))
         self.equity_usd = float(equity_usd)
         self.state_path = state_path
         self.kill_switch_path = kill_switch_path
@@ -1899,10 +1903,16 @@ class LiveRiskController:
         self.save()
 
     def extra_exposure(self) -> float:
-        return sum(journal.open_exposure() for journal in self.extra_journals)
+        total = sum(journal.open_exposure() for journal in self.extra_journals)
+        if self.negrisk_journal is not None:
+            total += self.negrisk_journal.open_exposure()
+        return total
 
     def extra_market_exposure(self, market_id: str) -> float:
-        return sum(journal.market_exposure(market_id) for journal in self.extra_journals)
+        total = sum(journal.market_exposure(market_id) for journal in self.extra_journals)
+        if self.negrisk_journal is not None:
+            total += self.negrisk_journal.market_exposure(market_id)
+        return total
 
     def extra_open_count(self) -> int:
         return sum(len(journal.incomplete_trades()) for journal in self.extra_journals)
@@ -1912,6 +1922,8 @@ class LiveRiskController:
         issues = list(self.journal.integrity_issues())
         for extra in self.extra_journals:
             issues.extend(extra.integrity_issues())
+        if self.negrisk_journal is not None:
+            issues.extend(self.negrisk_journal.integrity_issues())
         if issues:
             self.halt("live journal integrity failure: " + "; ".join(issues))
             raise RiskHaltError(self.state["halt_reason"])
@@ -1923,6 +1935,18 @@ class LiveRiskController:
         if unhedged:
             self.halt("unhedged live pair requires manual reconciliation: " + ", ".join(unhedged))
             raise RiskHaltError(self.state["halt_reason"])
+        if self.negrisk_journal is not None:
+            unfinished = [
+                str(record.get("basket_id", ""))
+                for record in self.negrisk_journal.incomplete_baskets()
+                if record.get("status") != "ASSEMBLED"
+            ]
+            if unfinished:
+                self.halt(
+                    "unfinished NegRisk basket requires manual reconciliation: "
+                    + ", ".join(unfinished)
+                )
+                raise RiskHaltError(self.state["halt_reason"])
         today = self.state["utc_day"]
         journal_loss = sum(
             max(0.0, -float(record.get("realized_pnl", 0.0)))
@@ -2007,6 +2031,29 @@ class LiveRiskController:
             market = self.journal.market_exposure(market_id) + self.extra_market_exposure(market_id)
             if market + required > self.equity_usd * self.max_market_exposure_fraction + 1e-9:
                 raise RiskHaltError("live market exposure limit")
+
+    def check_negrisk(self, opportunity) -> None:
+        """Admit an n-leg NegRisk basket against the shared live exposure budget."""
+        self.check_startup()
+        if self.negrisk_journal is None:
+            raise RiskHaltError("NegRisk journal is not configured")
+        if self.max_open_negrisk <= 0:
+            raise RiskHaltError("NegRisk execution is disabled by risk limits")
+        required = float(opportunity.execution_capital_required)
+        if not math.isfinite(required) or required < 0.0:
+            raise RiskHaltError("NegRisk capital reservation is invalid")
+        open_baskets = self.negrisk_journal.incomplete_baskets()
+        if len(open_baskets) >= self.max_open_negrisk:
+            raise RiskHaltError("maximum number of open NegRisk baskets reached")
+        total = self.journal.open_exposure() + self.extra_exposure()
+        if total + required > self.equity_usd * self.max_total_exposure_fraction + 1e-9:
+            raise RiskHaltError("live total exposure limit")
+        market = (
+            self.journal.market_exposure(opportunity.market_id)
+            + self.extra_market_exposure(opportunity.market_id)
+        )
+        if market + required > self.equity_usd * self.max_market_exposure_fraction + 1e-9:
+            raise RiskHaltError("live market exposure limit")
 
 
 @dataclass
@@ -2124,6 +2171,7 @@ class OfficialFOKExecutor:
         self.rollback_min_price = max(0.0001, min(1.0, rollback_min_price))
         self.journal = journal
         self.directional_journal = directional_journal
+        self.negrisk_journal = None
         self.max_retries = max(0, int(max_retries))
         self.auto_merge = bool(auto_merge)
         self.auto_redeem = bool(auto_redeem)
@@ -2751,6 +2799,9 @@ class OfficialFOKExecutor:
                         known.add(order_id)
         if self.directional_journal:
             known |= self.directional_journal.known_order_ids()
+        negrisk_journal = getattr(self, "negrisk_journal", None)
+        if negrisk_journal is not None:
+            known |= negrisk_journal.known_order_ids()
         return known
 
     def _known_live_token_ids(self) -> set[str]:
@@ -2763,6 +2814,9 @@ class OfficialFOKExecutor:
                         known.add(token_id)
         if self.directional_journal:
             known |= self.directional_journal.known_inventory_token_ids()
+        negrisk_journal = getattr(self, "negrisk_journal", None)
+        if negrisk_journal is not None:
+            known |= negrisk_journal.known_inventory_token_ids()
         return known
 
     async def _reconcile_external_account_state(self, open_orders: Dict[str, object]) -> None:
@@ -3010,6 +3064,40 @@ class OfficialFOKExecutor:
                 )
         return self.directional_journal._record(trade_id)
 
+    def _handle_negrisk_user_event(self, record: dict, event, event_type: str,
+                                   order_id: str, token_id: str) -> dict:
+        """Apply a user-stream fill to one NegRisk basket leg. Never guess by token."""
+        journal = getattr(self, "negrisk_journal", None)
+        if journal is None:
+            raise UnhedgedPairError("NegRisk user event arrived without a NegRisk journal")
+        event_side = str(_response_value(event, "side", default="") or "").upper()
+        if event_side and event_side not in {"BUY", "SELL"}:
+            raise UnhedgedPairError(
+                f"NegRisk event {order_id} has unexpected side {event_side}"
+            )
+        legs = record.get("legs") or []
+        leg = next((item for item in legs if str(item.get("order_id") or "") == str(order_id)), None)
+        if leg is None:
+            return record
+        expected_token = str(leg.get("token_id") or "")
+        if token_id and expected_token and token_id != expected_token:
+            raise UnhedgedPairError(
+                f"NegRisk event {order_id} has unexpected token {token_id}"
+            )
+        matched = _filled_shares(event, side=event_side or "BUY")
+        if matched is None:
+            matched = _response_value(event, "size", "amount", default=None)
+        if matched is not None:
+            journal.set_leg_order(
+                record["basket_id"], expected_token, order_id, float(matched),
+            )
+        refreshed = journal._record(record["basket_id"])
+        if refreshed.get("status") == "UNHEDGED":
+            raise UnhedgedPairError(
+                f"user stream reports an unfinished NegRisk basket: {refreshed.get('basket_id')}"
+            )
+        return refreshed
+
     def handle_user_event(self, event) -> Optional[dict]:
         """Apply one order/trade event and return the affected pair or directional trade."""
         if isinstance(event, dict):
@@ -3020,6 +3108,11 @@ class OfficialFOKExecutor:
             event = payload
         order_id = _response_value(event, "order_id", "orderID", "orderId", "taker_order_id", "id", default="")
         token_id = str(_response_value(event, "token_id", "asset_id", "assetId", default=""))
+        negrisk_journal = getattr(self, "negrisk_journal", None)
+        if negrisk_journal is not None and order_id:
+            basket = negrisk_journal.basket_for_order(order_id)
+            if basket is not None:
+                return self._handle_negrisk_user_event(basket, event, event_type, str(order_id), token_id)
         if self.directional_journal and order_id:
             directional = self.directional_journal.record_for_order(order_id)
             if directional is not None:
@@ -3104,6 +3197,8 @@ class OfficialFOKExecutor:
         raise RuntimeError(f"YES leg was rolled back: {cause}") from cause
 
     async def execute(self, opportunity: ArbitrageOpportunity) -> LivePairResult:
+        if not hasattr(opportunity, "yes_token_id") or not hasattr(opportunity, "no_token_id"):
+            raise ValueError("OfficialFOKExecutor only accepts binary Yes/No opportunities")
         if opportunity.shares <= 0.0:
             raise ValueError("cannot execute an empty pair")
         await self.preflight(required_usd=opportunity.execution_capital_required)

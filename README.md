@@ -45,7 +45,7 @@ live 或 paper 运行时设置 `MARKET_EVENT_LOG=market-events.jsonl` 可记录�
 uv run polywang --markets 100 --cash 1000
 ```
 
-它只研究 Yes 和 No 两腿同时买入后合计支付 1.00 的二元市场。选市会先拉一个按成交量过滤的候选池（`MARKET_SCAN_POOL`），再按「1 tick 错价扣完 taker 费后是否仍为正」排序，所以 geopolitics 和极端价位会排在 0.50 附近的高费率市场前面。NegRisk 多结果市场只观测、不走双腿 FOK。机会必须使用订单簿中的实际 ask 和深度，并覆盖两腿 taker 费用、可选 merge gas（`MERGE_GAS_USD`）、资金安全缓冲和最大仓位；纸面成交写入 `paper-ledger.json`，程序重启后会恢复账本。两腿仍是顺序 FOK，不是原子交易，`is_risk_free` 恒为 false。小额阶段保持 `AUTO_MERGE_COMPLETE_SETS=0`：merge gas 是固定成本，未实测就填 0 并打开自动 merge 会把亏损单显示成盈利。
+它只研究 Yes 和 No 两腿同时买入后合计支付 1.00 的二元市场。选市会先拉一个按成交量过滤的候选池（`MARKET_SCAN_POOL`），再按「1 tick 错价扣完 taker 费后是否仍为正」排序，所以 geopolitics 和极端价位会排在 0.50 附近的高费率市场前面。NegRisk 多结果市场默认只观测、不走双腿 FOK；独立 n 腿路径见下方开关。机会必须使用订单簿中的实际 ask 和深度，并覆盖两腿 taker 费用、可选 merge gas（`MERGE_GAS_USD`）、资金安全缓冲和最大仓位；纸面成交写入 `paper-ledger.json`，程序重启后会恢复账本。两腿仍是顺序 FOK，不是原子交易，`is_risk_free` 恒为 false。小额阶段保持 `AUTO_MERGE_COMPLETE_SETS=0`：merge gas 是固定成本，未实测就填 0 并打开自动 merge 会把亏损单显示成盈利。
 
 新引擎只有在显式设置 `POLYMARKET_LIVE_CONFIRM=I_UNDERSTAND_THE_RISK`、官方 geoblock 放行、私钥存在且安装了 live extra 时，才会使用两腿 FOK 执行器：
 
@@ -161,8 +161,20 @@ fee = 股数 × 费率 × p × (1 - p)      # 只对 taker 收取，maker 免费
 
 另外有一类机会不需要预测任何事：**NegRisk 多结果市场**。互斥结果的 YES 价格总和
 必须等于 1.00，不等于时差额可以锁定。但注意每一条腿都要付一次 taker 费，10 条腿
-的组合光手续费就 3%，所以这个策略**只有挂单才做得通**。`NegRiskScanner` 会同时
-给出 taker 和 maker 两种口径。
+的组合光手续费就可能吃掉整段边际。程序有独立的 `NegRiskBookScanner` 和
+`OfficialNegRiskExecutor`：顺序 FOK 买齐完整集合，中途失败则对已成交腿做 FAK
+unwind。这条路径**默认关闭**，也**不会**调用二元 `merge_positions`。
+
+```bash
+ENABLE_NEGRISK_EXECUTION=1   # paper 即可执行
+ENABLE_NEGRISK_LIVE=1        # 实盘还要这一条
+NEGRISK_MARKET_LIMIT=10
+```
+
+只接受 Gamma 里已经列全的字段：一张 n 结果市场，或带齐 `markets[]` 子市场的
+event。成交量池里散落的 `negRisk` 二元行不会被拼成「完整集合」，因为缺腿就是
+方向性敞口。`BUY_ALL_NO` 只有在每个结果都有 NO token 时才执行。组装完成后
+**不会自动 convert**；未完成的篮子重启即 halt，写入 `live-negrisk.json`。
 
 ## 需要定期校准的参数
 
@@ -192,7 +204,8 @@ fee = 股数 × 费率 × p × (1 - p)      # 只对 taker 收取，maker 免费
 │   ├── __main__.py         # python -m polywang
 │   ├── arbitrage_bot.py    # 市场流、纸面/实盘编排
 │   ├── arbitrage_core.py   # 扫描、账本、FOK、对账、方向性执行
-│   ├── polymarket_edge.py  # 费率、边际、凯利、校准、NegRisk
+│   ├── polymarket_edge.py  # 费率、边际、凯利、校准、NegRisk 价格扫描
+│   ├── negrisk.py          # 完整集合扫描、n 腿账本、独立 FOK 执行器
 │   ├── whale_intelligence.py
 │   ├── market_replay.py
 │   ├── sports_channel.py
