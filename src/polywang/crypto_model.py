@@ -47,6 +47,144 @@ def digital_call_probability(spot: float, strike: float, vol: float,
 
 
 @dataclass(frozen=True)
+class ProbabilityBand:
+    """
+    A digital-call probability together with how far it moves when the
+    volatility input is wrong.
+
+    The point estimate on its own hides the question that decides the trade.
+    Volatility is estimated, not observed, and near the money a modest error in
+    it moves the answer further than the apparent edge does. Carrying the band
+    is what lets a caller tell a mispriced contract from the width of its own
+    uncertainty.
+    """
+
+    point: float
+    low: float
+    high: float
+    vol: float
+    vol_error: float
+
+    @property
+    def width(self) -> float:
+        return abs(self.high - self.low)
+
+    def confidence_against(self, market_price: float) -> float:
+        """
+        How much of the apparent edge survives the volatility uncertainty, on a
+        0-1 scale suitable for shrinking a position size.
+
+        Returns zero when the band is at least as wide as twice the edge, which
+        is the honest answer in that case: the model cannot distinguish the
+        mispricing from its own error, so there is nothing to size on.
+        """
+        edge = abs(self.point - float(market_price))
+        if edge <= 1e-9:
+            return 0.0
+        return max(0.0, min(1.0, 1.0 - (self.width / (2.0 * edge))))
+
+
+def digital_call_probability_band(spot: float, strike: float, vol: float, time_years: float,
+                                  rate: float = 0.0, vol_error: float = 0.25,
+                                  samples: int = 21) -> Optional[ProbabilityBand]:
+    """
+    Reprices the contract across volatility plus and minus `vol_error`.
+
+    A 25% default is not pessimism: realised volatility over a short window is a
+    noisy estimate of the volatility that will actually be realised, and crypto
+    regimes move fast enough that being a quarter out is ordinary.
+
+    The range is swept rather than evaluated at its two ends, because the
+    probability is not monotone in volatility. More volatility widens the
+    distribution, pulling the answer towards 0.50, while the -sigma^2 T / 2 term
+    drags the median down. Above the strike those pull in opposite directions, so
+    the extreme can sit inside the range and an endpoint-only band can fail to
+    contain its own point estimate.
+    """
+    point = digital_call_probability(spot, strike, vol, time_years, rate)
+    if point is None:
+        return None
+
+    try:
+        vol_f = float(vol)
+        error = max(0.0, float(vol_error))
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(vol_f) or not math.isfinite(error):
+        return None
+
+    low_vol = max(0.0, vol_f * (1.0 - error))
+    high_vol = vol_f * (1.0 + error)
+    steps = max(2, int(samples))
+
+    values = [point]
+    for index in range(steps):
+        candidate_vol = low_vol + (high_vol - low_vol) * (index / (steps - 1))
+        candidate = digital_call_probability(spot, strike, candidate_vol, time_years, rate)
+        if candidate is not None:
+            values.append(candidate)
+
+    return ProbabilityBand(point=point, low=min(values), high=max(values),
+                           vol=vol_f, vol_error=error)
+
+
+class RealisedVolatility:
+    """
+    Rolling annualised volatility from a stream of spot prices.
+
+    Uses log returns, because prices compound. The sampling interval is required
+    rather than inferred: annualising assumes every observation spans the same
+    period, so a feed that skips ticks otherwise reports a figure wrong by the
+    square root of however much it skipped.
+
+    Returns None until it has enough samples to mean anything, rather than
+    emitting a confident number from four observations.
+    """
+
+    def __init__(self, sample_interval_seconds: float = 60.0, window: int = 240,
+                 minimum_samples: int = 30):
+        if sample_interval_seconds <= 0:
+            raise ValueError("sample_interval_seconds must be positive")
+        self.sample_interval_seconds = float(sample_interval_seconds)
+        self.window = max(2, int(window))
+        self.minimum_samples = max(2, int(minimum_samples))
+        self._prices: Deque[float] = deque(maxlen=self.window + 1)
+
+    def add(self, price: float) -> None:
+        try:
+            value = float(price)
+        except (TypeError, ValueError):
+            return
+        if not math.isfinite(value) or value <= 0.0:
+            return
+        self._prices.append(value)
+
+    def extend(self, prices) -> None:
+        for price in prices:
+            self.add(price)
+
+    @property
+    def sample_count(self) -> int:
+        return max(0, len(self._prices) - 1)
+
+    @property
+    def is_ready(self) -> bool:
+        return self.sample_count >= self.minimum_samples
+
+    def annualised(self) -> Optional[float]:
+        if not self.is_ready:
+            return None
+        prices = list(self._prices)
+        returns = [math.log(later / earlier) for earlier, later in zip(prices, prices[1:])]
+        if len(returns) < 2:
+            return None
+        mean = sum(returns) / len(returns)
+        variance = sum((value - mean) ** 2 for value in returns) / (len(returns) - 1)
+        periods_per_year = (365.0 * 24.0 * 60.0 * 60.0) / self.sample_interval_seconds
+        return math.sqrt(variance) * math.sqrt(periods_per_year)
+
+
+@dataclass(frozen=True)
 class CryptoReferenceQuote:
     market_id: str
     timestamp_ms: int
