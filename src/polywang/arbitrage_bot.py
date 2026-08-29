@@ -37,6 +37,8 @@ from .negrisk import (
     NegRiskMarket,
     OfficialNegRiskExecutor,
     PaperNegRiskExecutor,
+    collect_event_lookups,
+    fetch_complete_negrisk_events,
     negrisk_execution_enabled,
     parse_negrisk_markets,
 )
@@ -59,6 +61,7 @@ from .arbitrage_core import (
     consume_user_stream,
     intent_from_best_ask,
     intent_from_inventory_bid,
+    maker_gtc_enabled,
     _event_name,
     _gamma_outcome_prices,
 )
@@ -129,19 +132,28 @@ def fetch_markets(limit: int, *, get=None, pool: Optional[int] = None) -> List[B
 
 
 def fetch_universe(limit: int, *, get=None, pool: Optional[int] = None,
-                   negrisk_limit: int = 0) -> tuple:
+                   negrisk_limit: int = 0, get_event=None) -> tuple:
     """Return ranked binary combo-arb markets plus complete NegRisk fields.
 
     NegRisk rows are never mixed into the Yes/No FOK universe. Scattered
     volume-pool binaries that happen to be marked negRisk are also excluded
-    because a truncated field is not a complete set.
+    because a truncated field is not a complete set. When a NegRisk limit is
+    set, those binaries are used only as event-lookup keys; the complete
+    field comes from a Gamma event fetch, never from local grouping.
     """
     getter = get or _http_get_gamma
     keep = max(1, int(limit))
     pool_size = int(pool if pool is not None else env_int("MARKET_SCAN_POOL", max(keep * 5, 100)))
     pool_size = max(keep, pool_size)
     rows = _fetch_gamma_rows(pool_size, getter)
-    negrisk = parse_negrisk_markets(rows)
+    extra_events = []
+    if int(negrisk_limit) > 0:
+        lookups = collect_event_lookups(rows)
+        if lookups:
+            extra_events = fetch_complete_negrisk_events(
+                lookups, get_event or _http_get_gamma_event,
+            )
+    negrisk = parse_negrisk_markets(rows, extra_events=extra_events)
     negrisk_ids = {market.market_id for market in negrisk}
     binary: List[BinaryMarket] = []
     for row in rows:
@@ -180,6 +192,22 @@ def fetch_universe(limit: int, *, get=None, pool: Optional[int] = None,
             len(negrisk), len(selected_negrisk),
         )
     return selected, selected_negrisk
+
+
+def _http_get_gamma_event(kind: str, value: str) -> Optional[dict]:
+    """Fetch one complete Gamma event by id or slug. Missing events are None."""
+    if kind == "id":
+        url = f"https://gamma-api.polymarket.com/events/{value}"
+    elif kind == "slug":
+        url = f"https://gamma-api.polymarket.com/events/slug/{value}"
+    else:
+        return None
+    response = requests.get(url, timeout=10)
+    if response.status_code == 404:
+        return None
+    response.raise_for_status()
+    payload = response.json()
+    return payload if isinstance(payload, dict) else None
 
 
 def _http_get_gamma(params: dict) -> list:
@@ -372,7 +400,17 @@ class PaperMarketRunner:
                         if resolved_id in {resolved_market.market_id, resolved_market.condition_id}:
                             marked += self.negrisk_journal.mark_resolved(resolved_id, winning)
                     if marked:
-                        LOG.info("LIVE NEGRISK RESOLUTION: %s basket(s) marked settled; convert is still manual", marked)
+                        LOG.info("LIVE NEGRISK RESOLUTION: %s basket(s) pending redemption", marked)
+                    settler = getattr(self.negrisk_executor, "settle_baskets", None)
+                    if settler is not None:
+                        settled_baskets = settler()
+                        if inspect.isawaitable(settled_baskets):
+                            settled_baskets = await settled_baskets
+                        if settled_baskets:
+                            LOG.info(
+                                "LIVE NEGRISK SETTLED: %s basket(s) after confirmed redemption",
+                                len(settled_baskets),
+                            )
                 return
             for position_id, position in list(self.ledger.state["positions"].items()):
                 market = self.markets.get(position.get("market_id")) or self.negrisk_markets.get(position.get("market_id"))
@@ -431,7 +469,9 @@ class PaperMarketRunner:
                 continue
             if abs(yes_book.timestamp_ms - no_book.timestamp_ms) > self.max_leg_skew_ms:
                 continue
-            opportunity = self.scanner.scan(market, yes_book, no_book)
+            opportunity = self.scanner.scan(
+                market, yes_book, no_book, is_taker=not maker_gtc_enabled(),
+            )
             if not opportunity or opportunity.fingerprint in self.last_fingerprint:
                 continue
             yes_cost, _, yes_fills = yes_book.walk_asks(opportunity.shares)
@@ -452,8 +492,9 @@ class PaperMarketRunner:
             except ValueError as error:
                 LOG.info("Skip %s: %s", market.title, error)
                 continue
-            yes_book.consume_asks(yes_fills)
-            no_book.consume_asks(no_fills)
+            if opportunity.is_taker:
+                yes_book.consume_asks(yes_fills)
+                no_book.consume_asks(no_fills)
             self.last_fingerprint.add(opportunity.fingerprint)
             if self.live:
                 LOG.info("LIVE ARB HEDGED/PENDING USER CONFIRMATION: %s | %.4f shares | pair %s | YES %s | NO %s",

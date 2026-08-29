@@ -25,6 +25,8 @@ from polywang.negrisk import (
     NegRiskMarket,
     OfficialNegRiskExecutor,
     PaperNegRiskExecutor,
+    collect_event_lookups,
+    fetch_complete_negrisk_events,
     negrisk_execution_enabled,
     parse_negrisk_markets,
 )
@@ -143,6 +145,47 @@ class ParseTests(unittest.TestCase):
             child_binary("m-b", "yb", "nb", "B"),
         ]
         self.assertEqual(parse_negrisk_markets(rows), [])
+
+    def test_scattered_binaries_become_a_field_only_after_event_fetch(self):
+        rows = [
+            {**child_binary("m-a", "ya", "na", "A"), "eventId": "evt-1"},
+            {**child_binary("m-b", "yb", "nb", "B"), "eventId": "evt-1"},
+        ]
+        self.assertEqual(collect_event_lookups(rows), [("id", "evt-1")])
+        self.assertEqual(parse_negrisk_markets(rows), [])
+
+        def get_event(kind, value):
+            self.assertEqual((kind, value), ("id", "evt-1"))
+            return {
+                "id": "evt",
+                "title": "Election",
+                "active": True,
+                "closed": False,
+                "category": "geopolitics",
+                "markets": [
+                    child_binary("m-a", "ya", "na", "A"),
+                    child_binary("m-b", "yb", "nb", "B"),
+                    child_binary("m-c", "yc", "nc", "C"),
+                ],
+            }
+
+        events = fetch_complete_negrisk_events(collect_event_lookups(rows), get_event)
+        markets = parse_negrisk_markets(rows, extra_events=events)
+        self.assertEqual(len(markets), 1)
+        self.assertEqual(markets[0].source, "event")
+        self.assertEqual(markets[0].yes_token_ids, ("ya", "yb", "yc"))
+
+        binary, negrisk = fetch_universe(
+            5, get=lambda params: rows, pool=5, negrisk_limit=5, get_event=get_event,
+        )
+        self.assertEqual(binary, [])
+        self.assertEqual([market.market_id for market in negrisk], ["evt"])
+
+        empty, still_empty = fetch_universe(
+            5, get=lambda params: rows, pool=5, negrisk_limit=0,
+        )
+        self.assertEqual(empty, [])
+        self.assertEqual(still_empty, [])
 
 
 class BookScannerTests(unittest.TestCase):
@@ -350,6 +393,63 @@ class RiskAndRunnerTests(unittest.TestCase):
         binary, negrisk = fetch_universe(5, get=lambda params: rows, pool=5, negrisk_limit=5)
         self.assertEqual([market.market_id for market in binary], ["bin"])
         self.assertEqual([market.market_id for market in negrisk], ["nr1"])
+
+    def test_startup_allows_assembled_and_pending_redemption(self):
+        with tempfile.TemporaryDirectory() as directory:
+            nr = LiveNegRiskJournal(os.path.join(directory, "nr.json"))
+            opportunity = ExecutorTests().opportunity()
+            assembled = nr.create_basket(opportunity)
+            nr.set_status(assembled, "ASSEMBLED")
+            pending = nr.create_basket(opportunity)
+            nr.set_status(pending, "RESOLVED_PENDING_REDEMPTION")
+            converting = nr.create_basket(opportunity)
+            nr.set_status(converting, "CONVERT_SUBMITTED")
+            pairs = LiveOrderJournal(os.path.join(directory, "pairs.json"))
+            risk = LiveRiskController(
+                pairs, equity_usd=1000.0, state_path=os.path.join(directory, "risk.json"),
+                kill_switch_path=os.path.join(directory, "missing-kill"),
+                negrisk_journal=nr,
+            )
+            risk.check_startup()
+
+    def test_resolution_redeem_settles_and_convert_is_fail_closed(self):
+        class RedeemHandle:
+            transaction_hash = "0xredeem"
+            transaction_id = "rtx"
+
+            async def wait(self):
+                return self
+
+        class RedeemOnlyClient(FakeNegRiskClient):
+            def __init__(self):
+                super().__init__()
+                self.redeem_calls = []
+
+            async def redeem_positions(self, **kwargs):
+                self.redeem_calls.append(kwargs)
+                return RedeemHandle()
+
+        opportunity = ExecutorTests().opportunity()
+        with tempfile.TemporaryDirectory() as directory:
+            journal = LiveNegRiskJournal(os.path.join(directory, "nr.json"))
+            client = RedeemOnlyClient()
+            transport = OfficialFOKExecutor(client)
+            executor = OfficialNegRiskExecutor(
+                transport, journal, auto_convert=True, auto_redeem=True,
+            )
+            asyncio.run(executor.execute(opportunity))
+            basket = list(journal.state["baskets"].values())[0]
+            self.assertEqual(basket["status"], "ASSEMBLED")
+            with self.assertRaises(RuntimeError) as raised:
+                asyncio.run(executor.convert_basket(basket))
+            self.assertIn("convert_positions", str(raised.exception))
+            self.assertEqual(journal._record(basket["basket_id"])["status"], "ASSEMBLED")
+            self.assertEqual(journal.mark_resolved(opportunity.market_id, "A"), 1)
+            settled = asyncio.run(executor.settle_baskets())
+            self.assertEqual(len(settled), 1)
+            self.assertEqual(settled[0]["status"], "SETTLED")
+            self.assertEqual(settled[0]["settlement_type"], "REDEEM")
+            self.assertEqual(client.redeem_calls, [{"condition_id": "cnr"}])
 
     def test_execution_flags_default_off(self):
         with mock.patch.dict(os.environ, {}, clear=False):

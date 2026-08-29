@@ -124,13 +124,30 @@ ENABLE_CRYPTO_LIVE=1
 
 ## NegRisk 完整集合（默认关闭）
 
-这不是 Yes/No 双腿 FOK。互斥 n 结果字段买齐全部 YES（或在有 NO token 时买齐全部 NO）才是完整集合。顺序 n 腿同样不是原子成交，`is_risk_free` 仍为 false。官方 NegRisk adapter 的 convert/redeem 与二元 `merge_positions` 不同，本路径**不会自动 merge**。
+这不是 Yes/No 双腿 FOK。互斥 n 结果字段买齐全部 YES（或在有 NO token 时买齐全部 NO）才是完整集合。顺序 n 腿同样不是原子成交，`is_risk_free` 仍为 false。官方 NegRisk adapter 的 convert/redeem 与二元 `merge_positions` 不同，本路径**不会**调用二元 merge。
 
 ```bash
 ENABLE_NEGRISK_EXECUTION=1
 ENABLE_NEGRISK_LIVE=1          # 仅实盘需要
 NEGRISK_MARKET_LIMIT=10
 LIVE_MAX_OPEN_NEGRISK=2
+AUTO_CONVERT_NEGRISK=0         # 保持关闭：polymarket-client 0.6.0 没有 convert_positions
+AUTO_REDEEM_RESOLVED_POSITIONS=1
 ```
 
-只会订阅 Gamma 已经列全的字段（一张 n-way 市场，或带齐子市场列表的 event）。不要指望成交量前 N 里几条散落的 `negRisk` 二元行会被拼成完整集合。账本是 `live-negrisk.json`，和 `live-orders.json` 分开。未完成的篮子在启动时会 halt，已组装的库存计入总暴露，等待人工 convert 或结算。
+成交量池里散落的 `negRisk` 二元行**不会**在本地拼成完整集合。打开执行后，程序只用它们当 Gamma event 的查找键（`events[].id` / `eventId` / `eventSlug`），再去拉带齐 `markets[]` 的完整 event。拉不到就跳过，缺腿就是方向性敞口。账本是 `live-negrisk.json`，和 `live-orders.json` 分开。
+
+市场 resolution 后篮子进入 `RESOLVED_PENDING_REDEMPTION`，对账会对每个 child `condition_id` 调用官方 `redeem_positions`；输家腿余额可以为 0。确认后才变成 `SETTLED` 并释放风险预算。`ASSEMBLED` / `RESOLVED_PENDING_REDEMPTION` / `CONVERT_SUBMITTED` 在启动时不 halt（稳定库存）；未完成或未知结果仍 halt。
+
+`AUTO_CONVERT_NEGRISK` 默认 0。0.6.0 没有 `convert_positions`；打开后会 fail-closed 报错，不会猜一个替代接口，也不会重发已经提交的链上交易。
+
+## Maker / GTC（二元组合套利，默认关闭）
+
+挂单可以躲开 0.50 附近 politics 的 taker 费，但两腿不是同时成交。裸腿必须有超时和 FAK unwind。NegRisk n 腿不要开 GTC。
+
+```bash
+ENABLE_MAKER_GTC=0
+MAKER_REST_SECONDS=30
+```
+
+打开后扫描器按 maker（0 费率）计价，两腿同时挂 `post_only` 限价，价格是 `max(tick, worst_ask - tick)`。账本状态是 `RESTING`，`order_style=GTC`。post-only 被拒**不会**改成 FOK。超过 `MAKER_REST_SECONDS` 会撤单：两腿都成交 → `HEDGED`；只有一腿 → FAK unwind，失败则 `UNHEDGED` 并 halt。启动时 `RESTING` 不 halt（故意挂着）；`UNHEDGED` 仍 halt。kill-switch 会先 `cancel_all`，再对不平衡的 RESTING 腿发 FAK。

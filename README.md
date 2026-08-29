@@ -172,9 +172,16 @@ NEGRISK_MARKET_LIMIT=10
 ```
 
 只接受 Gamma 里已经列全的字段：一张 n 结果市场，或带齐 `markets[]` 子市场的
-event。成交量池里散落的 `negRisk` 二元行不会被拼成「完整集合」，因为缺腿就是
-方向性敞口。`BUY_ALL_NO` 只有在每个结果都有 NO token 时才执行。组装完成后
-**不会自动 convert**；未完成的篮子重启即 halt，写入 `live-negrisk.json`。
+event。成交量池里散落的 `negRisk` 二元行不会在本地拼场；打开执行后只把它们
+当成 event 查找键，再去 Gamma 拉完整 event。`BUY_ALL_NO` 只有在每个结果都有
+NO token 时才执行。组装后默认不 convert（`AUTO_CONVERT_NEGRISK=0`，0.6.0 没有
+`convert_positions`）。市场判定后进入 `RESOLVED_PENDING_REDEMPTION`，对每个
+child condition 调用 `redeem_positions`，确认后才 `SETTLED`。未完成篮子重启
+halt；已组装或待赎回库存计入暴露，写入 `live-negrisk.json`。
+
+二元组合套利另有可选 Maker/GTC（`ENABLE_MAKER_GTC=0`）：扫描按 0 费率，两腿
+`post_only` 限价挂着，超时撤单并对单边成交 FAK unwind。默认关闭。不要给
+NegRisk n 腿开 GTC。
 
 ## 需要定期校准的参数
 

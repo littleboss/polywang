@@ -20,6 +20,8 @@ from polywang.arbitrage_core import (
     PaperArbitrageExecutor,
     UnhedgedPairError,
     handle_market_event,
+    maker_gtc_enabled,
+    maker_limit_price,
 )
 
 
@@ -262,6 +264,21 @@ class ScannerTests(unittest.TestCase):
             min_net_profit_usd=0.01, min_return=0.0, safety_buffer_usd=0.0, merge_gas_usd=0.05,
         ).scan(market(), self.book([(0.40, 10)]), self.book([(0.40, 10)]))
         self.assertAlmostEqual(still_profit.net_profit, cheap.net_profit - 0.05, places=6)
+
+    def test_maker_scan_zeros_taker_fees_so_politics_mid_can_clear(self):
+        yes, no = self.book([(0.49, 100)]), self.book([(0.50, 100)])
+        taker = BinaryArbitrageScanner(min_net_profit_usd=0.01, min_return=0.0, safety_buffer_usd=0.0).scan(
+            market(), yes, no, is_taker=True)
+        maker = BinaryArbitrageScanner(min_net_profit_usd=0.01, min_return=0.0, safety_buffer_usd=0.0).scan(
+            market(), yes, no, is_taker=False)
+        self.assertIsNone(taker)
+        self.assertIsNotNone(maker)
+        self.assertEqual(maker.yes_fee, 0.0)
+        self.assertEqual(maker.no_fee, 0.0)
+        self.assertEqual(maker.yes_execution_fee_cap, 0.0)
+        self.assertFalse(maker.is_taker)
+        self.assertEqual(maker.order_style, "GTC")
+        self.assertAlmostEqual(maker_limit_price(0.50, 0.01), 0.49, places=9)
 
     def test_unsynced_book_is_not_scanned(self):
         yes, no = self.book([(0.40, 10)]), self.book([(0.40, 10)])
@@ -1161,6 +1178,142 @@ class LiveExecutorTests(unittest.TestCase):
             self.assertEqual(len(flatten["inventory"]["pairs"]), 1)
             self.assertIn("not auto-sold", flatten["note"])
             self.assertEqual(len(flatten["directional_flatten"]["flattened"]), 1)
+
+
+class FakeGTCClient(FakeClient):
+    def __init__(self, yes_ok=True, no_ok=True):
+        super().__init__(no_ok=no_ok)
+        self.yes_ok = yes_ok
+        self.limit_calls = []
+        self.orders = {}
+
+    async def place_limit_order(self, **kwargs):
+        self.limit_calls.append(kwargs)
+        token = kwargs["token_id"]
+        ok = self.yes_ok if token == "yes-token" else self.no_ok
+        order_id = f"gtc-{token}" if ok else ""
+        response = {
+            "ok": ok,
+            "order_id": order_id,
+            "taking_amount": "0",
+            "message": "" if ok else "would take",
+        }
+        if ok:
+            self.orders[order_id] = {
+                "ok": True,
+                "order_id": order_id,
+                "token_id": token,
+                "side": "BUY",
+                "status": "OPEN",
+                "taking_amount": "0",
+            }
+        return response
+
+    async def get_order(self, **kwargs):
+        return self.orders[kwargs["order_id"]]
+
+    async def cancel_order(self, **kwargs):
+        self.calls.append({"cancel_order": kwargs})
+        order = self.orders.get(kwargs["order_id"])
+        if order:
+            order["status"] = "CANCELLED"
+        return {"ok": True, "order_id": kwargs.get("order_id")}
+
+
+class MakerGTCTests(unittest.TestCase):
+    def opportunity(self):
+        yes, no = OrderBook(), OrderBook()
+        yes.asks, no.asks = {0.49: 10}, {0.50: 10}
+        yes.synced = no.synced = True
+        yes.timestamp_ms = no.timestamp_ms = 1
+        return BinaryArbitrageScanner(
+            min_net_profit_usd=0.01, min_return=0.0, safety_buffer_usd=0.0,
+        ).scan(market(), yes, no, is_taker=False)
+
+    def test_maker_flag_defaults_off(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ENABLE_MAKER_GTC", None)
+            self.assertFalse(maker_gtc_enabled())
+
+    def test_gtc_places_post_only_limits_and_stays_resting(self):
+        opportunity = self.opportunity()
+        self.assertIsNotNone(opportunity)
+        client = FakeGTCClient()
+        with tempfile.TemporaryDirectory() as directory:
+            journal = LiveOrderJournal(os.path.join(directory, "live.json"))
+            result = asyncio.run(OfficialFOKExecutor(client, journal=journal).execute(opportunity))
+            record = journal.state["pairs"][result.pair_id]
+            self.assertEqual(result.status, "RESTING")
+            self.assertEqual(record["status"], "RESTING")
+            self.assertEqual(record["order_style"], "GTC")
+            self.assertEqual([call["post_only"] for call in client.limit_calls], [True, True])
+            self.assertEqual(client.limit_calls[0]["price"], "0.480000")
+            self.assertEqual(client.limit_calls[1]["price"], "0.490000")
+            self.assertFalse(any(call.get("order_type") == "FOK" for call in client.calls))
+
+    def test_gtc_post_only_reject_does_not_fall_back_to_fok(self):
+        client = FakeGTCClient(yes_ok=False)
+        with tempfile.TemporaryDirectory() as directory:
+            journal = LiveOrderJournal(os.path.join(directory, "live.json"))
+            with self.assertRaises(RuntimeError) as raised:
+                asyncio.run(OfficialFOKExecutor(client, journal=journal).execute(self.opportunity()))
+            self.assertIn("post-only", str(raised.exception))
+            record = list(journal.state["pairs"].values())[0]
+            self.assertEqual(record["status"], "REJECTED")
+        self.assertEqual(len(client.limit_calls), 1)
+        self.assertFalse(any(call.get("order_type") == "FOK" for call in client.calls))
+
+    def test_gtc_timeout_cancels_and_unwinds_a_one_sided_fill(self):
+        opportunity = self.opportunity()
+        client = FakeGTCClient()
+        with tempfile.TemporaryDirectory() as directory:
+            journal = LiveOrderJournal(os.path.join(directory, "live.json"))
+            executor = OfficialFOKExecutor(client, journal=journal, rest_seconds=0.0)
+            result = asyncio.run(executor.execute(opportunity))
+            client.orders["gtc-yes-token"]["taking_amount"] = "10"
+            client.orders["gtc-yes-token"]["status"] = "FILLED"
+            journal.state["pairs"][result.pair_id]["created_at"] = time.time() - 60
+            journal.save()
+            asyncio.run(executor.reconcile(stale_after_seconds=0.0, recover_orphans=False))
+            record = journal.state["pairs"][result.pair_id]
+            sells = [call for call in client.calls if call.get("side") == "SELL"]
+            self.assertTrue(sells)
+            self.assertEqual(sells[0]["order_type"], "FAK")
+            self.assertEqual(record["status"], "ROLLED_BACK")
+
+    def test_startup_allows_resting_gtc_but_halts_on_unhedged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal = LiveOrderJournal(os.path.join(directory, "live.json"))
+            pair_id = journal.create_pair(self.opportunity())
+            journal.update(pair_id, order_style="GTC", status="RESTING",
+                           yes_order_id="gtc-yes", no_order_id="gtc-no")
+            risk = LiveRiskController(
+                journal, equity_usd=1000.0, state_path=os.path.join(directory, "risk.json"),
+                kill_switch_path=os.path.join(directory, "missing-kill"),
+            )
+            risk.check_startup()
+            journal.set_status(pair_id, "UNHEDGED", "one-sided fill")
+            with self.assertRaises(RiskHaltError):
+                risk.check_startup()
+
+    def test_halt_unwinds_unbalanced_resting_gtc(self):
+        client = FakeGTCClient()
+        with tempfile.TemporaryDirectory() as directory:
+            journal = LiveOrderJournal(os.path.join(directory, "live.json"))
+            executor = OfficialFOKExecutor(client, journal=journal)
+            result = asyncio.run(executor.execute(self.opportunity()))
+            journal.set_matched(result.pair_id, "yes", 10)
+            journal.set_status(result.pair_id, "RESTING")
+            risk = LiveRiskController(
+                journal, equity_usd=1000.0, state_path=os.path.join(directory, "risk.json"),
+                kill_switch_path="",
+            )
+            risk.halt("kill")
+            asyncio.run(executor.apply_halt_actions(risk))
+            sells = [call for call in client.calls if call.get("side") == "SELL"]
+            self.assertEqual(len(sells), 1)
+            self.assertEqual(sells[0]["token_id"], "yes-token")
+            self.assertEqual(journal.state["pairs"][result.pair_id]["status"], "ROLLED_BACK")
 
 
 if __name__ == "__main__":
