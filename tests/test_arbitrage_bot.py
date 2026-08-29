@@ -111,7 +111,7 @@ class UniverseSelectionTests(unittest.TestCase):
         ]
 
         def getter(params):
-            self.assertEqual(params["order"], "volume_24hr")
+            self.assertEqual(params["order"], "volume24hr")
             return list(rows)
 
         selected = fetch_markets(2, get=getter, pool=3)
@@ -280,6 +280,137 @@ class ResearchExecutionPathTests(unittest.TestCase):
             self.assertEqual(exit_signal.action, "EXIT")
             self.assertEqual(journal.inventory_by_token(), {})
             self.assertIsNone(model.inventory.get("m1"))
+
+
+class ScanRejectAndGammaTests(unittest.TestCase):
+    def test_gamma_market_fetch_uses_volume24hr_order_param(self):
+        from polywang.arbitrage_bot import GAMMA_VOLUME_ORDER, _fetch_gamma_rows
+        self.assertEqual(GAMMA_VOLUME_ORDER, "volume24hr")
+        seen = []
+
+        def getter(params):
+            seen.append(dict(params))
+            return []
+
+        _fetch_gamma_rows(5, getter)
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0]["order"], "volume24hr")
+        self.assertNotEqual(seen[0]["order"], "volume_24hr")
+
+    def test_fetch_markets_query_order_is_volume24hr(self):
+        from polywang.arbitrage_bot import fetch_markets
+
+        def getter(params):
+            self.assertEqual(params["order"], "volume24hr")
+            return [{
+                "id": "bin", "conditionId": "cb", "question": "Binary",
+                "clobTokenIds": '["y", "n"]', "outcomes": '["Yes", "No"]',
+                "outcomePrices": '["0.40", "0.60"]', "category": "geopolitics",
+                "active": True, "closed": False,
+            }]
+
+        selected = fetch_markets(1, get=getter, pool=1)
+        self.assertEqual([market.market_id for market in selected], ["bin"])
+
+    def test_default_floors_and_buffer_unchanged(self):
+        scanner = BinaryArbitrageScanner()
+        self.assertEqual(scanner.min_net_profit_usd, 0.05)
+        self.assertEqual(scanner.min_return, 0.002)
+        self.assertEqual(scanner.safety_buffer_usd, 0.02)
+
+    def test_scan_reject_counter_flush_sums_to_attempts_and_logs_touch(self):
+        from polywang.arbitrage_bot import ScanRejectCounter
+        lines = []
+
+        class Capture:
+            def info(self, message, *args):
+                lines.append(message % args if args else message)
+
+        counter = ScanRejectCounter(flush_interval_s=3600.0, logger=Capture())
+        counter.note_dual_synced("m1")
+        counter.observe_touch_sum(0.97)
+        counter.observe_touch_sum(0.99)
+        counter.observe_net(-0.04)
+        counter.record("net_below_floor")
+        counter.record("stale_book")
+        counter.record("leg_skew")
+        self.assertEqual(counter.attempts, 3)
+        self.assertEqual(sum(counter.counts.values()), 3)
+        counter.flush()
+        self.assertEqual(len(lines), 1)
+        self.assertIn("attempts=3", lines[0])
+        self.assertIn("rejects=3", lines[0])
+        self.assertIn("accepted=0", lines[0])
+        self.assertIn("dual_synced_markets=1", lines[0])
+        self.assertIn("best_yes_ask+no_ask=0.9700", lines[0])
+        self.assertIn("best_net=-0.0400", lines[0])
+        self.assertIn("net_below_floor=1", lines[0])
+        self.assertIn("stale_book=1", lines[0])
+        self.assertIn("leg_skew=1", lines[0])
+        self.assertEqual(counter.attempts, 0)
+
+    def test_paper_process_logs_rejects_and_does_not_write_live_orders(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ, {"WHALE_STATE_PATH": "", "MAX_LEG_SKEW_MS": "500"}, clear=False,
+        ):
+            ledger = os.path.join(directory, "ledger.json")
+            live_orders = os.path.join(directory, "live-orders.json")
+            market = BinaryMarket("m1", "c1", "Test", "yes-token", "no-token")
+            # Default floors: fee drag leaves net below 0.05 on a 0.48+0.48 book.
+            runner = PaperMarketRunner(
+                [market], ledger, 100.0, BinaryArbitrageScanner(),
+            )
+            runner.max_book_age_seconds = 1e9
+            runner.scan_rejects.flush_interval_s = 3600.0
+            now = int(__import__("time").time() * 1000)
+            asyncio.run(runner.process({
+                "event_type": "book", "asset_id": "yes-token", "timestamp": str(now),
+                "hash": "y", "asks": [{"price": "0.49", "size": "10"}], "bids": [],
+            }))
+            asyncio.run(runner.process({
+                "event_type": "book", "asset_id": "no-token", "timestamp": str(now),
+                "hash": "n", "asks": [{"price": "0.49", "size": "10"}], "bids": [],
+            }))
+            self.assertEqual(runner.ledger.state["positions"], {})
+            self.assertGreater(runner.scan_rejects.attempts, 0)
+            self.assertEqual(
+                sum(runner.scan_rejects.counts.values()) + runner.scan_rejects.accepted,
+                runner.scan_rejects.attempts,
+            )
+            self.assertGreater(runner.scan_rejects.counts["net_below_floor"], 0)
+            self.assertIsNotNone(runner.scan_rejects.best_touch_sum)
+            self.assertAlmostEqual(runner.scan_rejects.best_touch_sum, 0.98)
+            self.assertEqual(runner.scan_rejects.dual_synced_markets, {"m1"})
+            with self.assertLogs("arbitrage-bot", level="INFO") as captured:
+                runner.scan_rejects.flush()
+            self.assertTrue(any("SCAN REJECTS:" in line for line in captured.output))
+            self.assertTrue(any("best_yes_ask+no_ask=" in line for line in captured.output))
+            self.assertFalse(os.path.exists(live_orders))
+            self.assertNotEqual(ledger, live_orders)
+
+    def test_paper_process_counts_leg_skew(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ, {"WHALE_STATE_PATH": "", "MAX_LEG_SKEW_MS": "500"}, clear=False,
+        ):
+            market = BinaryMarket("m1", "c1", "Test", "yes-token", "no-token")
+            runner = PaperMarketRunner(
+                [market], os.path.join(directory, "ledger.json"), 100.0,
+                BinaryArbitrageScanner(min_net_profit_usd=0.01, min_return=0.0, safety_buffer_usd=0.0),
+            )
+            runner.max_book_age_seconds = 1e9
+            runner.scan_rejects.flush_interval_s = 3600.0
+            now = int(__import__("time").time() * 1000)
+            asyncio.run(runner.process({
+                "event_type": "book", "asset_id": "yes-token", "timestamp": str(now),
+                "hash": "y", "asks": [{"price": "0.40", "size": "10"}], "bids": [],
+            }))
+            asyncio.run(runner.process({
+                "event_type": "book", "asset_id": "no-token", "timestamp": str(now + 2000),
+                "hash": "n", "asks": [{"price": "0.40", "size": "10"}], "bids": [],
+            }))
+            self.assertEqual(runner.scan_rejects.counts["leg_skew"], 1)
+            self.assertEqual(runner.scan_rejects.attempts, 1)
+            self.assertIsNotNone(runner.scan_rejects.best_touch_sum)
 
 
 if __name__ == "__main__":
