@@ -492,6 +492,10 @@ class BinaryArbitrageScanner:
         self.max_order_usd = max(0.01, max_order_usd)
         self.max_levels = max(1, int(max_levels)) if max_levels is not None else None
         self.merge_gas_usd = max(0.0, float(merge_gas_usd))
+        # Set on each scan() call so callers can attribute silent rejects.
+        self.last_reject_reason: Optional[str] = None
+        self.last_touch_sum: Optional[float] = None
+        self.last_best_net: Optional[float] = None
 
     @staticmethod
     def _cost_for(book: OrderBook, shares: float,
@@ -521,14 +525,20 @@ class BinaryArbitrageScanner:
              is_taker: bool = True) -> Optional[ArbitrageOpportunity]:
         # Negative-risk groups need their own complete-set and redemption
         # semantics. Do not infer them from a two-token price sum.
+        self.last_reject_reason = None
+        self.last_touch_sum = None
+        self.last_best_net = None
         if not market.active or market.neg_risk:
             return None
         if not yes_book.synced or not no_book.synced:
+            self.last_reject_reason = "not_synced"
             return None
         yes_touch = yes_book.best_ask()
         no_touch = no_book.best_ask()
         if not yes_touch or not no_touch:
+            self.last_reject_reason = "no_touch"
             return None
+        self.last_touch_sum = float(yes_touch[0] + no_touch[0])
 
         yes_levels = yes_book.asks_sorted()
         no_levels = no_book.asks_sorted()
@@ -547,6 +557,7 @@ class BinaryArbitrageScanner:
         no_depth = sum(size for _, size in no_levels)
         max_shares = min(yes_depth, no_depth)
         if max_shares <= 0.0:
+            self.last_reject_reason = "no_depth"
             return None
 
         def execution_capital_for(shares: float) -> float:
@@ -583,6 +594,7 @@ class BinaryArbitrageScanner:
                     high = middle
             max_shares = low
         if max_shares <= 1e-12 or (market.min_order_size > 0.0 and max_shares < market.min_order_size):
+            self.last_reject_reason = "below_min_size"
             return None
 
         # Costs are piecewise-linear. Evaluating every cumulative depth boundary
@@ -602,6 +614,7 @@ class BinaryArbitrageScanner:
             candidates.add(min(max_shares, no_cumulative))
 
         best = None
+        best_any = None
         for shares in sorted(candidates):
             if shares <= 0.0:
                 continue
@@ -670,10 +683,23 @@ class BinaryArbitrageScanner:
                     "and FAK-unwinds a one-sided fill, which may slip or remain open"
                 ),
             )
+            if best_any is None or result.net_profit > best_any.net_profit:
+                best_any = result
             if result.net_profit >= self.min_net_profit_usd and result.return_on_capital >= self.min_return:
                 if best is None or result.net_profit > best.net_profit:
                     best = result
-        return best
+        if best_any is not None:
+            self.last_best_net = float(best_any.net_profit)
+        if best is not None:
+            return best
+        if best_any is None:
+            self.last_reject_reason = "no_depth"
+            return None
+        if best_any.net_profit < self.min_net_profit_usd:
+            self.last_reject_reason = "net_below_floor"
+        else:
+            self.last_reject_reason = "roc_below_floor"
+        return None
 
 
 @dataclass

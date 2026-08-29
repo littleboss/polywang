@@ -222,6 +222,22 @@ class ScannerTests(unittest.TestCase):
             market(), self.book([(0.50, 100)]), self.book([(0.50, 100)]))
         self.assertIsNone(opportunity)
 
+    def test_expensive_pair_sets_net_below_floor_reason(self):
+        scanner = BinaryArbitrageScanner(min_net_profit_usd=0.05, min_return=0.0, safety_buffer_usd=0.02)
+        opportunity = scanner.scan(market(), self.book([(0.49, 100)]), self.book([(0.49, 100)]))
+        self.assertIsNone(opportunity)
+        self.assertEqual(scanner.last_reject_reason, "net_below_floor")
+        self.assertAlmostEqual(scanner.last_touch_sum, 0.98)
+        self.assertIsNotNone(scanner.last_best_net)
+        self.assertLess(scanner.last_best_net, 0.05)
+
+    def test_missing_touch_sets_no_touch_reason(self):
+        scanner = BinaryArbitrageScanner(min_net_profit_usd=0.01, min_return=0.0)
+        empty = self.book([])
+        opportunity = scanner.scan(market(), self.book([(0.40, 10)]), empty)
+        self.assertIsNone(opportunity)
+        self.assertEqual(scanner.last_reject_reason, "no_touch")
+
     def test_max_order_is_checked_against_depth_walked_cost(self):
         yes, no = self.book([(0.30, 100), (0.35, 100)]), self.book([(0.30, 100), (0.35, 100)])
         opportunity = BinaryArbitrageScanner(

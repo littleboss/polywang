@@ -70,6 +70,98 @@ from .arbitrage_core import (
 LOG = logging.getLogger("arbitrage-bot")
 GAMMA_URL = "https://gamma-api.polymarket.com/markets"
 MARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+# Gamma /markets accepts order=volume24hr; volume_24hr returns HTTP 422.
+GAMMA_VOLUME_ORDER = "volume24hr"
+
+SCAN_REJECT_REASONS = (
+    "not_synced",
+    "stale_book",
+    "leg_skew",
+    "no_touch",
+    "no_depth",
+    "below_min_size",
+    "net_below_floor",
+    "roc_below_floor",
+    "fingerprint_dup",
+    "walk_mismatch",
+    "risk_skip",
+)
+
+
+class ScanRejectCounter:
+    """Count binary-scan skips and flush a 60s window summary.
+
+    Reject reason counts plus accepted opens equal scan attempts for the
+    interval. Also tracks the best (lowest) yes_ask+no_ask touch sum, the
+    best observed net, and how many markets had dual-synced books.
+    """
+
+    def __init__(self, flush_interval_s: float = 60.0, logger: Optional[logging.Logger] = None):
+        self.flush_interval_s = max(0.0, float(flush_interval_s))
+        self.log = logger or LOG
+        self.counts = {reason: 0 for reason in SCAN_REJECT_REASONS}
+        self.accepted = 0
+        self.best_touch_sum: Optional[float] = None
+        self.best_net: Optional[float] = None
+        self.dual_synced_markets: set = set()
+        self._window_start = time.monotonic()
+
+    def record(self, reason: str) -> None:
+        if reason not in self.counts:
+            raise ValueError(f"unknown scan reject reason: {reason}")
+        self.counts[reason] += 1
+        self.maybe_flush()
+
+    def record_accept(self) -> None:
+        self.accepted += 1
+        self.maybe_flush()
+
+    def note_dual_synced(self, market_id: str) -> None:
+        self.dual_synced_markets.add(str(market_id))
+
+    def observe_touch_sum(self, touch_sum: float) -> None:
+        value = float(touch_sum)
+        if self.best_touch_sum is None or value < self.best_touch_sum:
+            self.best_touch_sum = value
+
+    def observe_net(self, net: float) -> None:
+        value = float(net)
+        if self.best_net is None or value > self.best_net:
+            self.best_net = value
+
+    @property
+    def attempts(self) -> int:
+        return sum(self.counts.values()) + self.accepted
+
+    def maybe_flush(self, *, force: bool = False) -> None:
+        elapsed = time.monotonic() - self._window_start
+        if not force and elapsed < self.flush_interval_s:
+            return
+        self.flush()
+
+    def flush(self) -> None:
+        attempts = self.attempts
+        reject_total = sum(self.counts.values())
+        touch = "n/a" if self.best_touch_sum is None else f"{self.best_touch_sum:.4f}"
+        net = "n/a" if self.best_net is None else f"{self.best_net:.4f}"
+        reason_parts = " ".join(f"{name}={self.counts[name]}" for name in SCAN_REJECT_REASONS)
+        self.log.info(
+            "SCAN REJECTS: attempts=%d rejects=%d accepted=%d "
+            "dual_synced_markets=%d best_yes_ask+no_ask=%s best_net=%s | %s",
+            attempts,
+            reject_total,
+            self.accepted,
+            len(self.dual_synced_markets),
+            touch,
+            net,
+            reason_parts,
+        )
+        self.counts = {reason: 0 for reason in SCAN_REJECT_REASONS}
+        self.accepted = 0
+        self.best_touch_sum = None
+        self.best_net = None
+        self.dual_synced_markets = set()
+        self._window_start = time.monotonic()
 
 
 def env_float(name: str, default: float) -> float:
@@ -228,7 +320,7 @@ def _fetch_gamma_rows(pool: int, getter) -> list:
             "active": "true",
             "limit": min(page_size, pool - len(rows)),
             "offset": offset,
-            "order": "volume_24hr",
+            "order": GAMMA_VOLUME_ORDER,
             "ascending": "false",
         })
         if not isinstance(batch, list) or not batch:
@@ -348,6 +440,9 @@ class PaperMarketRunner:
         self.max_book_age_seconds = env_float("MAX_BOOK_AGE_SECONDS", 5.0)
         self.max_leg_skew_ms = max(0, int(env_float("MAX_LEG_SKEW_MS", 1000.0)))
         self.last_fingerprint = set()
+        self.scan_rejects = ScanRejectCounter(
+            flush_interval_s=env_float("SCAN_REJECT_FLUSH_SECONDS", 60.0),
+        )
         self.directional_executor = None
         self.calibration = None
         self.edge_evaluator = None
@@ -457,7 +552,13 @@ class PaperMarketRunner:
             if not yes_book or not no_book:
                 continue
             if not yes_book.synced or not no_book.synced:
+                self.scan_rejects.record("not_synced")
                 continue
+            self.scan_rejects.note_dual_synced(market.market_id)
+            yes_touch = yes_book.best_ask()
+            no_touch = no_book.best_ask()
+            if yes_touch and no_touch:
+                self.scan_rejects.observe_touch_sum(yes_touch[0] + no_touch[0])
             if self.live and not getattr(self.executor, "user_stream_healthy", False):
                 continue
             if not yes_book.timestamp_ms or not no_book.timestamp_ms:
@@ -466,17 +567,28 @@ class PaperMarketRunner:
             if now_ms + 30_000 < oldest_timestamp:
                 continue
             if now_ms - oldest_timestamp > self.max_book_age_seconds * 1000:
+                self.scan_rejects.record("stale_book")
                 continue
             if abs(yes_book.timestamp_ms - no_book.timestamp_ms) > self.max_leg_skew_ms:
+                self.scan_rejects.record("leg_skew")
                 continue
             opportunity = self.scanner.scan(
                 market, yes_book, no_book, is_taker=not maker_gtc_enabled(),
             )
-            if not opportunity or opportunity.fingerprint in self.last_fingerprint:
+            if self.scanner.last_best_net is not None:
+                self.scan_rejects.observe_net(self.scanner.last_best_net)
+            if opportunity is None:
+                reason = self.scanner.last_reject_reason
+                if reason in self.scan_rejects.counts:
+                    self.scan_rejects.record(reason)
+                continue
+            if opportunity.fingerprint in self.last_fingerprint:
+                self.scan_rejects.record("fingerprint_dup")
                 continue
             yes_cost, _, yes_fills = yes_book.walk_asks(opportunity.shares)
             no_cost, _, no_fills = no_book.walk_asks(opportunity.shares)
             if abs(yes_cost - opportunity.yes_cost) > 1e-8 or abs(no_cost - opportunity.no_cost) > 1e-8:
+                self.scan_rejects.record("walk_mismatch")
                 continue
             try:
                 if self.risk_controller:
@@ -490,12 +602,14 @@ class PaperMarketRunner:
                 LOG.critical("UNHEDGED LIVE PAIR: stopping the process for manual reconciliation")
                 raise
             except ValueError as error:
+                self.scan_rejects.record("risk_skip")
                 LOG.info("Skip %s: %s", market.title, error)
                 continue
             if opportunity.is_taker:
                 yes_book.consume_asks(yes_fills)
                 no_book.consume_asks(no_fills)
             self.last_fingerprint.add(opportunity.fingerprint)
+            self.scan_rejects.record_accept()
             if self.live:
                 LOG.info("LIVE ARB HEDGED/PENDING USER CONFIRMATION: %s | %.4f shares | pair %s | YES %s | NO %s",
                          market.title, result.shares, result.pair_id, result.yes_order_id, result.no_order_id)
@@ -503,6 +617,7 @@ class PaperMarketRunner:
                 LOG.info("PAPER ARB: %s | %.4f shares | capital $%.4f | net after buffer $%.4f | position %s",
                          market.title, opportunity.shares, opportunity.capital_required,
                          opportunity.net_profit, result.position_id)
+        self.scan_rejects.maybe_flush()
 
     async def _scan_negrisk(self, market_id: str, now_ms: int) -> None:
         if self.negrisk_scanner is None:
