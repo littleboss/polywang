@@ -1010,7 +1010,7 @@ class LiveOrderJournal:
                 if not math.isfinite(realized_pnl):
                     issues.append(f"{record.get('pair_id', '')} has invalid realized PnL")
             if record.get("status") not in {
-                "PENDING", "HEDGED", "RESOLVED_PENDING_REDEMPTION", "SETTLED",
+                "PENDING", "RESTING", "HEDGED", "RESOLVED_PENDING_REDEMPTION", "SETTLED",
                 "ROLLED_BACK", "REJECTED", "UNHEDGED"
             }:
                 issues.append(f"{record.get('pair_id', '')} has unknown status")
