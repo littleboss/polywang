@@ -11,13 +11,14 @@ binary pair executor or the directional single-leg book.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import inspect
 import json
 import math
 import os
 import tempfile
 import time
 from types import SimpleNamespace
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .arbitrage_core import (
     BinaryMarket,
@@ -237,11 +238,77 @@ class NegRiskMarket:
         )
 
 
-def parse_negrisk_markets(rows: Iterable[dict]) -> List[NegRiskMarket]:
+def event_lookup_key(row: dict) -> Optional[Tuple[str, str]]:
+    """Return ('id', ...) or ('slug', ...) for a Gamma event fetch, else None."""
+    if not isinstance(row, dict):
+        return None
+    events = row.get("events")
+    if isinstance(events, str):
+        events = _json_list(events)
+    if isinstance(events, list):
+        for item in events:
+            if not isinstance(item, dict):
+                continue
+            event_id = str(item.get("id") or "").strip()
+            slug = str(item.get("slug") or item.get("ticker") or "").strip()
+            if event_id:
+                return ("id", event_id)
+            if slug:
+                return ("slug", slug)
+    for name in ("eventId", "event_id"):
+        value = str(row.get(name) or "").strip()
+        if value:
+            return ("id", value)
+    slug = str(row.get("eventSlug") or row.get("event_slug") or "").strip()
+    if slug:
+        return ("slug", slug)
+    return None
+
+
+def collect_event_lookups(rows: Iterable[dict]) -> List[Tuple[str, str]]:
+    """Keys for complete event fetches. Truncated pool rows are never grouped locally."""
+    seen = set()
+    keys: List[Tuple[str, str]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if NegRiskMarket.from_gamma(row) is not None:
+            continue
+        binary = BinaryMarket.from_gamma(row)
+        if binary is None or not binary.active or not binary.neg_risk:
+            continue
+        key = event_lookup_key(row)
+        if key is None or key in seen:
+            continue
+        seen.add(key)
+        keys.append(key)
+    return keys
+
+
+def fetch_complete_negrisk_events(
+    lookups: Sequence[Tuple[str, str]],
+    get_event: Callable[[str, str], Optional[dict]],
+) -> List[dict]:
+    """Fetch complete Gamma events. Never invent a field from truncated binaries."""
+    events: List[dict] = []
+    seen = set()
+    for kind, value in lookups:
+        key = (kind, value)
+        if key in seen:
+            continue
+        seen.add(key)
+        event = get_event(kind, value)
+        if isinstance(event, dict):
+            events.append(event)
+    return events
+
+
+def parse_negrisk_markets(rows: Iterable[dict],
+                          extra_events: Optional[Iterable[dict]] = None) -> List[NegRiskMarket]:
     """Parse complete fields only. Scattered volume-pool binaries are ignored."""
     markets: List[NegRiskMarket] = []
     seen = set()
-    for row in rows:
+    for row in list(rows) + list(extra_events or []):
         parsed = NegRiskMarket.from_gamma(row) if isinstance(row, dict) else None
         if parsed is None or not parsed.active:
             continue
@@ -281,10 +348,13 @@ class NegRiskBookOpportunity:
     fingerprint: str
     merge_gas_usd: float = 0.0
     is_risk_free: bool = False
+    source: str = "nway"
+    child_condition_ids: Tuple[str, ...] = ()
     residual_risk: str = (
         "sequential n-leg FOK is not atomic; a later-leg miss is unwound with "
-        "FAK and may slip, partially fill, or remain open. NegRisk convert/"
-        "redeem is not automatic."
+        "FAK and may slip, partially fill, or remain open. Resolution redeem "
+        "runs after the market resolves; pre-resolution convert stays off "
+        "unless the official client exposes convert_positions."
     )
 
     @property
@@ -455,6 +525,10 @@ class NegRiskBookScanner:
                 fingerprint=f"{market.market_id}:{direction}:{':'.join(hashes)}:{shares:.12f}",
                 merge_gas_usd=self.merge_gas_usd,
                 is_risk_free=False,
+                source=market.source,
+                child_condition_ids=tuple(
+                    outcome.child_condition_id or market.condition_id for outcome in market.outcomes
+                ),
             )
             if result.net_profit >= self.min_net_profit_usd and result.return_on_capital >= self.min_return:
                 if best is None or result.net_profit > best.net_profit:
@@ -490,7 +564,9 @@ class LiveNegRiskJournal:
     """Atomic n-leg basket journal. Binary pairs stay on LiveOrderJournal."""
 
     TERMINAL_STATUSES = {"UNWOUND", "REJECTED", "SETTLED"}
-    OPEN_STATUSES = {"PENDING", "PARTIAL", "ASSEMBLED", "UNHEDGED"}
+    OPEN_STATUSES = {"PENDING", "PARTIAL", "ASSEMBLED", "UNHEDGED",
+                     "RESOLVED_PENDING_REDEMPTION", "CONVERT_SUBMITTED"}
+    STABLE_OPEN = {"ASSEMBLED", "RESOLVED_PENDING_REDEMPTION", "CONVERT_SUBMITTED"}
 
     def __init__(self, path: str):
         self.path = path
@@ -555,6 +631,8 @@ class LiveNegRiskJournal:
             "capital_reserved": float(opportunity.execution_capital_required),
             "expected_net_profit": float(opportunity.net_profit),
             "payout_per_share": float(opportunity.payout_per_share),
+            "source": opportunity.source,
+            "child_condition_ids": list(opportunity.child_condition_ids),
             "legs": legs,
             "status": "PENDING",
             "rollback_status": "NOT_REQUIRED",
@@ -604,7 +682,7 @@ class LiveNegRiskJournal:
     def incomplete_trades(self) -> List[dict]:
         """Risk duck-type: unfinished baskets, excluding fully assembled sets."""
         return [record for record in self.incomplete_baskets()
-                if record.get("status") != "ASSEMBLED"]
+                if record.get("status") not in self.STABLE_OPEN]
 
     def open_exposure(self) -> float:
         total = 0.0
@@ -712,7 +790,7 @@ class LiveNegRiskJournal:
         for record in self.state["baskets"].values():
             status = str(record.get("status", "UNKNOWN"))
             by_status[status] = by_status.get(status, 0) + 1
-            if status not in self.TERMINAL_STATUSES and status != "ASSEMBLED":
+            if status not in self.TERMINAL_STATUSES and status not in self.STABLE_OPEN:
                 unfinished.append(str(record.get("basket_id", "")))
         return {
             "baskets": len(self.state["baskets"]),
@@ -726,11 +804,31 @@ class LiveNegRiskJournal:
         for record in self.incomplete_baskets():
             if str(record.get("market_id")) != str(market_id) and str(record.get("condition_id")) != str(market_id):
                 continue
-            if record.get("status") != "ASSEMBLED":
+            if record.get("status") not in {"ASSEMBLED", "CONVERT_SUBMITTED"}:
                 continue
-            self.update(record["basket_id"], status="SETTLED", winning_outcome=str(winning))
+            self.update(
+                record["basket_id"],
+                status="RESOLVED_PENDING_REDEMPTION",
+                winning_outcome=str(winning),
+                settlement_type="MARKET_RESOLUTION",
+            )
             marked += 1
         return marked
+
+    def mark_settled(self, basket_id: str, transaction_hash: str, *,
+                     settlement_type: str, realized_pnl: Optional[float] = None) -> dict:
+        record = self._record(basket_id)
+        reserved = float(record.get("capital_reserved", 0.0))
+        payout = float(record.get("requested_shares", 0.0)) * float(record.get("payout_per_share", 1.0))
+        pnl = payout - reserved if realized_pnl is None else float(realized_pnl)
+        return self.update(
+            basket_id,
+            status="SETTLED",
+            settlement_type=settlement_type,
+            settlement_tx_hash=str(transaction_hash),
+            realized_pnl=pnl,
+            capital_reserved=0.0,
+        )
 
 
 class PaperNegRiskExecutor:
@@ -797,15 +895,23 @@ class LiveNegRiskResult:
 class OfficialNegRiskExecutor:
     """Sequential FOK across a complete NegRisk field, then FAK unwind on miss.
 
-    Convert/merge/redeem stay off: official NegRisk adapter calls are a
-    different contract from binary merge_positions. Assembled baskets remain
-    inventory until resolution or a manual convert.
+    Resolution redeem uses official ``redeem_positions`` per child condition.
+    Pre-resolution convert calls ``convert_positions`` only when the SDK
+    exposes it; polymarket-client 0.6.0 does not, so AUTO_CONVERT stays off.
     """
 
-    def __init__(self, transport: OfficialFOKExecutor, journal: LiveNegRiskJournal):
+    def __init__(self, transport: OfficialFOKExecutor, journal: LiveNegRiskJournal,
+                 auto_convert: Optional[bool] = None, auto_redeem: Optional[bool] = None):
         self.transport = transport
         self.journal = journal
         transport.negrisk_journal = journal
+        transport.negrisk_executor = self
+        if auto_convert is None:
+            auto_convert = os.getenv("AUTO_CONVERT_NEGRISK", "0") == "1"
+        if auto_redeem is None:
+            auto_redeem = os.getenv("AUTO_REDEEM_RESOLVED_POSITIONS", "1") == "1"
+        self.auto_convert = bool(auto_convert)
+        self.auto_redeem = bool(auto_redeem)
 
     async def execute(self, opportunity: NegRiskBookOpportunity) -> LiveNegRiskResult:
         if opportunity.shares <= 0.0:
@@ -905,6 +1011,131 @@ class OfficialNegRiskExecutor:
                 "NegRisk order outcome is unknown; reconcile before placing new orders"
             ) from cause
         raise RuntimeError(f"NegRisk basket was unwound: {cause}") from cause
+
+    def _redeem_condition_ids(self, record: dict) -> List[str]:
+        raw = record.get("child_condition_ids") or [record.get("condition_id")]
+        seen = set()
+        ids = []
+        for item in raw:
+            value = str(item or "").strip()
+            if value and value not in seen:
+                seen.add(value)
+                ids.append(value)
+        return ids
+
+    async def convert_basket(self, record: dict) -> dict:
+        """Convert an assembled complete set if the official client exposes it."""
+        basket_id = str(record["basket_id"])
+        current = self.journal._record(basket_id)
+        if current.get("status") == "SETTLED":
+            return current
+        if current.get("status") != "ASSEMBLED":
+            raise RuntimeError(f"basket {basket_id} is not assembled")
+        if current.get("settlement_type") == "CONVERT_SUBMITTED":
+            raise RuntimeError(f"basket {basket_id} has a submitted convert requiring reconciliation")
+        method_name = next(
+            (name for name in ("convert_positions", "convertPositions")
+             if getattr(self.transport.client, name, None) is not None),
+            "",
+        )
+        if not method_name:
+            raise RuntimeError(
+                "Official client does not expose convert_positions; "
+                "keep AUTO_CONVERT_NEGRISK=0 and redeem after resolution"
+            )
+        from decimal import Decimal, ROUND_DOWN
+        requested = Decimal(str(current.get("requested_shares", 0.0)))
+        amount = int((requested * Decimal(1_000_000)).to_integral_value(rounding=ROUND_DOWN))
+        if amount <= 0:
+            raise RuntimeError(f"basket {basket_id} has no convertible base-unit amount")
+        self.journal.update(basket_id, settlement_type="CONVERT_PENDING")
+        handle = await self.transport._call(
+            method_name,
+            condition_id=str(current["condition_id"]),
+            amount=amount,
+            token_ids=[str(leg.get("token_id")) for leg in current.get("legs") or []],
+        )
+        transaction_id = str(_response_value(handle, "transaction_id", "transactionID", default="") or "")
+        submitted_hash = self.transport._transaction_hash(handle)
+        self.journal.update(
+            basket_id,
+            status="CONVERT_SUBMITTED",
+            settlement_type="CONVERT_SUBMITTED",
+            settlement_tx_id=transaction_id,
+            settlement_tx_hash=submitted_hash,
+        )
+        wait = getattr(handle, "wait", None)
+        if wait is None:
+            raise RuntimeError("convert transaction handle has no wait method")
+        outcome = wait()
+        outcome = await outcome if inspect.isawaitable(outcome) else outcome
+        transaction_hash = self.transport._transaction_hash(outcome) or submitted_hash
+        if not transaction_hash:
+            raise RuntimeError("convert transaction completed without a transaction hash")
+        return self.journal.mark_settled(basket_id, transaction_hash, settlement_type="CONVERT")
+
+    async def redeem_basket(self, record: dict) -> dict:
+        """Redeem resolved child conditions. Losing legs may have zero balance."""
+        basket_id = str(record["basket_id"])
+        current = self.journal._record(basket_id)
+        if current.get("status") == "SETTLED":
+            return current
+        if current.get("status") != "RESOLVED_PENDING_REDEMPTION":
+            raise RuntimeError(f"basket {basket_id} is not pending redemption")
+        if current.get("settlement_type") == "REDEEM_SUBMITTED":
+            raise RuntimeError(f"basket {basket_id} has a submitted redemption requiring reconciliation")
+        if getattr(self.transport.client, "redeem_positions", None) is None:
+            raise RuntimeError("Official client does not expose redeem_positions")
+        hashes = []
+        errors = []
+        last_handle = None
+        self.journal.update(basket_id, settlement_type="REDEEM_PENDING")
+        for condition_id in self._redeem_condition_ids(current):
+            try:
+                handle = await self.transport._call("redeem_positions", condition_id=condition_id)
+            except Exception as error:
+                errors.append(f"{condition_id}: {error}")
+                continue
+            last_handle = handle
+            submitted_hash = self.transport._transaction_hash(handle)
+            if submitted_hash:
+                hashes.append(submitted_hash)
+        if last_handle is None:
+            raise RuntimeError(
+                f"basket {basket_id} redemption failed on every condition: " + "; ".join(errors)
+            )
+        transaction_id = str(_response_value(last_handle, "transaction_id", "transactionID", default="") or "")
+        self.journal.update(
+            basket_id,
+            settlement_type="REDEEM_SUBMITTED",
+            settlement_tx_id=transaction_id,
+            settlement_tx_hash=hashes[-1] if hashes else "",
+        )
+        wait = getattr(last_handle, "wait", None)
+        if wait is None:
+            raise RuntimeError("redemption transaction handle has no wait method")
+        outcome = wait()
+        outcome = await outcome if inspect.isawaitable(outcome) else outcome
+        transaction_hash = self.transport._transaction_hash(outcome) or (hashes[-1] if hashes else "")
+        if not transaction_hash:
+            raise RuntimeError("redemption transaction completed without a transaction hash")
+        return self.journal.mark_settled(basket_id, transaction_hash, settlement_type="REDEEM")
+
+    async def settle_baskets(self) -> List[dict]:
+        settled = []
+        for record in list(self.journal.incomplete_baskets()):
+            action = None
+            if record.get("status") == "ASSEMBLED" and self.auto_convert:
+                action = self.convert_basket
+            elif record.get("status") == "RESOLVED_PENDING_REDEMPTION" and self.auto_redeem:
+                action = self.redeem_basket
+            if action is None:
+                continue
+            try:
+                settled.append(await action(record))
+            except Exception as error:
+                self.journal.update(record["basket_id"], error=str(error))
+        return settled
 
 
 def negrisk_execution_enabled(live: bool) -> bool:

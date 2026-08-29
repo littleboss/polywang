@@ -22,6 +22,28 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 from .polymarket_edge import PolymarketFeeModel
 
 
+def maker_gtc_enabled() -> bool:
+    """Maker/GTC resting orders for binary combo arb. Default off."""
+    return os.getenv("ENABLE_MAKER_GTC", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def maker_rest_seconds(default: float = 30.0) -> float:
+    raw = os.getenv("MAKER_REST_SECONDS", "")
+    try:
+        value = float(raw) if raw else default
+    except ValueError:
+        value = default
+    return value if math.isfinite(value) and value >= 0.0 else default
+
+
+def maker_limit_price(worst_price: float, tick_size: float) -> float:
+    """Post one tick better than the scanned ask so post-only does not cross."""
+    tick = tick_size if math.isfinite(tick_size) and tick_size > 0.0 else 0.01
+    if not math.isfinite(worst_price) or worst_price <= 0.0:
+        return tick
+    return max(tick, worst_price - tick)
+
+
 def _json_list(value):
     if isinstance(value, str):
         try:
@@ -441,6 +463,9 @@ class ArbitrageOpportunity:
     fingerprint: str
     merge_gas_usd: float = 0.0
     is_risk_free: bool = False
+    is_taker: bool = True
+    order_style: str = "FOK"
+    tick_size: float = 0.01
     residual_risk: str = (
         "sequential FOK legs are not atomic; a first-leg fill with a second-leg "
         "failure is unwound with FAK and may slip, partially fill, or remain open"
@@ -491,7 +516,8 @@ class BinaryArbitrageScanner:
         return cost, average, fills
 
     def scan(self, market: BinaryMarket, yes_book: OrderBook, no_book: OrderBook,
-             fee_model: Optional[PolymarketFeeModel] = None) -> Optional[ArbitrageOpportunity]:
+             fee_model: Optional[PolymarketFeeModel] = None,
+             is_taker: bool = True) -> Optional[ArbitrageOpportunity]:
         # Negative-risk groups need their own complete-set and redemption
         # semantics. Do not infer them from a two-token price sum.
         if not market.active or market.neg_risk:
@@ -509,6 +535,7 @@ class BinaryArbitrageScanner:
             yes_levels = yes_levels[:self.max_levels]
             no_levels = no_levels[:self.max_levels]
 
+        taker = bool(is_taker)
         fee_model = fee_model or PolymarketFeeModel(
             market.category,
             taker_fee_rate=market.taker_fee_rate,
@@ -531,11 +558,11 @@ class BinaryArbitrageScanner:
             yes_worst = yes_fills[-1][0]
             no_worst = no_fills[-1][0]
             yes_fee_cap = shares * max(
-                (fee_model.fee_per_share(price, is_taker=True) for price, _ in yes_levels),
+                (fee_model.fee_per_share(price, is_taker=taker) for price, _ in yes_levels),
                 default=0.0,
             )
             no_fee_cap = shares * max(
-                (fee_model.fee_per_share(price, is_taker=True) for price, _ in no_levels),
+                (fee_model.fee_per_share(price, is_taker=taker) for price, _ in no_levels),
                 default=0.0,
             )
             fees = yes_fee_cap + no_fee_cap
@@ -580,18 +607,18 @@ class BinaryArbitrageScanner:
             no_cost, no_avg, no_fills = self._cost_for(no_book, shares, no_levels)
             if not yes_fills or not no_fills:
                 continue
-            yes_fee = sum(fee_model.fee_usd(quantity, price, is_taker=True) for price, quantity in yes_fills)
-            no_fee = sum(fee_model.fee_usd(quantity, price, is_taker=True) for price, quantity in no_fills)
+            yes_fee = sum(fee_model.fee_usd(quantity, price, is_taker=taker) for price, quantity in yes_fills)
+            no_fee = sum(fee_model.fee_usd(quantity, price, is_taker=taker) for price, quantity in no_fills)
             yes_worst_price = yes_fills[-1][0]
             no_worst_price = no_fills[-1][0]
             yes_execution_amount = shares * yes_worst_price
             no_execution_amount = shares * no_worst_price
             yes_execution_fee_cap = shares * max(
-                (fee_model.fee_per_share(price, is_taker=True) for price, _ in yes_levels),
+                (fee_model.fee_per_share(price, is_taker=taker) for price, _ in yes_levels),
                 default=0.0,
             )
             no_execution_fee_cap = shares * max(
-                (fee_model.fee_per_share(price, is_taker=True) for price, _ in no_levels),
+                (fee_model.fee_per_share(price, is_taker=taker) for price, _ in no_levels),
                 default=0.0,
             )
             execution_capital = (
@@ -629,6 +656,17 @@ class BinaryArbitrageScanner:
                 fingerprint=f"{market.market_id}:{yes_book.hash}:{no_book.hash}:{shares:.12f}",
                 merge_gas_usd=self.merge_gas_usd,
                 is_risk_free=False,
+                is_taker=taker,
+                order_style="FOK" if taker else "GTC",
+                tick_size=market.tick_size if market.tick_size > 0.0 else 0.01,
+                residual_risk=(
+                    "sequential FOK legs are not atomic; a first-leg fill with a "
+                    "second-leg failure is unwound with FAK and may slip, partially "
+                    "fill, or remain open"
+                    if taker else
+                    "resting GTC legs are not atomic; a timeout cancels leftovers "
+                    "and FAK-unwinds a one-sided fill, which may slip or remain open"
+                ),
             )
             if result.net_profit >= self.min_net_profit_usd and result.return_on_capital >= self.min_return:
                 if best is None or result.net_profit > best.net_profit:
@@ -850,6 +888,7 @@ class LiveOrderJournal:
             "rollback_status": "NOT_REQUIRED",
             "rollback_details": {},
             "pnl_quality": "UNAVAILABLE",
+            "order_style": str(getattr(opportunity, "order_style", "FOK") or "FOK").upper(),
             "settlement_type": "",
             "settlement_tx_id": "",
             "settlement_tx_hash": "",
@@ -971,7 +1010,7 @@ class LiveOrderJournal:
                 if not math.isfinite(realized_pnl):
                     issues.append(f"{record.get('pair_id', '')} has invalid realized PnL")
             if record.get("status") not in {
-                "PENDING", "HEDGED", "RESOLVED_PENDING_REDEMPTION", "SETTLED",
+                "PENDING", "RESTING", "HEDGED", "RESOLVED_PENDING_REDEMPTION", "SETTLED",
                 "ROLLED_BACK", "REJECTED", "UNHEDGED"
             }:
                 issues.append(f"{record.get('pair_id', '')} has unknown status")
@@ -1936,10 +1975,11 @@ class LiveRiskController:
             self.halt("unhedged live pair requires manual reconciliation: " + ", ".join(unhedged))
             raise RiskHaltError(self.state["halt_reason"])
         if self.negrisk_journal is not None:
+            stable = getattr(self.negrisk_journal, "STABLE_OPEN", {"ASSEMBLED"})
             unfinished = [
                 str(record.get("basket_id", ""))
                 for record in self.negrisk_journal.incomplete_baskets()
-                if record.get("status") != "ASSEMBLED"
+                if record.get("status") not in stable
             ]
             if unfinished:
                 self.halt(
@@ -2166,15 +2206,20 @@ class OfficialFOKExecutor:
                  journal: Optional[LiveOrderJournal] = None,
                  max_retries: int = 3, auto_merge: bool = False,
                  auto_redeem: bool = True,
-                 directional_journal: Optional[LiveDirectionalJournal] = None):
+                 directional_journal: Optional[LiveDirectionalJournal] = None,
+                 rest_seconds: Optional[float] = None):
         self.client = client
         self.rollback_min_price = max(0.0001, min(1.0, rollback_min_price))
         self.journal = journal
         self.directional_journal = directional_journal
         self.negrisk_journal = None
+        self.negrisk_executor = None
         self.max_retries = max(0, int(max_retries))
         self.auto_merge = bool(auto_merge)
         self.auto_redeem = bool(auto_redeem)
+        self.maker_rest_seconds = (
+            rest_seconds if rest_seconds is not None else maker_rest_seconds()
+        )
         self.user_stream_healthy = False
 
     @classmethod
@@ -2389,12 +2434,32 @@ class OfficialFOKExecutor:
                     status = "OPEN"
                 if status in {"OPEN", "LIVE", "ACTIVE", "PENDING"}:
                     age = time.time() - float(record.get("created_at", time.time()))
-                    if age >= max(0.0, stale_after_seconds):
+                    timeout = (
+                        self.maker_rest_seconds
+                        if str(record.get("order_style", "FOK")).upper() == "GTC"
+                        else stale_after_seconds
+                    )
+                    if age >= max(0.0, timeout):
                         await self._call("cancel_order", order_id=order_id)
+                        cancelled = await self._call("get_order", order_id=order_id)
+                        cancelled_matched = _filled_shares(cancelled)
+                        if cancelled_matched is None:
+                            raise RuntimeError(f"order {order_id} has no confirmed matched size after cancel")
+                        self.journal.set_matched(record["pair_id"], leg, cancelled_matched)
+                        cancelled_status = str(
+                            _response_value(cancelled, "status", "state", default="CANCELLED") or "CANCELLED"
+                        ).upper()
+                        self.journal.set_order_status(record["pair_id"], leg, cancelled_status)
             refreshed = self.journal._record(record["pair_id"])
             self._update_pair_status(refreshed)
+            if refreshed["status"] == "UNHEDGED" and str(refreshed.get("order_style", "")).upper() == "GTC":
+                await self._unwind_gtc_imbalance(refreshed)
+                refreshed = self.journal._record(record["pair_id"])
             if refreshed["status"] == "UNHEDGED":
                 raise UnhedgedPairError(f"pair {record['pair_id']} is not fully hedged after reconciliation")
+            if refreshed["status"] == "RESTING":
+                reconciled.append(refreshed)
+                continue
             await self._reconcile_conditional_balances(refreshed)
             reconciled.append(refreshed)
         if scan_account:
@@ -2619,25 +2684,28 @@ class OfficialFOKExecutor:
 
     async def settle_hedged_pairs(self) -> List[dict]:
         """Best-effort merge/redeem; temporary chain lag is retried safely."""
-        if not self.journal:
-            return []
-        settled = await self._resume_submitted_settlements()
-        for record in list(self.journal.incomplete_pairs()):
-            action = None
-            if record.get("status") == "HEDGED" and self.auto_merge:
-                action = self.merge_pair
-            elif record.get("status") == "RESOLVED_PENDING_REDEMPTION" and self.auto_redeem:
-                action = self.redeem_pair
-            if action is None:
-                continue
-            try:
-                settled.append(await action(record))
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:
-                self.journal.update(record["pair_id"], error=str(error))
-                # A submitted chain transaction remains submitted. It must not
-                # be recreated after a timeout or process restart.
+        settled: List[dict] = []
+        if self.journal:
+            settled = await self._resume_submitted_settlements()
+            for record in list(self.journal.incomplete_pairs()):
+                action = None
+                if record.get("status") == "HEDGED" and self.auto_merge:
+                    action = self.merge_pair
+                elif record.get("status") == "RESOLVED_PENDING_REDEMPTION" and self.auto_redeem:
+                    action = self.redeem_pair
+                if action is None:
+                    continue
+                try:
+                    settled.append(await action(record))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    self.journal.update(record["pair_id"], error=str(error))
+                    # A submitted chain transaction remains submitted. It must not
+                    # be recreated after a timeout or process restart.
+        negrisk_executor = getattr(self, "negrisk_executor", None)
+        if negrisk_executor is not None:
+            settled.extend(await negrisk_executor.settle_baskets())
         return settled
 
     def _trade_query_after(self, condition_id: str, watermarks: dict) -> Optional[str]:
@@ -2958,6 +3026,7 @@ class OfficialFOKExecutor:
     async def flatten_on_halt(self, reason: str) -> dict:
         """Cancel resting orders, FAK-sell directional inventory, snapshot pair leftovers."""
         cancelled = await self.cancel_all_open_orders()
+        await self._unwind_resting_gtc_pairs()
         directional_flatten = await self._flatten_directional_inventory()
         inventory = await self._inventory_snapshot()
         leftover = list(directional_flatten.get("leftover") or [])
@@ -3011,6 +3080,7 @@ class OfficialFOKExecutor:
         terminal = {"CANCELED", "CANCELLED", "UNMATCHED", "FAILED", "REJECTED", "KILLED", "EXPIRED", "FILLED", "MATCHED"}
         yes_terminal = record.get("yes_order_status") in terminal
         no_terminal = record.get("no_order_status") in terminal
+        is_gtc = str(record.get("order_style", "FOK")).upper() == "GTC"
         if complete_yes and complete_no:
             if record.get("status") not in {
                 "SETTLED", "ROLLED_BACK", "RESOLVED_PENDING_REDEMPTION"
@@ -3018,11 +3088,18 @@ class OfficialFOKExecutor:
                 record["status"] = "HEDGED"
         elif yes <= 1e-8 and no <= 1e-8 and yes_terminal and no_terminal:
             record["status"] = "REJECTED"
+        elif is_gtc and not (yes_terminal and no_terminal):
+            # One or both GTC legs are still working. A single fill is not
+            # an unhedged halt while the other order remains live.
+            if record.get("status") not in {
+                "SETTLED", "ROLLED_BACK", "RESOLVED_PENDING_REDEMPTION", "HEDGED",
+            }:
+                record["status"] = "RESTING"
         elif (yes > 1e-8 or no > 1e-8) and (yes_terminal or no_terminal):
             record["status"] = "UNHEDGED"
         elif record.get("status") not in {
             "PENDING", "REJECTED", "HEDGED", "RESOLVED_PENDING_REDEMPTION",
-            "SETTLED", "ROLLED_BACK"
+            "SETTLED", "ROLLED_BACK", "RESTING",
         }:
             record["status"] = "PENDING"
         record["updated_at"] = time.time()
@@ -3196,11 +3273,188 @@ class OfficialFOKExecutor:
             self.journal.update(pair_id, rollback_status="CONFIRMED", status="ROLLED_BACK", error=str(cause))
         raise RuntimeError(f"YES leg was rolled back: {cause}") from cause
 
+    async def _place_gtc_leg(self, token_id: str, price: float, shares: float) -> object:
+        return await self._call(
+            "place_limit_order",
+            token_id=token_id,
+            price=f"{price:.6f}",
+            size=f"{shares:.6f}",
+            side="BUY",
+            post_only=True,
+        )
+
+    async def _cancel_gtc_order(self, order_id: str) -> None:
+        if not order_id:
+            return
+        try:
+            await self._call("cancel_order", order_id=order_id)
+        except Exception:
+            # A missing cancel is not success; later reconcile or halt must see it.
+            raise
+
+    async def _unwind_gtc_imbalance(self, record: dict) -> dict:
+        """FAK-sell a one-sided GTC fill after cancel. Fail-closed if unwind is incomplete."""
+        if not self.journal:
+            raise UnhedgedPairError("GTC unwind requires a live journal")
+        pair_id = str(record["pair_id"])
+        current = self.journal._record(pair_id)
+        requested = float(current.get("requested_shares", 0.0))
+        yes = float(current.get("yes_matched_shares", 0.0))
+        no = float(current.get("no_matched_shares", 0.0))
+        if yes + 1e-8 >= requested and no + 1e-8 >= requested:
+            return self.journal.set_status(pair_id, "HEDGED")
+        errors = []
+        if yes > 1e-8:
+            try:
+                await self._rollback_leg(
+                    str(current["yes_token_id"]), yes, "YES", pair_id, "yes",
+                )
+            except Exception as error:
+                errors.append(f"YES unwind: {error}")
+        if no > 1e-8:
+            try:
+                await self._rollback_leg(
+                    str(current["no_token_id"]), no, "NO", pair_id, "no",
+                )
+            except Exception as error:
+                errors.append(f"NO unwind: {error}")
+        if errors:
+            self.journal.update(pair_id, rollback_status="FAILED", status="UNHEDGED",
+                                error="; ".join(errors))
+            raise UnhedgedPairError(
+                f"GTC pair {pair_id} could not be fully unwound: " + "; ".join(errors)
+            )
+        if yes <= 1e-8 and no <= 1e-8:
+            return self.journal.update(pair_id, rollback_status="NOT_REQUIRED", status="REJECTED")
+        return self.journal.update(pair_id, rollback_status="CONFIRMED", status="ROLLED_BACK")
+
+    async def _unwind_resting_gtc_pairs(self) -> None:
+        if not self.journal:
+            return
+        for record in list(self.journal.incomplete_pairs()):
+            if str(record.get("order_style", "")).upper() != "GTC":
+                continue
+            if record.get("status") not in {"RESTING", "PENDING", "UNHEDGED"}:
+                continue
+            yes = float(record.get("yes_matched_shares", 0.0))
+            no = float(record.get("no_matched_shares", 0.0))
+            requested = float(record.get("requested_shares", 0.0))
+            if yes + 1e-8 >= requested and no + 1e-8 >= requested:
+                self.journal.set_status(record["pair_id"], "HEDGED")
+                continue
+            if yes <= 1e-8 and no <= 1e-8:
+                self.journal.set_status(record["pair_id"], "REJECTED", "halt cancelled resting GTC")
+                continue
+            await self._unwind_gtc_imbalance(record)
+
+    async def execute_gtc(self, opportunity: ArbitrageOpportunity) -> LivePairResult:
+        """Rest both binary legs as post-only GTC. Never fall back to FOK."""
+        if opportunity.shares <= 0.0:
+            raise ValueError("cannot execute an empty pair")
+        await self.preflight(required_usd=opportunity.execution_capital_required)
+        pair_id = self.journal.create_pair(opportunity) if self.journal else ""
+        if self.journal:
+            self.journal.update(pair_id, order_style="GTC", status="RESTING")
+        tick = opportunity.tick_size if opportunity.tick_size > 0.0 else 0.01
+        yes_price = maker_limit_price(opportunity.yes_worst_price, tick)
+        no_price = maker_limit_price(opportunity.no_worst_price, tick)
+        yes_order_id = ""
+        no_order_id = ""
+        try:
+            yes = await self._place_gtc_leg(opportunity.yes_token_id, yes_price, opportunity.shares)
+        except Exception as error:
+            if self.journal:
+                self.journal.update(
+                    pair_id, status="UNHEDGED",
+                    error=f"YES GTC outcome is unknown: {error}",
+                )
+            raise UnhedgedPairError(
+                "YES GTC outcome is unknown; reconcile before placing new orders"
+            ) from error
+        yes_order_id = str(_response_value(yes, "order_id", "orderID", default="") or "")
+        if not _response_ok(yes) and not yes_order_id:
+            if self.journal:
+                self.journal.set_status(
+                    pair_id, "REJECTED",
+                    str(_response_value(yes, "message", "errorMsg", default="YES post-only rejected")),
+                )
+            raise RuntimeError(
+                f"YES GTC post-only rejected: "
+                f"{_response_value(yes, 'message', 'errorMsg', default='unknown error')}"
+            )
+        if not yes_order_id:
+            if self.journal:
+                self.journal.update(pair_id, status="UNHEDGED", error="YES GTC response had no order ID")
+            raise UnhedgedPairError("YES GTC response did not include an order ID")
+        yes_filled = _filled_shares(yes, side="BUY") or 0.0
+        if self.journal:
+            self.journal.set_order_id(pair_id, "yes", yes_order_id)
+            self.journal.set_order_status(pair_id, "yes", "OPEN")
+            if yes_filled > 1e-8:
+                self.journal.set_placement_fill(pair_id, "yes", yes_filled)
+        try:
+            no = await self._place_gtc_leg(opportunity.no_token_id, no_price, opportunity.shares)
+        except Exception as error:
+            await self._cancel_gtc_order(yes_order_id)
+            if yes_filled > 1e-8:
+                if self.journal:
+                    self.journal.update(pair_id, status="UNHEDGED",
+                                        error=f"NO GTC outcome is unknown: {error}")
+                raise UnhedgedPairError(
+                    "NO GTC outcome is unknown after YES may have filled"
+                ) from error
+            if self.journal:
+                self.journal.update(pair_id, status="UNHEDGED",
+                                    error=f"NO GTC outcome is unknown: {error}")
+            raise UnhedgedPairError(
+                "NO GTC outcome is unknown; reconcile before placing new orders"
+            ) from error
+        no_order_id = str(_response_value(no, "order_id", "orderID", default="") or "")
+        if not _response_ok(no) and not no_order_id:
+            await self._cancel_gtc_order(yes_order_id)
+            if yes_filled > 1e-8:
+                if self.journal:
+                    self.journal.update(
+                        pair_id, status="UNHEDGED",
+                        error=str(_response_value(no, "message", "errorMsg", default="NO post-only rejected")),
+                    )
+                await self._unwind_gtc_imbalance(self.journal._record(pair_id))
+            elif self.journal:
+                self.journal.set_status(
+                    pair_id, "REJECTED",
+                    str(_response_value(no, "message", "errorMsg", default="NO post-only rejected")),
+                )
+            raise RuntimeError(
+                f"NO GTC post-only rejected: "
+                f"{_response_value(no, 'message', 'errorMsg', default='unknown error')}"
+            )
+        if not no_order_id:
+            await self._cancel_gtc_order(yes_order_id)
+            if self.journal:
+                self.journal.update(pair_id, status="UNHEDGED", error="NO GTC response had no order ID")
+            raise UnhedgedPairError("NO GTC response did not include an order ID")
+        no_filled = _filled_shares(no, side="BUY") or 0.0
+        if self.journal:
+            self.journal.set_order_id(pair_id, "no", no_order_id)
+            self.journal.set_order_status(pair_id, "no", "OPEN")
+            if no_filled > 1e-8:
+                self.journal.set_placement_fill(pair_id, "no", no_filled)
+            self.journal.set_status(pair_id, "RESTING")
+        return LivePairResult(
+            pair_id=pair_id,
+            yes_order_id=yes_order_id,
+            no_order_id=no_order_id,
+            shares=opportunity.shares,
+            status="RESTING",
+        )
+
     async def execute(self, opportunity: ArbitrageOpportunity) -> LivePairResult:
         if not hasattr(opportunity, "yes_token_id") or not hasattr(opportunity, "no_token_id"):
             raise ValueError("OfficialFOKExecutor only accepts binary Yes/No opportunities")
         if opportunity.shares <= 0.0:
             raise ValueError("cannot execute an empty pair")
+        if str(getattr(opportunity, "order_style", "FOK")).upper() == "GTC" or not getattr(opportunity, "is_taker", True):
+            return await self.execute_gtc(opportunity)
         await self.preflight(required_usd=opportunity.execution_capital_required)
         pair_id = self.journal.create_pair(opportunity) if self.journal else ""
         try:
