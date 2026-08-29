@@ -42,10 +42,139 @@ CATEGORY_TAKER_FEE_RATES: Dict[str, float] = {
     "geopolitics": 0.0,
 }
 
+# Maker rebate share per category, as a fraction of the taker fee paid on the
+# other side of the fill. Makers pay nothing and collect part of what the taker
+# paid, so the gap between resting and crossing is wider than the fee alone.
+CATEGORY_MAKER_REBATE_SHARES: Dict[str, float] = {
+    "crypto": 0.20,
+    "sports": 0.15,
+    "economics": 0.25,
+    "culture": 0.25,
+    "weather": 0.25,
+    "other": 0.25,
+    "general": 0.25,
+    "finance": 0.25,
+    "politics": 0.25,
+    "tech": 0.25,
+    "mentions": 0.25,
+    "geopolitics": 0.0,
+}
+
+# Gamma tags are free-form, so the label on a market is rarely the name of the
+# category whose fee schedule applies to it. A BTC market may be tagged "crypto",
+# "Bitcoin" or "Crypto Prices", and only the first of those matches the rate
+# table. The unmatched ones fall through to the default rate of 0.05 while the
+# venue actually charges 0.07, and understating a fee is the direction that lets
+# losing trades through.
+CATEGORY_ALIASES: Dict[str, str] = {
+    # Crypto: 0.07, the dearest schedule on the venue.
+    "btc": "crypto",
+    "bitcoin": "crypto",
+    "eth": "crypto",
+    "ethereum": "crypto",
+    "sol": "crypto",
+    "solana": "crypto",
+    "xrp": "crypto",
+    "doge": "crypto",
+    "coin": "crypto",
+    "coins": "crypto",
+    "crypto_prices": "crypto",
+    "crypto_price": "crypto",
+    "digital_assets": "crypto",
+    "altcoin": "crypto",
+    "altcoins": "crypto",
+    "defi": "crypto",
+    "stablecoin": "crypto",
+    # US macro settles under Economics: 0.05. These land on the right rate today
+    # only because the default happens to match, which is luck rather than
+    # design and would break silently if the default ever moved.
+    "us_macro": "economics",
+    "usmacro": "economics",
+    "macro": "economics",
+    "macroeconomics": "economics",
+    "economic": "economics",
+    "cpi": "economics",
+    "core_cpi": "economics",
+    "ppi": "economics",
+    "pce": "economics",
+    "inflation": "economics",
+    "fed": "economics",
+    "fomc": "economics",
+    "federal_reserve": "economics",
+    "interest_rates": "economics",
+    "rates": "economics",
+    "nfp": "economics",
+    "payrolls": "economics",
+    "jobs": "economics",
+    "employment": "economics",
+    "unemployment": "economics",
+    "jobless_claims": "economics",
+    "gdp": "economics",
+    "recession": "economics",
+    "retail_sales": "economics",
+    # Remaining categories, for tags that arrive spelled differently.
+    "sport": "sports",
+    "soccer": "sports",
+    "football": "sports",
+    "basketball": "sports",
+    "baseball": "sports",
+    "nfl": "sports",
+    "nba": "sports",
+    "mlb": "sports",
+    "epl": "sports",
+    "political": "politics",
+    "election": "politics",
+    "elections": "politics",
+    "geopolitical": "geopolitics",
+    "world_events": "geopolitics",
+    "world": "geopolitics",
+    "technology": "tech",
+    "ai": "tech",
+    "stocks": "finance",
+    "equities": "finance",
+    "earnings": "finance",
+    "markets": "finance",
+    "mention": "mentions",
+    "pop_culture": "culture",
+    "entertainment": "culture",
+    "awards": "culture",
+}
+
 DEFAULT_CATEGORY = "other"
 
 # Fees below this round to zero on the platform.
 MIN_CHARGEABLE_FEE_USDC = 0.00001
+
+
+def resolve_category(name: Optional[str]) -> str:
+    """
+    Maps a free-form market tag onto the category whose fee schedule applies.
+
+    Falls back to the default rather than raising, because an unrecognised tag is
+    a pricing question rather than a crash. Callers that need to know they are on
+    the fallback should compare the result against the input.
+    """
+    if name is None:
+        return DEFAULT_CATEGORY
+    key = str(name).strip().lower().replace("-", "_").replace(" ", "_")
+    if not key:
+        return DEFAULT_CATEGORY
+    if key in CATEGORY_TAKER_FEE_RATES:
+        return key
+    return CATEGORY_ALIASES.get(key, DEFAULT_CATEGORY)
+
+
+def fee_rate_from_bps(basis_points) -> float:
+    """
+    Converts a basis-point fee rate into the decimal the fee formula expects.
+
+    The CLOB `/fee-rate` endpoint returns `base_fee` in basis points, so 700 means
+    0.07. This is a separate quantity from `feeRateBps` in an order payload, which
+    is a ceiling on what the venue may ever charge rather than the rate actually
+    applied; substituting one for the other is a documented way to compute fees
+    that are wrong by orders of magnitude.
+    """
+    return float(basis_points) / 10000.0
 
 
 class PolymarketFeeModel:
@@ -63,13 +192,23 @@ class PolymarketFeeModel:
        limit order instead.
     """
 
-    def __init__(self, category: str = DEFAULT_CATEGORY, maker_rebate_share: float = 0.0,
-                 taker_fee_rate: Optional[float] = None, fee_exponent: float = 1.0):
-        self.category = (category or DEFAULT_CATEGORY).strip().lower()
+    def __init__(self, category: str = DEFAULT_CATEGORY, maker_rebate_share: Optional[float] = None,
+                 taker_fee_rate: Optional[float] = None, fee_exponent: float = 1.0,
+                 fees_enabled: bool = True):
+        # Resolve before looking the rate up, so a market tagged "Bitcoin" is
+        # charged at the crypto rate instead of falling through to the default.
+        self.category = resolve_category(category)
         default_rate = CATEGORY_TAKER_FEE_RATES.get(self.category, CATEGORY_TAKER_FEE_RATES[DEFAULT_CATEGORY])
         self.taker_fee_rate = max(0.0, float(taker_fee_rate)) if taker_fee_rate is not None else default_rate
         self.fee_exponent = max(0.0, float(fee_exponent))
-        self.maker_rebate_share = maker_rebate_share
+        self.maker_rebate_share = (
+            CATEGORY_MAKER_REBATE_SHARES.get(self.category, 0.0)
+            if maker_rebate_share is None else float(maker_rebate_share)
+        )
+        # Individual markets can run with fees switched off regardless of their
+        # category. Assuming the category rate in those cases overstates the cost
+        # and rejects trades that are in fact free to enter.
+        self.fees_enabled = bool(fees_enabled)
 
     def fee_usd(self, shares: float, price: float, is_taker: bool = True) -> float:
         """Total fee in USDC for a fill of `shares` at `price`."""
@@ -77,10 +216,19 @@ class PolymarketFeeModel:
         return 0.0 if fee < MIN_CHARGEABLE_FEE_USDC else fee
 
     def fee_per_share(self, price: float, is_taker: bool = True) -> float:
-        if not is_taker or self.taker_fee_rate <= 0.0:
+        if not self.fees_enabled or not is_taker or self.taker_fee_rate <= 0.0:
             return 0.0
         price = _clamp(price, 0.0, 1.0)
         return self.taker_fee_rate * (price * (1.0 - price)) ** self.fee_exponent
+
+    def maker_rebate_usd(self, shares: float, price: float) -> float:
+        """
+        What a resting order collects when a taker crosses into it.
+
+        Makers do not merely avoid the fee, they are paid a share of it, which is
+        the part that decides whether a multi-leg basket is worth assembling.
+        """
+        return self.fee_usd(shares, price, is_taker=True) * self.maker_rebate_share
 
     def fee_as_fraction_of_notional(self, price: float, is_taker: bool = True) -> float:
         """

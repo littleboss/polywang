@@ -183,6 +183,7 @@ class BinaryMarketReplay:
         rate = self.fee_overrides.get(market.market_id, market.taker_fee_rate)
         return PolymarketFeeModel(
             market.category, taker_fee_rate=rate, fee_exponent=market.fee_exponent,
+            fees_enabled=market.fees_enabled,
         )
 
     def _flush_pending(self, now_ms: int) -> None:

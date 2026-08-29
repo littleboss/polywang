@@ -108,6 +108,7 @@ class NegRiskMarket:
     tick_size: float = 0.01
     taker_fee_rate: Optional[float] = None
     fee_exponent: float = 1.0
+    fees_enabled: bool = True
     source: str = "nway"  # "nway" or "event"
 
     @property
@@ -234,6 +235,7 @@ class NegRiskMarket:
             tick_size=tick_size if math.isfinite(tick_size) and tick_size > 0.0 else 0.01,
             taker_fee_rate=fee_rate,
             fee_exponent=fee_exponent,
+            fees_enabled=_as_bool(payload.get("feesEnabled", payload.get("fees_enabled", True)), True),
             source=source,
         )
 
@@ -436,6 +438,7 @@ class NegRiskBookScanner:
             market.category,
             taker_fee_rate=market.taker_fee_rate,
             fee_exponent=market.fee_exponent,
+            fees_enabled=market.fees_enabled,
         )
         max_shares = min(sum(size for _, size in levels_map[token_id]) for _, token_id in specs)
         if max_shares <= 0.0:
