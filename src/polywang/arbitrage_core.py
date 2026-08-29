@@ -19,7 +19,7 @@ import time
 from decimal import Decimal, ROUND_DOWN
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-from .polymarket_edge import PolymarketFeeModel
+from .polymarket_edge import PolymarketFeeModel, resolve_category
 
 
 def maker_gtc_enabled() -> bool:
@@ -104,18 +104,15 @@ def _as_bool(value: object, default: bool = False) -> bool:
 
 
 def _category(raw: object) -> str:
-    value = str(raw or "other").strip().lower()
-    aliases = {
-        "finance": "finance",
-        "economic": "economics",
-        "economics": "economics",
-        "political": "politics",
-        "politics": "politics",
-        "crypto": "crypto",
-        "sports": "sports",
-        "geopolitics": "geopolitics",
-    }
-    return aliases.get(value, value if value else "other")
+    """
+    Normalise a Gamma tag to the category whose fee schedule applies.
+
+    Shares one alias table with the fee model rather than keeping a second one
+    here. A tag that only this function knew about would still be priced at the
+    default rate downstream, which is the bug this replaced: "Bitcoin" resolved
+    to itself, missed the rate table, and was charged 0.05 against a real 0.07.
+    """
+    return resolve_category(raw)
 
 
 # Market-channel schema versions this process can apply. An unknown version is
@@ -148,6 +145,7 @@ class BinaryMarket:
     tick_size: float = 0.01
     taker_fee_rate: Optional[float] = None
     fee_exponent: float = 1.0
+    fees_enabled: bool = True
     implied_yes: Optional[float] = None
 
     @classmethod
@@ -226,6 +224,9 @@ class BinaryMarket:
             tick_size=tick_size,
             taker_fee_rate=fee_rate,
             fee_exponent=fee_exponent,
+            # A market can run with fees switched off whatever its category, and
+            # charging it the category rate would reject entries that are free.
+            fees_enabled=_as_bool(payload.get("feesEnabled", payload.get("fees_enabled", True)), True),
             implied_yes=_gamma_yes_price(payload, outcomes),
         )
 
@@ -540,6 +541,7 @@ class BinaryArbitrageScanner:
             market.category,
             taker_fee_rate=market.taker_fee_rate,
             fee_exponent=market.fee_exponent,
+            fees_enabled=market.fees_enabled,
         )
         yes_depth = sum(size for _, size in yes_levels)
         no_depth = sum(size for _, size in no_levels)
