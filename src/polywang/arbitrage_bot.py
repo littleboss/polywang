@@ -70,6 +70,23 @@ from .arbitrage_core import (
 LOG = logging.getLogger("arbitrage-bot")
 GAMMA_URL = "https://gamma-api.polymarket.com/markets"
 MARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+# Empirical: a single CLOB market socket that subscribed 200 assets_ids stayed
+# ESTAB after the initial book dump and never emitted price_change / deltas.
+# Official docs do not publish a hard cap; keep each subscribe at this bound.
+MARKET_WS_MAX_ASSETS_PER_SUBSCRIBE = 50
+# Initial `book` snapshots must not keep a shard healthy forever.
+MARKET_WS_IDLE_RECONNECT_SECONDS = 15.0
+MARKET_WS_PING_INTERVAL = 10
+MARKET_WS_PING_TIMEOUT = 10
+MARKET_WS_CLOSE_TIMEOUT = 5
+# Incremental / delta types that prove the tape is alive after the snapshot dump.
+MARKET_WS_INCREMENTAL_EVENT_TYPES = frozenset({
+    "price_change",
+    "last_trade_price",
+    "tick_size_change",
+    "best_bid_ask",
+    "trade",
+})
 # Gamma /markets accepts order=volume24hr; volume_24hr returns HTTP 422.
 GAMMA_VOLUME_ORDER = "volume24hr"
 
@@ -448,9 +465,18 @@ class PaperMarketRunner:
         self.edge_evaluator = None
         self.last_directional_event = ""
 
-    def invalidate_books(self) -> None:
-        """Require fresh snapshots after a market-stream reconnect."""
-        for book in self.books.values():
+    def invalidate_books(self, token_ids: Optional[Iterable[str]] = None) -> None:
+        """Require fresh snapshots after a market-stream reconnect.
+
+        When `token_ids` is set, only that shard's books are dropped so a
+        single idle reconnect cannot unsync healthy concurrent connections.
+        """
+        if token_ids is None:
+            books = list(self.books.values())
+        else:
+            wanted = {str(token_id) for token_id in token_ids}
+            books = [book for token_id, book in self.books.items() if token_id in wanted]
+        for book in books:
             book.invalidate("market stream reconnect")
 
     async def process(self, event: dict) -> None:
@@ -695,35 +721,233 @@ class PaperMarketRunner:
         return result
 
 
-async def run_market_stream(runner: PaperMarketRunner, token_ids: List[str]) -> None:
-    try:
-        import websockets
-    except ImportError as error:
-        raise SystemExit("Install websockets for the paper market stream: uv sync") from error
+def chunk_asset_ids(
+    token_ids: Iterable[str],
+    max_size: int = MARKET_WS_MAX_ASSETS_PER_SUBSCRIBE,
+) -> List[List[str]]:
+    """Split token ids so one CLOB market subscribe never exceeds `max_size`."""
+    if max_size < 1:
+        raise ValueError("max_size must be at least 1")
+    ids = [str(token_id) for token_id in token_ids if str(token_id)]
+    return [ids[index:index + max_size] for index in range(0, len(ids), max_size)]
 
-    backoff = 1.0
-    recorder = JsonlEventRecorder(os.getenv("MARKET_EVENT_LOG", ""), source="market")
+
+def _market_event_type(event: dict) -> str:
+    if not isinstance(event, dict):
+        return ""
+    return _event_name(event.get("event_type", event.get("type", "")))
+
+
+def _market_event_asset_id(event: dict) -> str:
+    if not isinstance(event, dict):
+        return ""
+    for key in ("asset_id", "assetId", "token_id", "tokenId"):
+        value = event.get(key)
+        if value:
+            return str(value)
+    return ""
+
+
+class MarketStreamIdleWatch:
+    """Idle timer that ignores the initial book dump and waits for a live tape.
+
+    CLOB sends one `book` snapshot per subscribed token after subscribe. Those
+    snapshots must not reset the 15s idle clock. A later `book` for the same
+    token is treated as a book-update and does reset it, as do price_change /
+    trade / top-of-book messages.
+    """
+
+    def __init__(self, idle_seconds: float = MARKET_WS_IDLE_RECONNECT_SECONDS,
+                 now=time.monotonic):
+        self.idle_seconds = max(0.0, float(idle_seconds))
+        self._now = now
+        self.subscribed_at = now()
+        self.last_event_type: Optional[str] = None
+        self.last_event_at = self.subscribed_at
+        self.last_incremental_at: Optional[float] = None
+        self._seen_book_assets: set = set()
+
+    def mark_subscribed(self) -> None:
+        self.subscribed_at = self._now()
+        self.last_event_type = None
+        self.last_event_at = self.subscribed_at
+        self.last_incremental_at = None
+        self._seen_book_assets.clear()
+
+    def note(self, event: dict) -> bool:
+        """Record an event. Returns True when it counts as incremental/delta."""
+        event_type = _market_event_type(event) or "unknown"
+        now = self._now()
+        self.last_event_type = event_type
+        self.last_event_at = now
+        incremental = self._is_incremental(event, event_type)
+        if incremental:
+            self.last_incremental_at = now
+        return incremental
+
+    def _is_incremental(self, event: dict, event_type: str) -> bool:
+        if event_type in MARKET_WS_INCREMENTAL_EVENT_TYPES:
+            return True
+        if event_type != "book":
+            return False
+        asset_id = _market_event_asset_id(event)
+        if not asset_id:
+            return False
+        if asset_id in self._seen_book_assets:
+            return True
+        self._seen_book_assets.add(asset_id)
+        return False
+
+    def last_event_age(self) -> float:
+        return max(0.0, self._now() - self.last_event_at)
+
+    def seconds_until_idle(self) -> float:
+        anchor = self.last_incremental_at
+        if anchor is None:
+            anchor = self.subscribed_at
+        return self.idle_seconds - (self._now() - anchor)
+
+    def is_idle(self) -> bool:
+        return self.seconds_until_idle() <= 0.0
+
+
+async def _recv_market_message(websocket, timeout: float):
+    """Receive one frame, honoring both `recv` and async-iteration sockets."""
+    recv = getattr(websocket, "recv", None)
+    if recv is not None:
+        return await asyncio.wait_for(recv(), timeout=timeout)
+    iterator = getattr(websocket, "__aiter__", None)
+    if iterator is None:
+        raise RuntimeError("market websocket does not support recv")
+    return await asyncio.wait_for(iterator().__anext__(), timeout=timeout)
+
+
+async def _pump_market_socket(websocket, runner: PaperMarketRunner,
+                              recorder: JsonlEventRecorder,
+                              lock: asyncio.Lock,
+                              watch: MarketStreamIdleWatch) -> str:
+    """Forward every event; return `idle` when the live tape goes silent."""
     while True:
+        remaining = watch.seconds_until_idle()
+        if remaining <= 0:
+            return "idle"
         try:
-            async with websockets.connect(MARKET_WS_URL, ping_interval=10, ping_timeout=10, close_timeout=5) as websocket:
-                runner.invalidate_books()
-                await websocket.send(json.dumps({"assets_ids": token_ids, "type": "market"}))
-                LOG.info("Subscribed to %d binary-market tokens", len(token_ids))
+            message = await _recv_market_message(websocket, remaining)
+        except asyncio.TimeoutError:
+            return "idle"
+        if isinstance(message, (bytes, bytearray)):
+            message = message.decode("utf-8", errors="replace")
+        if isinstance(message, str) and message.strip() in {"PING", "PONG", "ping", "pong"}:
+            continue
+        try:
+            payload = json.loads(message)
+        except (TypeError, ValueError):
+            continue
+        for event in _events(payload):
+            watch.note(event)
+            async with lock:
+                recorder.record(event)
+                await runner.process(event)
+
+
+async def _run_market_stream_shard(
+    runner: PaperMarketRunner,
+    token_ids: List[str],
+    shard_index: int,
+    recorder: JsonlEventRecorder,
+    lock: asyncio.Lock,
+    *,
+    connect,
+    idle_seconds: float,
+    ping_interval: float,
+    ping_timeout: float,
+    close_timeout: float,
+) -> None:
+    backoff = 1.0
+    while True:
+        watch = MarketStreamIdleWatch(idle_seconds)
+        try:
+            async with connect(
+                MARKET_WS_URL,
+                ping_interval=ping_interval,
+                ping_timeout=ping_timeout,
+                close_timeout=close_timeout,
+            ) as websocket:
+                runner.invalidate_books(token_ids)
+                await websocket.send(json.dumps({"assets_ids": list(token_ids), "type": "market"}))
+                watch.mark_subscribed()
+                LOG.info(
+                    "Subscribed market stream shard %d to %d binary-market tokens",
+                    shard_index, len(token_ids),
+                )
                 backoff = 1.0
-                async for message in websocket:
-                    try:
-                        payload = json.loads(message)
-                    except (TypeError, ValueError):
-                        continue
-                    for event in _events(payload):
-                        recorder.record(event)
-                        await runner.process(event)
+                reason = await _pump_market_socket(websocket, runner, recorder, lock, watch)
+                if reason == "idle":
+                    LOG.warning(
+                        "Market stream shard %d silent: no incremental events for %.1fs "
+                        "(tokens=%d last_event=%s age=%.1fs); reconnecting",
+                        shard_index,
+                        idle_seconds,
+                        len(token_ids),
+                        watch.last_event_type or "none",
+                        watch.last_event_age(),
+                    )
+                    continue
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            LOG.warning("Market stream disconnected: %s; reconnecting in %.1fs", error, backoff)
+            LOG.warning(
+                "Market stream shard %d disconnected: %s; reconnecting in %.1fs",
+                shard_index, error, backoff,
+            )
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2.0, 30.0)
+
+
+async def run_market_stream(
+    runner: PaperMarketRunner,
+    token_ids: List[str],
+    *,
+    connect=None,
+    idle_seconds: float = MARKET_WS_IDLE_RECONNECT_SECONDS,
+    max_assets_per_subscribe: int = MARKET_WS_MAX_ASSETS_PER_SUBSCRIBE,
+    ping_interval: float = MARKET_WS_PING_INTERVAL,
+    ping_timeout: float = MARKET_WS_PING_TIMEOUT,
+    close_timeout: float = MARKET_WS_CLOSE_TIMEOUT,
+) -> None:
+    if connect is None:
+        try:
+            import websockets
+        except ImportError as error:
+            raise SystemExit("Install websockets for the paper market stream: uv sync") from error
+        connect = websockets.connect
+
+    chunks = chunk_asset_ids(token_ids, max_assets_per_subscribe)
+    if not chunks:
+        LOG.info("Market stream has no token ids to subscribe")
+        return
+
+    recorder = JsonlEventRecorder(os.getenv("MARKET_EVENT_LOG", ""), source="market")
+    lock = asyncio.Lock()
+    LOG.info(
+        "Opening %d CLOB market websocket(s) for %d tokens (max %d assets_ids / subscribe)",
+        len(chunks), sum(len(chunk) for chunk in chunks), max_assets_per_subscribe,
+    )
+    await asyncio.gather(*[
+        _run_market_stream_shard(
+            runner,
+            chunk,
+            shard_index,
+            recorder,
+            lock,
+            connect=connect,
+            idle_seconds=idle_seconds,
+            ping_interval=ping_interval,
+            ping_timeout=ping_timeout,
+            close_timeout=close_timeout,
+        )
+        for shard_index, chunk in enumerate(chunks)
+    ])
 
 
 async def run_official_market_stream(executor: OfficialFOKExecutor,
