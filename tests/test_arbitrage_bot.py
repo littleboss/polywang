@@ -655,10 +655,16 @@ class MarketStreamSubscribeTests(unittest.TestCase):
                 },
             ])
             runner = _FakeStreamRunner()
+            def recorded_rows():
+                if not os.path.isfile(path):
+                    return 0
+                with open(path, encoding="utf-8") as handle:
+                    return sum(1 for line in handle if line.strip())
+
             with mock.patch.dict(os.environ, {"MARKET_EVENT_LOG": path}, clear=False):
                 asyncio.run(self._run_until(
                     run_market_stream(runner, ["tok-0"], connect=connect, idle_seconds=3600.0),
-                    lambda: os.path.isfile(path) and sum(1 for _line in open(path, encoding="utf-8")) >= 2,
+                    lambda: recorded_rows() >= 2,
                 ))
             with open(path, encoding="utf-8") as handle:
                 rows = [json.loads(line) for line in handle if line.strip()]
