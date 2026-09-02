@@ -144,6 +144,164 @@ class UniverseSelectionTests(unittest.TestCase):
         self.assertTrue(any("NEGRISK OBSERVE" in line for line in captured.output))
 
 
+class UniverseOverlapTests(unittest.TestCase):
+    """QUANT-20260902-07: same Gamma id in binary + NegRisk → NegRisk wins."""
+
+    OVERLAP_ID = "3903714"
+
+    def _binary(self, market_id, yes, no, title="Binary"):
+        return BinaryMarket(market_id, f"c-{market_id}", title, yes, no)
+
+    def _nway(self, market_id, *, tokens=("tok-a", "tok-b", "tok-c"), condition_id=None):
+        from polywang.negrisk import NegRiskMarket
+        token_list = list(tokens)
+        names = ["A", "B", "C"][:len(token_list)]
+        prices = ["0.20"] * len(token_list)
+        payload = {
+            "id": market_id,
+            "conditionId": condition_id or f"cnr-{market_id}",
+            "question": "Who wins",
+            "clobTokenIds": json.dumps(token_list),
+            "outcomes": json.dumps(names),
+            "outcomePrices": json.dumps(prices),
+            "category": "geopolitics",
+            "active": True,
+            "closed": False,
+        }
+        market = NegRiskMarket.from_gamma(payload)
+        self.assertIsNotNone(market)
+        return market
+
+    def _overlap_gamma_rows(self):
+        return [
+            {
+                "id": self.OVERLAP_ID, "conditionId": "c-bin-3903714",
+                "question": "Binary keep overlap",
+                "clobTokenIds": '["y-3903714", "n-3903714"]',
+                "outcomes": '["Yes", "No"]',
+                "outcomePrices": '["0.48", "0.48"]', "category": "geopolitics",
+                "active": True, "closed": False,
+            },
+            {
+                "id": self.OVERLAP_ID, "conditionId": "c-nr-3903714",
+                "question": "NegRisk keep overlap",
+                "clobTokenIds": '["tok-a", "tok-b", "tok-c"]',
+                "outcomes": '["A", "B", "C"]',
+                "outcomePrices": '["0.20", "0.20", "0.20"]',
+                "category": "geopolitics",
+                "active": True, "closed": False,
+            },
+            {
+                "id": "bin-other", "conditionId": "c-other", "question": "Other binary",
+                "clobTokenIds": '["y-o", "n-o"]', "outcomes": '["Yes", "No"]',
+                "outcomePrices": '["0.49", "0.49"]', "category": "geopolitics",
+                "active": True, "closed": False,
+            },
+        ]
+
+    def test_overlapping_gamma_id_keeps_negrisk_drops_binary_and_logs(self):
+        from polywang.arbitrage_bot import drop_binary_markets_overlapping_negrisk
+        binary = self._binary(self.OVERLAP_ID, "y-3903714", "n-3903714")
+        other = self._binary("bin-other", "y-o", "n-o")
+        negrisk = self._nway(self.OVERLAP_ID)
+        with self.assertLogs("arbitrage-bot", level="INFO") as captured:
+            kept = drop_binary_markets_overlapping_negrisk([binary, other], [negrisk])
+        self.assertEqual([market.market_id for market in kept], ["bin-other"])
+        self.assertEqual(negrisk.market_id, self.OVERLAP_ID)
+        self.assertTrue(any(
+            self.OVERLAP_ID in line and "overlap" in line.lower()
+            for line in captured.output
+        ))
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ, {"WHALE_STATE_PATH": ""}, clear=False,
+        ), self.assertLogs("arbitrage-bot", level="INFO") as runner_logs:
+            runner = PaperMarketRunner(
+                [binary, other], os.path.join(directory, "ledger.json"), 100.0,
+                BinaryArbitrageScanner(),
+                negrisk_markets=[negrisk],
+            )
+        self.assertNotIn(self.OVERLAP_ID, runner.markets)
+        self.assertIn(self.OVERLAP_ID, runner.negrisk_markets)
+        self.assertIn("bin-other", runner.markets)
+        self.assertEqual(runner.negrisk_markets[self.OVERLAP_ID].yes_token_ids, ("tok-a", "tok-b", "tok-c"))
+        self.assertNotIn("y-3903714", runner.token_to_market)
+        self.assertIn("tok-a", runner.token_to_market)
+        self.assertIn("y-o", runner.token_to_market)
+        # Subscribe input is token_to_market keys — constructing the runner is enough.
+        self.assertTrue(list(runner.token_to_market))
+        self.assertTrue(any(
+            self.OVERLAP_ID in line and "overlap" in line.lower()
+            for line in runner_logs.output
+        ))
+
+    def test_fetch_universe_drops_overlapping_gamma_id_from_binary_keep_set(self):
+        from polywang.arbitrage_bot import fetch_universe
+        rows = self._overlap_gamma_rows()
+        with self.assertLogs("arbitrage-bot", level="INFO") as captured:
+            binary, negrisk = fetch_universe(
+                100, get=lambda params: rows, pool=len(rows), negrisk_limit=20,
+            )
+        self.assertEqual([market.market_id for market in negrisk], [self.OVERLAP_ID])
+        self.assertEqual([market.market_id for market in binary], ["bin-other"])
+        self.assertTrue(any(
+            self.OVERLAP_ID in line and "overlap" in line.lower()
+            for line in captured.output
+        ))
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ, {"WHALE_STATE_PATH": ""}, clear=False,
+        ):
+            runner = PaperMarketRunner(
+                binary, os.path.join(directory, "ledger.json"), 100.0,
+                BinaryArbitrageScanner(),
+                negrisk_markets=negrisk,
+            )
+        self.assertEqual(set(runner.markets), {"bin-other"})
+        self.assertEqual(set(runner.negrisk_markets), {self.OVERLAP_ID})
+        subscribe_ids = list(runner.token_to_market)
+        self.assertEqual(len(subscribe_ids), len(set(subscribe_ids)))
+        self.assertTrue({"tok-a", "tok-b", "tok-c", "y-o", "n-o"} <= set(subscribe_ids))
+        self.assertFalse({"y-3903714", "n-3903714"} & set(subscribe_ids))
+
+    def test_token_collision_across_different_market_ids_still_raises(self):
+        binary = self._binary("bin-a", "tok-a", "tok-bin-no")
+        negrisk = self._nway("nr1")
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "duplicate token"):
+                PaperMarketRunner(
+                    [binary], os.path.join(directory, "ledger.json"), 100.0,
+                    BinaryArbitrageScanner(),
+                    negrisk_markets=[negrisk],
+                )
+
+    def test_condition_collision_across_different_market_ids_still_raises(self):
+        binary = self._binary("bin-a", "y-bin", "n-bin")
+        negrisk = self._nway("nr1", condition_id=binary.condition_id)
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "duplicate condition"):
+                PaperMarketRunner(
+                    [binary], os.path.join(directory, "ledger.json"), 100.0,
+                    BinaryArbitrageScanner(),
+                    negrisk_markets=[negrisk],
+                )
+
+    def test_floors_unchanged_after_overlap_filter(self):
+        from polywang.negrisk import NegRiskBookScanner, negrisk_execution_enabled
+        scanner = BinaryArbitrageScanner()
+        self.assertEqual(scanner.min_net_profit_usd, 0.05)
+        self.assertEqual(scanner.min_return, 0.002)
+        self.assertEqual(scanner.safety_buffer_usd, 0.02)
+        nr = NegRiskBookScanner()
+        self.assertEqual(nr.min_net_profit_usd, 0.05)
+        self.assertEqual(nr.min_return, 0.002)
+        self.assertEqual(nr.safety_buffer_usd, 0.02)
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ENABLE_NEGRISK_LIVE", None)
+            os.environ.pop("POLYMARKET_LIVE_CONFIRM", None)
+            self.assertFalse(negrisk_execution_enabled(True))
+            self.assertNotEqual(os.getenv("ENABLE_NEGRISK_LIVE", "").strip().lower(), "1")
+            self.assertNotEqual(os.getenv("POLYMARKET_LIVE_CONFIRM"), "I_UNDERSTAND_THE_RISK")
+
+
 class ResearchExecutionPathTests(unittest.TestCase):
     def _runner(self, directory, market=None):
         from polywang.arbitrage_core import LiveDirectionalJournal, PaperDirectionalExecutor
