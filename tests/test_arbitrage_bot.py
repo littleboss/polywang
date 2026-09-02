@@ -464,11 +464,13 @@ class _FakeMarketSocket:
 
 
 class _RecordingConnect:
-    def __init__(self, message_factory=None):
+    def __init__(self, message_factory=None, *, fail_ping: bool = False):
         self.calls = []
         self.sockets = []
         self.subscribes = []
+        self.pings = []
         self._message_factory = message_factory or (lambda _index: [])
+        self.fail_ping = fail_ping
 
     def __call__(self, url, **kwargs):
         index = len(self.calls)
@@ -477,8 +479,15 @@ class _RecordingConnect:
         original_send = socket.send
 
         async def send(data):
+            text = data.decode("utf-8") if isinstance(data, (bytes, bytearray)) else data
+            if isinstance(text, str) and text.strip() in {"PING", "ping"}:
+                if self.fail_ping:
+                    raise RuntimeError("forced text PING failure")
+                await original_send(text.strip().upper())
+                self.pings.append(text.strip().upper())
+                return
             await original_send(data)
-            self.subscribes.append(json.loads(data))
+            self.subscribes.append(json.loads(text))
 
         socket.send = send
         self.sockets.append(socket)
@@ -533,7 +542,7 @@ class MarketStreamSubscribeTests(unittest.TestCase):
         self.assertEqual(sum(len(chunk) for chunk in two_hundred), 200)
         self.assertEqual([len(chunk) for chunk in chunk_asset_ids(self._ids(51))], [50, 1])
 
-    def test_idle_watch_books_only_dump_is_idle_after_15s(self):
+    def test_idle_watch_books_only_dump_is_not_idle(self):
         from polywang.arbitrage_bot import MARKET_WS_IDLE_RECONNECT_SECONDS, MarketStreamIdleWatch
         self.assertEqual(MARKET_WS_IDLE_RECONNECT_SECONDS, 15.0)
         clock = _FakeClock(0.0)
@@ -543,12 +552,31 @@ class MarketStreamSubscribeTests(unittest.TestCase):
         self.assertFalse(watch.note({"event_type": "book", "asset_id": "no"}))
         clock.t = 14.9
         self.assertFalse(watch.is_idle())
+        clock.t = 60.0
+        self.assertFalse(watch.is_idle())
+        self.assertEqual(watch.last_event_type, "book")
+        self.assertAlmostEqual(watch.last_event_age(), 60.0)
+
+    def test_idle_watch_zero_messages_is_idle_after_timeout(self):
+        from polywang.arbitrage_bot import MarketStreamIdleWatch
+        clock = _FakeClock(0.0)
+        watch = MarketStreamIdleWatch(15.0, now=clock)
+        watch.mark_subscribed()
+        clock.t = 14.9
+        self.assertFalse(watch.is_idle())
         clock.t = 15.0
         self.assertTrue(watch.is_idle())
-        self.assertEqual(watch.last_event_type, "book")
-        self.assertAlmostEqual(watch.last_event_age(), 15.0)
 
-    def test_idle_watch_price_change_and_later_book_reset_timer(self):
+    def test_idle_watch_pong_counts_as_life(self):
+        from polywang.arbitrage_bot import MarketStreamIdleWatch
+        clock = _FakeClock(0.0)
+        watch = MarketStreamIdleWatch(15.0, now=clock)
+        watch.mark_subscribed()
+        watch.note_control_frame("PONG")
+        clock.t = 60.0
+        self.assertFalse(watch.is_idle())
+
+    def test_idle_watch_price_change_and_later_book_are_not_idle(self):
         from polywang.arbitrage_bot import MarketStreamIdleWatch
         clock = _FakeClock(0.0)
         watch = MarketStreamIdleWatch(15.0, now=clock)
@@ -563,7 +591,7 @@ class MarketStreamSubscribeTests(unittest.TestCase):
         self.assertFalse(watch.is_idle())
         clock.t = 20.0
         self.assertTrue(watch.note({"event_type": "book", "asset_id": "yes"}))
-        clock.t = 34.9
+        clock.t = 120.0
         self.assertFalse(watch.is_idle())
 
     def test_one_connection_never_receives_more_than_50_ids(self):
@@ -580,6 +608,7 @@ class MarketStreamSubscribeTests(unittest.TestCase):
         self.assertEqual(max(sizes), 50)
         self.assertEqual(sum(sizes), 51)
         self.assertTrue(all(payload["type"] == "market" for payload in connect.subscribes))
+        self.assertTrue(all(payload.get("custom_feature_enabled") is True for payload in connect.subscribes))
         self.assertTrue(all(call["url"] == MARKET_WS_URL for call in connect.calls))
         self.assertTrue(all(call["kwargs"]["ping_interval"] == 10 for call in connect.calls))
         self.assertTrue(all(call["kwargs"]["ping_timeout"] == 10 for call in connect.calls))
@@ -599,40 +628,124 @@ class MarketStreamSubscribeTests(unittest.TestCase):
         for payload in connect.subscribes:
             self.assertLessEqual(len(payload["assets_ids"]), 50)
             self.assertEqual(payload["type"], "market")
+            self.assertIs(payload.get("custom_feature_enabled"), True)
             subscribed.extend(payload["assets_ids"])
         self.assertEqual(subscribed, token_ids)
         self.assertEqual(len(runner.invalidated), 4)
 
-    def test_idle_after_books_only_dump_reconnects_and_logs(self):
+    def test_subscribe_payload_has_custom_feature_and_rejects_over_50(self):
+        from polywang.arbitrage_bot import MARKET_WS_MAX_ASSETS_PER_SUBSCRIBE, market_subscribe_payload
+        payload = market_subscribe_payload(self._ids(50))
+        self.assertEqual(MARKET_WS_MAX_ASSETS_PER_SUBSCRIBE, 50)
+        self.assertEqual(len(payload["assets_ids"]), 50)
+        self.assertEqual(payload["type"], "market")
+        self.assertIs(payload["custom_feature_enabled"], True)
+        with self.assertRaises(ValueError):
+            market_subscribe_payload(self._ids(51))
+
+    def test_text_ping_is_sent_on_10s_cadence(self):
+        from polywang.arbitrage_bot import run_market_stream
+        connect = _RecordingConnect()
+        runner = _FakeStreamRunner()
+        started = time.monotonic()
+        asyncio.run(self._run_until(
+            run_market_stream(
+                runner, ["tok-0"],
+                connect=connect, idle_seconds=3600.0,
+                text_ping_interval=0.05, text_ping_timeout=0.0,
+            ),
+            lambda: len(connect.pings) >= 2,
+        ))
+        elapsed = time.monotonic() - started
+        self.assertGreaterEqual(len(connect.pings), 2)
+        self.assertTrue(all(ping == "PING" for ping in connect.pings))
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(len(connect.calls), 1)
+        self.assertEqual(len(connect.subscribes), 1)
+        self.assertIs(connect.subscribes[0]["custom_feature_enabled"], True)
+
+    def test_pong_is_not_treated_as_a_market_event(self):
+        from polywang.arbitrage_bot import run_market_stream
+        connect = _RecordingConnect(lambda _index: [
+            "PONG",
+            {"event_type": "book", "asset_id": "tok-0", "asks": [], "bids": []},
+        ])
+        runner = _FakeStreamRunner()
+        asyncio.run(self._run_until(
+            run_market_stream(
+                runner, ["tok-0"], connect=connect, idle_seconds=3600.0,
+                text_ping_interval=3600.0,
+            ),
+            lambda: any(event.get("event_type") == "book" for event in runner.processed),
+        ))
+        self.assertEqual([event["event_type"] for event in runner.processed], ["book"])
+
+    def test_text_ping_send_failure_is_logged(self):
+        from polywang.arbitrage_bot import run_market_stream
+        connect = _RecordingConnect(fail_ping=True)
+        runner = _FakeStreamRunner()
+        with self.assertLogs("arbitrage-bot", level="WARNING") as captured:
+            asyncio.run(self._run_until(
+                run_market_stream(
+                    runner, ["tok-0"],
+                    connect=connect, idle_seconds=3600.0,
+                    text_ping_interval=0.05, text_ping_timeout=0.0,
+                ),
+                lambda: any("text PING send failed" in line for line in captured.output),
+            ))
+        self.assertTrue(any("text PING send failed" in line for line in captured.output))
+
+    def test_books_only_dump_does_not_idle_reconnect(self):
         from polywang.arbitrage_bot import run_market_stream
 
         books = [
             {"event_type": "book", "asset_id": "tok-0", "asks": [], "bids": []},
             {"event_type": "book", "asset_id": "tok-1", "asks": [], "bids": []},
         ]
-
-        def messages(index):
-            return list(books) if index == 0 else []
-
-        connect = _RecordingConnect(messages)
+        connect = _RecordingConnect(lambda _index: list(books))
         runner = _FakeStreamRunner()
-        with self.assertLogs("arbitrage-bot", level="WARNING") as captured:
-            asyncio.run(self._run_until(
+        seen_books_at = {"t": None}
+
+        async def wait_and_hold():
+            await self._run_until(
                 run_market_stream(
                     runner, ["tok-0", "tok-1"],
                     connect=connect, idle_seconds=0.05,
+                    text_ping_interval=3600.0,
                 ),
-                lambda: len(connect.calls) >= 2 and any(
-                    "silent" in line and "last_event=book" in line for line in captured.output
-                ),
+                lambda: len(runner.processed) >= 2,
+                timeout=2.0,
+            )
+
+        # The helper cancels as soon as books arrive; hold the stream ourselves.
+        async def hold_after_books():
+            task = asyncio.create_task(run_market_stream(
+                runner, ["tok-0", "tok-1"],
+                connect=connect, idle_seconds=0.05,
+                text_ping_interval=3600.0,
             ))
-        self.assertGreaterEqual(len(connect.calls), 2)
-        self.assertTrue(connect.sockets[0].closed)
-        self.assertEqual([event["event_type"] for event in runner.processed], ["book", "book"])
-        self.assertTrue(any(
-            "shard 0 silent" in line and "tokens=2" in line and "last_event=book" in line
-            for line in captured.output
-        ))
+            try:
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and len(runner.processed) < 2:
+                    if task.done():
+                        task.result()
+                        raise AssertionError("market stream ended before books arrived")
+                    await asyncio.sleep(0.01)
+                self.assertEqual([event["event_type"] for event in runner.processed], ["book", "book"])
+                seen_books_at["t"] = time.monotonic()
+                await asyncio.sleep(0.2)
+                self.assertEqual(len(connect.calls), 1)
+                self.assertFalse(connect.sockets[0].closed)
+                self.assertEqual(len(runner.processed), 2)
+            finally:
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+        asyncio.run(hold_after_books())
+        self.assertIsNotNone(seen_books_at["t"])
 
     def test_price_change_after_books_is_processed_and_keeps_socket(self):
         from polywang.arbitrage_bot import run_market_stream
@@ -649,6 +762,7 @@ class MarketStreamSubscribeTests(unittest.TestCase):
         asyncio.run(self._run_until(
             run_market_stream(
                 runner, ["tok-0"], connect=connect, idle_seconds=0.2,
+                text_ping_interval=3600.0,
             ),
             lambda: any(event.get("event_type") == "price_change" for event in runner.processed),
         ))
@@ -675,7 +789,10 @@ class MarketStreamSubscribeTests(unittest.TestCase):
 
             with mock.patch.dict(os.environ, {"MARKET_EVENT_LOG": path}, clear=False):
                 asyncio.run(self._run_until(
-                    run_market_stream(runner, ["tok-0"], connect=connect, idle_seconds=3600.0),
+                    run_market_stream(
+                        runner, ["tok-0"], connect=connect, idle_seconds=3600.0,
+                        text_ping_interval=3600.0,
+                    ),
                     lambda: recorded_rows() >= 2,
                 ))
             with open(path, encoding="utf-8") as handle:
@@ -705,6 +822,329 @@ class MarketStreamSubscribeTests(unittest.TestCase):
             self.assertFalse(runner.books["no-a"].synced)
             self.assertTrue(runner.books["yes-b"].synced)
             self.assertTrue(runner.books["no-b"].synced)
+
+    def test_clob_book_to_event_stamps_fresh_rest_source(self):
+        from polywang.arbitrage_bot import clob_book_to_event
+        event = clob_book_to_event(
+            "yes-token",
+            {
+                "asset_id": "yes-token",
+                "timestamp": "1",
+                "hash": "abc",
+                "bids": [{"price": "0.40", "size": "3"}],
+                "asks": [{"price": "0.42", "size": "4"}],
+            },
+            now_ms=1_700_000_000_123,
+        )
+        self.assertEqual(event["event_type"], "book")
+        self.assertEqual(event["asset_id"], "yes-token")
+        self.assertEqual(event["source"], "rest-book")
+        self.assertEqual(event["timestamp"], "1700000000123")
+        self.assertEqual(event["received_at_ms"], 1_700_000_000_123)
+        self.assertEqual(event["exchange_timestamp"], "1")
+        self.assertEqual(event["hash"], "abc")
+
+    def test_rest_book_poll_injects_books_that_reset_age(self):
+        from polywang.arbitrage_bot import run_paper_rest_book_poll
+        from polywang.market_replay import JsonlEventRecorder
+
+        stale_ms = int(time.time() * 1000) - 10_000
+        fetches = []
+
+        def get_book(token_id):
+            fetches.append(token_id)
+            return {
+                "asset_id": token_id,
+                "timestamp": str(stale_ms),
+                "hash": f"h-{token_id}",
+                "bids": [{"price": "0.40", "size": "5"}],
+                "asks": [{"price": "0.41", "size": "5"}],
+            }
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ,
+            {
+                "WHALE_STATE_PATH": "",
+                "MARKET_EVENT_LOG": os.path.join(directory, "events.jsonl"),
+            },
+            clear=False,
+        ):
+            market = BinaryMarket("m1", "c1", "Test", "yes-token", "no-token")
+            runner = PaperMarketRunner(
+                [market], os.path.join(directory, "ledger.json"), 100.0,
+                BinaryArbitrageScanner(),
+            )
+            runner.max_book_age_seconds = 5.0
+            runner.scan_rejects.flush_interval_s = 3600.0
+            asyncio.run(runner.process({
+                "event_type": "book", "asset_id": "yes-token", "timestamp": str(stale_ms),
+                "hash": "old-y",
+                "asks": [{"price": "0.41", "size": "5"}], "bids": [{"price": "0.40", "size": "5"}],
+            }))
+            asyncio.run(runner.process({
+                "event_type": "book", "asset_id": "no-token", "timestamp": str(stale_ms),
+                "hash": "old-n",
+                "asks": [{"price": "0.41", "size": "5"}], "bids": [{"price": "0.40", "size": "5"}],
+            }))
+            self.assertGreater(runner.scan_rejects.counts["stale_book"], 0)
+            runner.scan_rejects.counts["stale_book"] = 0
+
+            path = os.path.join(directory, "events.jsonl")
+            recorder = JsonlEventRecorder(path, source="rest-book")
+            asyncio.run(self._run_until(
+                run_paper_rest_book_poll(
+                    runner, ["yes-token", "no-token"],
+                    recorder, asyncio.Lock(),
+                    get_book=get_book,
+                    cadence_seconds=0.05,
+                    max_rps=100.0,
+                    concurrency=2,
+                ),
+                lambda: "yes-token" in fetches and "no-token" in fetches
+                and runner.books["yes-token"].synced
+                and runner.books["no-token"].synced
+                and (time.time() * 1000 - runner.books["yes-token"].timestamp_ms) < 5000
+                and (time.time() * 1000 - runner.books["no-token"].timestamp_ms) < 5000,
+            ))
+            now_ms = int(time.time() * 1000)
+            self.assertLess(now_ms - runner.books["yes-token"].timestamp_ms, 5000)
+            self.assertLess(now_ms - runner.books["no-token"].timestamp_ms, 5000)
+            from polywang.arbitrage_bot import clob_book_to_event
+            runner.scan_rejects.counts["stale_book"] = 0
+            asyncio.run(runner.process(clob_book_to_event("yes-token", get_book("yes-token"))))
+            self.assertEqual(runner.scan_rejects.counts["stale_book"], 0)
+            with open(path, encoding="utf-8") as handle:
+                rows = [json.loads(line) for line in handle if line.strip()]
+            rest_rows = [row for row in rows if row.get("source") == "rest-book"]
+            self.assertTrue(rest_rows)
+            self.assertTrue(all(row["event_type"] == "book" for row in rest_rows))
+            self.assertTrue(all("received_at_ms" in row for row in rest_rows))
+
+    def test_run_market_stream_wires_rest_book_source(self):
+        from polywang.arbitrage_bot import run_market_stream
+
+        fetches = []
+
+        def get_book(token_id):
+            fetches.append(token_id)
+            return {
+                "asset_id": token_id,
+                "asks": [{"price": "0.41", "size": "2"}],
+                "bids": [{"price": "0.39", "size": "2"}],
+            }
+
+        connect = _RecordingConnect()
+        runner = _FakeStreamRunner()
+        asyncio.run(self._run_until(
+            run_market_stream(
+                runner, ["tok-0"],
+                connect=connect, idle_seconds=3600.0,
+                text_ping_interval=3600.0,
+                rest_get_book=get_book,
+                rest_cadence_seconds=0.05,
+                rest_max_rps=50.0,
+                rest_concurrency=1,
+            ),
+            lambda: any(event.get("source") == "rest-book" for event in runner.processed),
+        ))
+        self.assertTrue(fetches)
+        rest_events = [event for event in runner.processed if event.get("source") == "rest-book"]
+        self.assertEqual(rest_events[0]["event_type"], "book")
+        self.assertEqual(rest_events[0]["asset_id"], "tok-0")
+
+    def test_rest_book_429_backs_off_then_injects(self):
+        from polywang.arbitrage_bot import RestRateLimitError, run_paper_rest_book_poll
+        from polywang.market_replay import JsonlEventRecorder
+
+        calls = []
+
+        def get_book(token_id):
+            calls.append(token_id)
+            if len(calls) == 1:
+                raise RestRateLimitError(0.01)
+            return {
+                "asset_id": token_id,
+                "asks": [{"price": "0.44", "size": "2"}],
+                "bids": [{"price": "0.40", "size": "2"}],
+            }
+
+        runner = _FakeStreamRunner()
+        recorder = JsonlEventRecorder("", source="rest-book")
+        asyncio.run(self._run_until(
+            run_paper_rest_book_poll(
+                runner, ["tok-0"],
+                recorder, asyncio.Lock(),
+                get_book=get_book,
+                cadence_seconds=0.05,
+                max_rps=50.0,
+                concurrency=1,
+            ),
+            lambda: any(event.get("source") == "rest-book" for event in runner.processed),
+        ))
+        self.assertGreaterEqual(len(calls), 2)
+        self.assertEqual(runner.processed[0]["event_type"], "book")
+        self.assertEqual(runner.processed[0]["source"], "rest-book")
+        self.assertEqual(runner.processed[0]["asset_id"], "tok-0")
+
+    def test_http_get_clob_book_uses_token_id_query_and_maps_429(self):
+        from polywang.arbitrage_bot import CLOB_BOOK_URL, RestRateLimitError, _http_get_clob_book
+
+        class Response:
+            def __init__(self, status_code, payload=None, headers=None):
+                self.status_code = status_code
+                self._payload = payload or {}
+                self.headers = headers or {}
+
+            def raise_for_status(self):
+                if self.status_code >= 400 and self.status_code != 429:
+                    raise RuntimeError(f"http {self.status_code}")
+
+            def json(self):
+                return self._payload
+
+        class Session:
+            def __init__(self):
+                self.calls = []
+                self.next = Response(200, {"asset_id": "tok", "asks": [], "bids": []})
+
+            def get(self, url, params=None, timeout=None):
+                self.calls.append({"url": url, "params": dict(params or {}), "timeout": timeout})
+                return self.next
+
+        session = Session()
+        payload = _http_get_clob_book("tok-1", session)
+        self.assertEqual(session.calls[0]["url"], CLOB_BOOK_URL)
+        self.assertEqual(session.calls[0]["params"]["token_id"], "tok-1")
+        self.assertEqual(payload["asset_id"], "tok")
+        session.next = Response(429, headers={"Retry-After": "1.5"})
+        with self.assertRaises(RestRateLimitError) as raised:
+            _http_get_clob_book("tok-1", session)
+        self.assertAlmostEqual(raised.exception.retry_after, 1.5)
+
+    def test_http_post_clob_books_uses_official_batch_body(self):
+        from polywang.arbitrage_bot import (
+            CLOB_BOOKS_URL, RestBooksUnavailable, RestRateLimitError,
+            clob_books_request_body, _http_post_clob_books,
+        )
+
+        class Response:
+            def __init__(self, status_code, payload=None, headers=None):
+                self.status_code = status_code
+                self._payload = payload if payload is not None else []
+                self.headers = headers or {}
+
+            def raise_for_status(self):
+                if self.status_code >= 400 and self.status_code not in {404, 429}:
+                    raise RuntimeError(f"http {self.status_code}")
+
+            def json(self):
+                return self._payload
+
+        class Session:
+            def __init__(self):
+                self.calls = []
+                self.next = Response(200, [
+                    {"asset_id": "a", "asks": [], "bids": []},
+                    {"asset_id": "b", "asks": [], "bids": []},
+                ])
+
+            def post(self, url, json=None, timeout=None):
+                self.calls.append({"url": url, "json": list(json or []), "timeout": timeout})
+                return self.next
+
+        self.assertEqual(clob_books_request_body(["a", "b"]), [
+            {"token_id": "a"}, {"token_id": "b"},
+        ])
+        session = Session()
+        rows = _http_post_clob_books(["a", "b"], session)
+        self.assertEqual(session.calls[0]["url"], CLOB_BOOKS_URL)
+        self.assertEqual(session.calls[0]["json"], [{"token_id": "a"}, {"token_id": "b"}])
+        self.assertEqual([row["asset_id"] for row in rows], ["a", "b"])
+        session.next = Response(429, headers={"Retry-After": "2"})
+        with self.assertRaises(RestRateLimitError):
+            _http_post_clob_books(["a"], session)
+        session.next = Response(404, {"error": "missing"})
+        with self.assertRaises(RestBooksUnavailable):
+            _http_post_clob_books(["a"], session)
+
+    def test_240_token_rest_round_uses_batch_books_under_4s(self):
+        from polywang.arbitrage_bot import paper_rest_book_round
+        from polywang.market_replay import JsonlEventRecorder
+
+        token_ids = [f"tok-{index}" for index in range(240)]
+        calls = []
+
+        def get_books(batch):
+            calls.append(list(batch))
+            return [
+                {
+                    "asset_id": token_id,
+                    "asks": [{"price": "0.41", "size": "2"}],
+                    "bids": [{"price": "0.39", "size": "2"}],
+                }
+                for token_id in batch
+            ]
+
+        runner = _FakeStreamRunner()
+        recorder = JsonlEventRecorder("", source="rest-book")
+        started = time.monotonic()
+        stats = asyncio.run(paper_rest_book_round(
+            runner, token_ids, recorder, asyncio.Lock(),
+            get_books=get_books,
+            batch_size=240,
+            skip_fresh_seconds=0.0,
+            max_rps=100.0,
+        ))
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 4.0)
+        self.assertLess(stats["elapsed"], 4.0)
+        self.assertEqual(stats["path"], "books")
+        self.assertEqual(stats["requests"], 1)
+        self.assertEqual(stats["tokens"], 240)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls[0]), 240)
+        self.assertEqual(calls[0], token_ids)
+        self.assertEqual(len(runner.processed), 240)
+        self.assertTrue(all(event.get("source") == "rest-book" for event in runner.processed))
+        self.assertTrue(all(event.get("event_type") == "book" for event in runner.processed))
+
+    def test_rest_round_skips_books_fresher_than_2s(self):
+        from polywang.arbitrage_bot import paper_rest_book_round, tokens_needing_rest_book
+        from polywang.arbitrage_core import OrderBook
+        from polywang.market_replay import JsonlEventRecorder
+
+        now_ms = int(time.time() * 1000)
+        runner = _FakeStreamRunner()
+        runner.books = {}
+        fresh = OrderBook()
+        fresh.synced = True
+        fresh.timestamp_ms = now_ms - 500
+        stale = OrderBook()
+        stale.synced = True
+        stale.timestamp_ms = now_ms - 10_000
+        runner.books["fresh"] = fresh
+        runner.books["stale"] = stale
+        self.assertEqual(
+            tokens_needing_rest_book(runner, ["fresh", "stale"], now_ms=now_ms, fresh_seconds=2.0),
+            ["stale"],
+        )
+
+        calls = []
+
+        def get_books(batch):
+            calls.append(list(batch))
+            return [{"asset_id": token_id, "asks": [], "bids": []} for token_id in batch]
+
+        stats = asyncio.run(paper_rest_book_round(
+            runner, ["fresh", "stale"],
+            JsonlEventRecorder(""), asyncio.Lock(),
+            get_books=get_books,
+            skip_fresh_seconds=2.0,
+            max_rps=100.0,
+        ))
+        self.assertEqual(calls, [["stale"]])
+        self.assertEqual(stats["tokens"], 1)
+        self.assertEqual(stats["requests"], 1)
 
 
 if __name__ == "__main__":

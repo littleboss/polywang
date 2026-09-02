@@ -70,15 +70,33 @@ from .arbitrage_core import (
 LOG = logging.getLogger("arbitrage-bot")
 GAMMA_URL = "https://gamma-api.polymarket.com/markets"
 MARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+CLOB_REST_URL = "https://clob.polymarket.com"
+CLOB_BOOK_URL = f"{CLOB_REST_URL}/book"
+# Official py-clob-client: GET_ORDER_BOOKS="/books"; get_order_books POSTs
+# [{"token_id": ...}, ...]. Live probe: POST /books → 200; GET /books → 400.
+CLOB_BOOKS_URL = f"{CLOB_REST_URL}/books"
 # Empirical: a single CLOB market socket that subscribed 200 assets_ids stayed
 # ESTAB after the initial book dump and never emitted price_change / deltas.
 # Official docs do not publish a hard cap; keep each subscribe at this bound.
 MARKET_WS_MAX_ASSETS_PER_SUBSCRIBE = 50
-# Initial `book` snapshots must not keep a shard healthy forever.
+# Watchdog for *zero frames of any kind* after subscribe. A live `book` dump
+# followed by silence on `price_change` is not a dead socket — do not thrash.
 MARKET_WS_IDLE_RECONNECT_SECONDS = 15.0
+# Application-level heartbeat: a TEXT frame `PING` every 10s (not just the
+# websockets library opcode ping). Server replies `PONG`.
 MARKET_WS_PING_INTERVAL = 10
 MARKET_WS_PING_TIMEOUT = 10
 MARKET_WS_CLOSE_TIMEOUT = 5
+# Paper-only REST fallback. One POST /books covers the 240-token paper
+# universe in a single RTT (≪4s). Serial GET /book at 40 rps is ~6s and
+# exceeds MAX_BOOK_AGE_SECONDS=5 — do not use that as the paper path.
+PAPER_REST_BOOK_CADENCE_SECONDS = 2.0
+PAPER_REST_BOOK_MAX_RPS = 4.0
+PAPER_REST_BOOK_CONCURRENCY = 2
+PAPER_REST_BOOK_TIMEOUT_SECONDS = 5.0
+PAPER_REST_BOOK_BATCH_SIZE = 240
+PAPER_REST_BOOK_SKIP_FRESH_SECONDS = 2.0
+PAPER_REST_BOOK_MAX_ROUND_SECONDS = 4.0
 # Incremental / delta types that prove the tape is alive after the snapshot dump.
 MARKET_WS_INCREMENTAL_EVENT_TYPES = frozenset({
     "price_change",
@@ -179,6 +197,18 @@ class ScanRejectCounter:
         self.best_net = None
         self.dual_synced_markets = set()
         self._window_start = time.monotonic()
+
+
+class RestRateLimitError(Exception):
+    """CLOB REST 429. Paper /book polling backs off; never used to place orders."""
+
+    def __init__(self, retry_after: float = 1.0):
+        self.retry_after = max(0.0, float(retry_after))
+        super().__init__(f"CLOB REST rate limited; retry after {self.retry_after:.1f}s")
+
+
+class RestBooksUnavailable(Exception):
+    """POST /books is missing; paper may fall back to GET /book."""
 
 
 def env_float(name: str, default: float) -> float:
@@ -487,7 +517,7 @@ class PaperMarketRunner:
         """Require fresh snapshots after a market-stream reconnect.
 
         When `token_ids` is set, only that shard's books are dropped so a
-        single idle reconnect cannot unsync healthy concurrent connections.
+        single shard reconnect cannot unsync healthy concurrent connections.
         """
         if token_ids is None:
             books = list(self.books.values())
@@ -750,6 +780,175 @@ def chunk_asset_ids(
     return [ids[index:index + max_size] for index in range(0, len(ids), max_size)]
 
 
+def market_subscribe_payload(token_ids: Iterable[str]) -> dict:
+    """Paper CLOB market subscribe frame. Official raw-WS key is snake_case.
+
+    Docs: custom_feature_enabled unlocks best_bid_ask / lifecycle updates.
+    Batches must stay at or below MARKET_WS_MAX_ASSETS_PER_SUBSCRIBE.
+    """
+    ids = [str(token_id) for token_id in token_ids if str(token_id)]
+    if len(ids) > MARKET_WS_MAX_ASSETS_PER_SUBSCRIBE:
+        raise ValueError(
+            f"market subscribe has {len(ids)} assets_ids; max is "
+            f"{MARKET_WS_MAX_ASSETS_PER_SUBSCRIBE}"
+        )
+    return {
+        "assets_ids": ids,
+        "type": "market",
+        "custom_feature_enabled": True,
+    }
+
+
+def clob_book_to_event(token_id: str, payload: dict, *, now_ms: Optional[int] = None) -> dict:
+    """Turn a CLOB REST /book object into a market `book` event.
+
+    `timestamp` is the local receipt time so MAX_BOOK_AGE_SECONDS=5 sees a
+    fresh book. The exchange timestamp is kept as `exchange_timestamp`.
+    """
+    received_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+    body = payload if isinstance(payload, dict) else {}
+    asset_id = str(body.get("asset_id") or body.get("token_id") or token_id)
+    event = {
+        "event_type": "book",
+        "asset_id": asset_id,
+        "bids": body.get("bids") or [],
+        "asks": body.get("asks") or [],
+        "timestamp": str(received_ms),
+        "source": "rest-book",
+        "received_at_ms": received_ms,
+    }
+    market = body.get("market")
+    if market:
+        event["market"] = market
+    book_hash = body.get("hash")
+    if book_hash:
+        event["hash"] = book_hash
+    exchange_ts = body.get("timestamp")
+    if exchange_ts not in (None, ""):
+        event["exchange_timestamp"] = exchange_ts
+    return event
+
+
+def clob_books_request_body(token_ids: Iterable[str]) -> List[dict]:
+    """Body for official POST /books — same shape as py-clob-client.get_order_books."""
+    return [{"token_id": str(token_id)} for token_id in token_ids if str(token_id)]
+
+
+def tokens_needing_rest_book(
+    runner,
+    token_ids: Iterable[str],
+    *,
+    now_ms: Optional[int] = None,
+    fresh_seconds: float = PAPER_REST_BOOK_SKIP_FRESH_SECONDS,
+) -> List[str]:
+    """Skip tokens whose local book age is already under `fresh_seconds`."""
+    received_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+    fresh_ms = max(0.0, float(fresh_seconds)) * 1000.0
+    books = getattr(runner, "books", None) or {}
+    needed: List[str] = []
+    for token_id in token_ids:
+        tid = str(token_id)
+        if not tid:
+            continue
+        book = books.get(tid)
+        if book is None or not getattr(book, "synced", False):
+            needed.append(tid)
+            continue
+        timestamp_ms = int(getattr(book, "timestamp_ms", 0) or 0)
+        if timestamp_ms <= 0 or received_ms - timestamp_ms >= fresh_ms:
+            needed.append(tid)
+    return needed
+
+
+def _clob_rest_retry_after(response) -> float:
+    raw = response.headers.get("Retry-After") if response is not None else None
+    try:
+        return float(raw) if raw not in (None, "") else 1.0
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def _raise_for_clob_rest(response, *, batch: bool = False) -> None:
+    if response.status_code == 429:
+        raise RestRateLimitError(_clob_rest_retry_after(response))
+    if batch and response.status_code == 404:
+        raise RestBooksUnavailable("POST /books returned 404")
+    response.raise_for_status()
+
+
+def _http_get_clob_book(token_id: str, session: Optional[requests.Session] = None) -> dict:
+    """GET /book?token_id= — paper observation only, never places an order."""
+    client = session if session is not None else requests
+    response = client.get(
+        CLOB_BOOK_URL,
+        params={"token_id": str(token_id)},
+        timeout=PAPER_REST_BOOK_TIMEOUT_SECONDS,
+    )
+    _raise_for_clob_rest(response)
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise ValueError("CLOB /book did not return an object")
+    return payload
+
+
+def _http_post_clob_books(token_ids: Iterable[str],
+                          session: Optional[requests.Session] = None) -> List[dict]:
+    """POST /books with [{token_id}] — paper observation only, never places an order."""
+    body = clob_books_request_body(token_ids)
+    if not body:
+        return []
+    client = session if session is not None else requests
+    response = client.post(
+        CLOB_BOOKS_URL,
+        json=body,
+        timeout=PAPER_REST_BOOK_TIMEOUT_SECONDS,
+    )
+    _raise_for_clob_rest(response, batch=True)
+    payload = response.json()
+    if isinstance(payload, list):
+        return [row for row in payload if isinstance(row, dict)]
+    if isinstance(payload, dict):
+        rows = payload.get("data") or payload.get("books") or []
+        if isinstance(rows, list):
+            return [row for row in rows if isinstance(row, dict)]
+    raise ValueError("CLOB POST /books did not return a list of books")
+
+
+def _default_paper_get_books(session: requests.Session):
+    """Prefer verified POST /books; fall back to GET /book only if /books is gone."""
+
+    def get_books(token_ids: List[str]) -> List[dict]:
+        try:
+            return _http_post_clob_books(token_ids, session)
+        except RestBooksUnavailable:
+            LOG.warning("Paper REST POST /books unavailable; falling back to GET /book")
+            return [_http_get_clob_book(token_id, session) for token_id in token_ids]
+
+    return get_books
+
+
+class _RequestLimiter:
+    """Serialize REST starts so a 240-token paper universe does not 429."""
+
+    def __init__(self, max_rps: float):
+        self.min_interval = 1.0 / max(0.1, float(max_rps))
+        self._next = 0.0
+        self._lock = asyncio.Lock()
+
+    async def wait(self) -> None:
+        async with self._lock:
+            now = time.monotonic()
+            delay = self._next - now
+            if delay > 0:
+                await asyncio.sleep(delay)
+            self._next = time.monotonic() + self.min_interval
+
+    def backoff(self, seconds: float) -> None:
+        wait = max(0.0, float(seconds))
+        self._next = max(self._next, time.monotonic() + wait)
+        self.min_interval = min(1.0, max(self.min_interval, wait / 4.0 if wait else self.min_interval))
+
+
 def _market_event_type(event: dict) -> str:
     if not isinstance(event, dict):
         return ""
@@ -766,13 +965,17 @@ def _market_event_asset_id(event: dict) -> str:
     return ""
 
 
-class MarketStreamIdleWatch:
-    """Idle timer that ignores the initial book dump and waits for a live tape.
+def _is_control_frame(message: str) -> bool:
+    return message.strip() in {"PING", "PONG", "ping", "pong"}
 
-    CLOB sends one `book` snapshot per subscribed token after subscribe. Those
-    snapshots must not reset the 15s idle clock. A later `book` for the same
-    token is treated as a book-update and does reset it, as do price_change /
-    trade / top-of-book messages.
+
+class MarketStreamIdleWatch:
+    """Silence watchdog: reconnect only when no frames of any kind arrive.
+
+    CLOB often sends one `book` snapshot per token and then goes quiet on
+    `price_change`. That dump is a live connection. Treat any frame — first
+    book, later book, delta, or text PONG — as life. A books-only tape must
+    not trip the 15s reconnect.
     """
 
     def __init__(self, idle_seconds: float = MARKET_WS_IDLE_RECONNECT_SECONDS,
@@ -782,6 +985,7 @@ class MarketStreamIdleWatch:
         self.subscribed_at = now()
         self.last_event_type: Optional[str] = None
         self.last_event_at = self.subscribed_at
+        self.last_message_at: Optional[float] = None
         self.last_incremental_at: Optional[float] = None
         self._seen_book_assets: set = set()
 
@@ -789,15 +993,22 @@ class MarketStreamIdleWatch:
         self.subscribed_at = self._now()
         self.last_event_type = None
         self.last_event_at = self.subscribed_at
+        self.last_message_at = None
         self.last_incremental_at = None
         self._seen_book_assets.clear()
 
+    def note_control_frame(self, name: str = "") -> None:
+        self.last_message_at = self._now()
+        if name:
+            self.last_event_type = str(name).lower()
+
     def note(self, event: dict) -> bool:
-        """Record an event. Returns True when it counts as incremental/delta."""
+        """Record an event. Returns True when it is an incremental/delta."""
         event_type = _market_event_type(event) or "unknown"
         now = self._now()
         self.last_event_type = event_type
         self.last_event_at = now
+        self.last_message_at = now
         incremental = self._is_incremental(event, event_type)
         if incremental:
             self.last_incremental_at = now
@@ -820,42 +1031,79 @@ class MarketStreamIdleWatch:
         return max(0.0, self._now() - self.last_event_at)
 
     def seconds_until_idle(self) -> float:
-        anchor = self.last_incremental_at
-        if anchor is None:
-            anchor = self.subscribed_at
-        return self.idle_seconds - (self._now() - anchor)
+        if self.last_message_at is not None:
+            return math.inf
+        return self.idle_seconds - (self._now() - self.subscribed_at)
 
     def is_idle(self) -> bool:
-        return self.seconds_until_idle() <= 0.0
+        remaining = self.seconds_until_idle()
+        return math.isfinite(remaining) and remaining <= 0.0
 
 
-async def _recv_market_message(websocket, timeout: float):
+async def _recv_market_message(websocket, timeout: Optional[float]):
     """Receive one frame, honoring both `recv` and async-iteration sockets."""
     recv = getattr(websocket, "recv", None)
     if recv is not None:
+        if timeout is None:
+            return await recv()
         return await asyncio.wait_for(recv(), timeout=timeout)
     iterator = getattr(websocket, "__aiter__", None)
     if iterator is None:
         raise RuntimeError("market websocket does not support recv")
+    if timeout is None:
+        return await iterator().__anext__()
     return await asyncio.wait_for(iterator().__anext__(), timeout=timeout)
+
+
+async def _text_ping_loop(websocket, interval: float, timeout: float,
+                          shard_index: int, pong_event: asyncio.Event) -> None:
+    """Send a protocol TEXT `PING` on a fixed cadence; log send failures."""
+    next_at = time.monotonic() + max(0.01, float(interval))
+    while True:
+        delay = next_at - time.monotonic()
+        if delay > 0:
+            await asyncio.sleep(delay)
+        next_at += max(0.01, float(interval))
+        pong_event.clear()
+        try:
+            await websocket.send("PING")
+        except Exception as error:
+            LOG.warning("Market stream shard %d text PING send failed: %s", shard_index, error)
+            raise
+        if timeout > 0:
+            try:
+                await asyncio.wait_for(pong_event.wait(), timeout=timeout)
+            except asyncio.TimeoutError as error:
+                LOG.warning(
+                    "Market stream shard %d text PING timed out waiting for PONG (%.1fs)",
+                    shard_index, timeout,
+                )
+                raise TimeoutError("market stream text PONG timeout") from error
 
 
 async def _pump_market_socket(websocket, runner: PaperMarketRunner,
                               recorder: JsonlEventRecorder,
                               lock: asyncio.Lock,
-                              watch: MarketStreamIdleWatch) -> str:
-    """Forward every event; return `idle` when the live tape goes silent."""
+                              watch: MarketStreamIdleWatch,
+                              pong_event: Optional[asyncio.Event] = None) -> str:
+    """Forward market events. Idle only when no frames of any kind arrive."""
+    control = pong_event if pong_event is not None else asyncio.Event()
     while True:
         remaining = watch.seconds_until_idle()
         if remaining <= 0:
             return "idle"
+        recv_timeout = remaining if math.isfinite(remaining) else None
         try:
-            message = await _recv_market_message(websocket, remaining)
+            message = await _recv_market_message(websocket, recv_timeout)
         except asyncio.TimeoutError:
             return "idle"
         if isinstance(message, (bytes, bytearray)):
             message = message.decode("utf-8", errors="replace")
-        if isinstance(message, str) and message.strip() in {"PING", "PONG", "ping", "pong"}:
+        if isinstance(message, str) and _is_control_frame(message):
+            name = message.strip()
+            watch.note_control_frame(name)
+            if name.upper() == "PONG":
+                control.set()
             continue
         try:
             payload = json.loads(message)
@@ -880,10 +1128,15 @@ async def _run_market_stream_shard(
     ping_interval: float,
     ping_timeout: float,
     close_timeout: float,
+    text_ping_interval: float,
+    text_ping_timeout: float,
 ) -> None:
     backoff = 1.0
     while True:
         watch = MarketStreamIdleWatch(idle_seconds)
+        pong_event = asyncio.Event()
+        ping_task = None
+        pump_task = None
         try:
             async with connect(
                 MARKET_WS_URL,
@@ -892,25 +1145,57 @@ async def _run_market_stream_shard(
                 close_timeout=close_timeout,
             ) as websocket:
                 runner.invalidate_books(token_ids)
-                await websocket.send(json.dumps({"assets_ids": list(token_ids), "type": "market"}))
+                await websocket.send(json.dumps(market_subscribe_payload(token_ids)))
                 watch.mark_subscribed()
                 LOG.info(
-                    "Subscribed market stream shard %d to %d binary-market tokens",
+                    "Subscribed market stream shard %d to %d binary-market tokens "
+                    "(custom_feature_enabled=true)",
                     shard_index, len(token_ids),
                 )
                 backoff = 1.0
-                reason = await _pump_market_socket(websocket, runner, recorder, lock, watch)
-                if reason == "idle":
-                    LOG.warning(
-                        "Market stream shard %d silent: no incremental events for %.1fs "
-                        "(tokens=%d last_event=%s age=%.1fs); reconnecting",
-                        shard_index,
-                        idle_seconds,
-                        len(token_ids),
-                        watch.last_event_type or "none",
-                        watch.last_event_age(),
+                pump_task = asyncio.create_task(
+                    _pump_market_socket(websocket, runner, recorder, lock, watch, pong_event)
+                )
+                tasks = {pump_task}
+                if text_ping_interval > 0:
+                    ping_task = asyncio.create_task(
+                        _text_ping_loop(
+                            websocket, text_ping_interval, text_ping_timeout,
+                            shard_index, pong_event,
+                        )
                     )
-                    continue
+                    tasks.add(ping_task)
+                try:
+                    done, pending = await asyncio.wait(
+                        tasks, return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for task in pending:
+                        task.cancel()
+                    await asyncio.gather(*pending, return_exceptions=True)
+                    for task in done:
+                        if task.cancelled():
+                            continue
+                        exc = task.exception()
+                        if exc is not None:
+                            raise exc
+                        if task is pump_task and task.result() == "idle":
+                            LOG.warning(
+                                "Market stream shard %d silent: no frames of any kind for %.1fs "
+                                "(tokens=%d last_event=%s age=%.1fs); reconnecting",
+                                shard_index,
+                                idle_seconds,
+                                len(token_ids),
+                                watch.last_event_type or "none",
+                                watch.last_event_age(),
+                            )
+                finally:
+                    for task in (ping_task, pump_task):
+                        if task is not None and not task.done():
+                            task.cancel()
+                    await asyncio.gather(
+                        *[task for task in (ping_task, pump_task) if task is not None],
+                        return_exceptions=True,
+                    )
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -920,6 +1205,159 @@ async def _run_market_stream_shard(
             )
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2.0, 30.0)
+
+
+async def _inject_rest_book_event(
+    runner: PaperMarketRunner,
+    recorder: JsonlEventRecorder,
+    lock: asyncio.Lock,
+    token_id: str,
+    payload: dict,
+) -> None:
+    if not isinstance(payload, dict):
+        return
+    event = clob_book_to_event(token_id, payload)
+    async with lock:
+        recorder.record(event)
+        await runner.process(event)
+
+
+async def _fetch_rest_books_chunk(
+    chunk: List[str],
+    get_books,
+    get_book,
+    limiter: _RequestLimiter,
+) -> List[dict]:
+    delay = 0.25
+    for _attempt in range(5):
+        await limiter.wait()
+        try:
+            if get_books is not None:
+                rows = await asyncio.to_thread(get_books, chunk)
+            else:
+                rows = []
+                for token_id in chunk:
+                    rows.append(await asyncio.to_thread(get_book, token_id))
+            if isinstance(rows, list):
+                return [row for row in rows if isinstance(row, dict)]
+            return []
+        except RestRateLimitError as error:
+            wait = error.retry_after if error.retry_after > 0 else delay
+            LOG.warning("Paper REST /books hit 429; backing off %.2fs", wait)
+            limiter.backoff(wait)
+            await asyncio.sleep(wait)
+            delay = min(delay * 2.0, 8.0)
+        except Exception as error:
+            LOG.warning("Paper REST /books chunk failed: %s", error)
+            return []
+    return []
+
+
+async def paper_rest_book_round(
+    runner: PaperMarketRunner,
+    token_ids: List[str],
+    recorder: JsonlEventRecorder,
+    lock: asyncio.Lock,
+    *,
+    get_books=None,
+    get_book=None,
+    batch_size: int = PAPER_REST_BOOK_BATCH_SIZE,
+    skip_fresh_seconds: float = PAPER_REST_BOOK_SKIP_FRESH_SECONDS,
+    max_rps: float = PAPER_REST_BOOK_MAX_RPS,
+    limiter: Optional[_RequestLimiter] = None,
+) -> dict:
+    """Refresh stale paper books via POST /books. One 240-token batch is one RTT."""
+    ids = [str(token_id) for token_id in token_ids if str(token_id)]
+    wanted = tokens_needing_rest_book(runner, ids, fresh_seconds=skip_fresh_seconds)
+    started = time.monotonic()
+    if not wanted:
+        return {"tokens": 0, "requests": 0, "elapsed": 0.0, "path": "skip"}
+    if get_books is None and get_book is None:
+        raise ValueError("paper REST round needs get_books or get_book")
+    size = max(1, int(batch_size))
+    chunks = chunk_asset_ids(wanted, size)
+    rate = limiter or _RequestLimiter(max_rps)
+    injected = 0
+    requests = 0
+    path = "books" if get_books is not None else "book"
+    for chunk in chunks:
+        rows = await _fetch_rest_books_chunk(chunk, get_books, get_book, rate)
+        requests += 1 if get_books is not None else max(1, len(chunk))
+        if get_books is None and get_book is not None:
+            paired = list(zip(chunk, rows))
+        else:
+            by_asset = {}
+            for row in rows:
+                asset_id = str(row.get("asset_id") or row.get("token_id") or "")
+                if asset_id:
+                    by_asset[asset_id] = row
+            paired = [
+                (token_id, by_asset[token_id])
+                for token_id in chunk
+                if token_id in by_asset
+            ]
+        for token_id, payload in paired:
+            await _inject_rest_book_event(runner, recorder, lock, token_id, payload)
+            injected += 1
+    elapsed = time.monotonic() - started
+    if elapsed >= PAPER_REST_BOOK_MAX_ROUND_SECONDS:
+        LOG.warning(
+            "Paper REST /books round took %.2fs for %d tokens (%d request(s)); "
+            "target is <%ds so MAX_BOOK_AGE_SECONDS=5 stays clear",
+            elapsed, injected, requests, int(PAPER_REST_BOOK_MAX_ROUND_SECONDS),
+        )
+    return {"tokens": injected, "requests": requests, "elapsed": elapsed, "path": path}
+
+
+async def run_paper_rest_book_poll(
+    runner: PaperMarketRunner,
+    token_ids: List[str],
+    recorder: JsonlEventRecorder,
+    lock: asyncio.Lock,
+    *,
+    get_book=None,
+    get_books=None,
+    cadence_seconds: float = PAPER_REST_BOOK_CADENCE_SECONDS,
+    max_rps: float = PAPER_REST_BOOK_MAX_RPS,
+    concurrency: int = PAPER_REST_BOOK_CONCURRENCY,
+    batch_size: int = PAPER_REST_BOOK_BATCH_SIZE,
+    skip_fresh_seconds: float = PAPER_REST_BOOK_SKIP_FRESH_SECONDS,
+) -> None:
+    """Paper-only CLOB POST /books poll. Does not place orders. Live WS stays fail-closed."""
+    ids = [str(token_id) for token_id in token_ids if str(token_id)]
+    if not ids:
+        return
+    session = None
+    batch_getter = get_books
+    single_getter = get_book
+    if batch_getter is None and single_getter is None:
+        session = requests.Session()
+        batch_getter = _default_paper_get_books(session)
+    cadence = max(0.1, float(cadence_seconds))
+    limiter = _RequestLimiter(max_rps)
+    LOG.info(
+        "Paper REST /books poller watching %d tokens (batch=%d cadence=%.1fs skip_fresh=%.1fs)",
+        len(ids), max(1, int(batch_size)), cadence, skip_fresh_seconds,
+    )
+    try:
+        while True:
+            stats = await paper_rest_book_round(
+                runner, ids, recorder, lock,
+                get_books=batch_getter,
+                get_book=single_getter,
+                batch_size=batch_size,
+                skip_fresh_seconds=skip_fresh_seconds,
+                max_rps=max_rps,
+                limiter=limiter,
+            )
+            wait = cadence - float(stats.get("elapsed") or 0.0)
+            if wait > 0:
+                await asyncio.sleep(wait)
+    except asyncio.CancelledError:
+        raise
+    finally:
+        if session is not None:
+            session.close()
 
 
 async def run_market_stream(
@@ -932,13 +1370,27 @@ async def run_market_stream(
     ping_interval: float = MARKET_WS_PING_INTERVAL,
     ping_timeout: float = MARKET_WS_PING_TIMEOUT,
     close_timeout: float = MARKET_WS_CLOSE_TIMEOUT,
+    text_ping_interval: float = MARKET_WS_PING_INTERVAL,
+    text_ping_timeout: float = MARKET_WS_PING_TIMEOUT,
+    enable_rest_books: Optional[bool] = None,
+    rest_get_book=None,
+    rest_get_books=None,
+    rest_cadence_seconds: float = PAPER_REST_BOOK_CADENCE_SECONDS,
+    rest_max_rps: float = PAPER_REST_BOOK_MAX_RPS,
+    rest_concurrency: int = PAPER_REST_BOOK_CONCURRENCY,
+    rest_batch_size: int = PAPER_REST_BOOK_BATCH_SIZE,
 ) -> None:
+    injected_connect = connect is not None
     if connect is None:
         try:
             import websockets
         except ImportError as error:
             raise SystemExit("Install websockets for the paper market stream: uv sync") from error
         connect = websockets.connect
+    if enable_rest_books is None:
+        enable_rest_books = rest_get_book is not None or rest_get_books is not None or (
+            not injected_connect and env_bool("ENABLE_PAPER_REST_BOOK", True)
+        )
 
     chunks = chunk_asset_ids(token_ids, max_assets_per_subscribe)
     if not chunks:
@@ -951,7 +1403,7 @@ async def run_market_stream(
         "Opening %d CLOB market websocket(s) for %d tokens (max %d assets_ids / subscribe)",
         len(chunks), sum(len(chunk) for chunk in chunks), max_assets_per_subscribe,
     )
-    await asyncio.gather(*[
+    tasks = [
         _run_market_stream_shard(
             runner,
             chunk,
@@ -963,9 +1415,26 @@ async def run_market_stream(
             ping_interval=ping_interval,
             ping_timeout=ping_timeout,
             close_timeout=close_timeout,
+            text_ping_interval=text_ping_interval,
+            text_ping_timeout=text_ping_timeout,
         )
         for shard_index, chunk in enumerate(chunks)
-    ])
+    ]
+    if enable_rest_books:
+        rest_recorder = JsonlEventRecorder(os.getenv("MARKET_EVENT_LOG", ""), source="rest-book")
+        tasks.append(run_paper_rest_book_poll(
+            runner,
+            [str(token_id) for token_id in token_ids if str(token_id)],
+            rest_recorder,
+            lock,
+            get_book=rest_get_book,
+            get_books=rest_get_books,
+            cadence_seconds=rest_cadence_seconds,
+            max_rps=rest_max_rps,
+            concurrency=rest_concurrency,
+            batch_size=rest_batch_size,
+        ))
+    await asyncio.gather(*tasks)
 
 
 async def run_official_market_stream(executor: OfficialFOKExecutor,
