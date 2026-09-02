@@ -1,6 +1,8 @@
 import asyncio
+import json
 import os
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -411,6 +413,280 @@ class ScanRejectAndGammaTests(unittest.TestCase):
             self.assertEqual(runner.scan_rejects.counts["leg_skew"], 1)
             self.assertEqual(runner.scan_rejects.attempts, 1)
             self.assertIsNotNone(runner.scan_rejects.best_touch_sum)
+
+
+class _FakeClock:
+    def __init__(self, start: float = 0.0):
+        self.t = float(start)
+
+    def __call__(self) -> float:
+        return self.t
+
+
+class _FakeMarketSocket:
+    """Async websocket stand-in that records subscribe frames and yields scripted messages."""
+
+    def __init__(self, messages=None, hang: bool = True):
+        self._messages = [json.dumps(item) if isinstance(item, (dict, list)) else item
+                          for item in (messages or [])]
+        self.sent = []
+        self.closed = False
+        self.hang = hang
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        self.closed = True
+        return False
+
+    async def send(self, data):
+        self.sent.append(data)
+
+    async def recv(self):
+        if self._messages:
+            return self._messages.pop(0)
+        if not self.hang:
+            raise RuntimeError("fake socket closed")
+        await asyncio.Future()
+
+
+class _RecordingConnect:
+    def __init__(self, message_factory=None):
+        self.calls = []
+        self.sockets = []
+        self.subscribes = []
+        self._message_factory = message_factory or (lambda _index: [])
+
+    def __call__(self, url, **kwargs):
+        index = len(self.calls)
+        self.calls.append({"url": url, "kwargs": dict(kwargs)})
+        socket = _FakeMarketSocket(self._message_factory(index))
+        original_send = socket.send
+
+        async def send(data):
+            await original_send(data)
+            self.subscribes.append(json.loads(data))
+
+        socket.send = send
+        self.sockets.append(socket)
+        return socket
+
+
+class _FakeStreamRunner:
+    def __init__(self):
+        self.processed = []
+        self.invalidated = []
+
+    def invalidate_books(self, token_ids=None):
+        self.invalidated.append(list(token_ids) if token_ids is not None else None)
+
+    async def process(self, event):
+        self.processed.append(event)
+
+
+class MarketStreamSubscribeTests(unittest.TestCase):
+    def _ids(self, count):
+        return [f"tok-{index}" for index in range(count)]
+
+    async def _run_until(self, coro, predicate, timeout=2.0):
+        task = asyncio.create_task(coro)
+        try:
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if predicate():
+                    return
+                if task.done():
+                    task.result()
+                    raise AssertionError("market stream ended before the wait condition")
+                await asyncio.sleep(0.01)
+            raise AssertionError("timed out waiting for the market-stream condition")
+        finally:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    def test_chunk_asset_ids_never_exceeds_50_and_covers_200(self):
+        from polywang.arbitrage_bot import MARKET_WS_MAX_ASSETS_PER_SUBSCRIBE, chunk_asset_ids
+        self.assertEqual(MARKET_WS_MAX_ASSETS_PER_SUBSCRIBE, 50)
+        self.assertEqual(chunk_asset_ids([]), [])
+        fifty = chunk_asset_ids(self._ids(50))
+        self.assertEqual(len(fifty), 1)
+        self.assertEqual(len(fifty[0]), 50)
+        two_hundred = chunk_asset_ids(self._ids(200))
+        self.assertEqual(len(two_hundred), 4)
+        self.assertTrue(all(len(chunk) <= 50 for chunk in two_hundred))
+        self.assertEqual(sum(len(chunk) for chunk in two_hundred), 200)
+        self.assertEqual([len(chunk) for chunk in chunk_asset_ids(self._ids(51))], [50, 1])
+
+    def test_idle_watch_books_only_dump_is_idle_after_15s(self):
+        from polywang.arbitrage_bot import MARKET_WS_IDLE_RECONNECT_SECONDS, MarketStreamIdleWatch
+        self.assertEqual(MARKET_WS_IDLE_RECONNECT_SECONDS, 15.0)
+        clock = _FakeClock(0.0)
+        watch = MarketStreamIdleWatch(15.0, now=clock)
+        watch.mark_subscribed()
+        self.assertFalse(watch.note({"event_type": "book", "asset_id": "yes"}))
+        self.assertFalse(watch.note({"event_type": "book", "asset_id": "no"}))
+        clock.t = 14.9
+        self.assertFalse(watch.is_idle())
+        clock.t = 15.0
+        self.assertTrue(watch.is_idle())
+        self.assertEqual(watch.last_event_type, "book")
+        self.assertAlmostEqual(watch.last_event_age(), 15.0)
+
+    def test_idle_watch_price_change_and_later_book_reset_timer(self):
+        from polywang.arbitrage_bot import MarketStreamIdleWatch
+        clock = _FakeClock(0.0)
+        watch = MarketStreamIdleWatch(15.0, now=clock)
+        watch.mark_subscribed()
+        watch.note({"event_type": "book", "asset_id": "yes"})
+        clock.t = 5.0
+        self.assertTrue(watch.note({
+            "event_type": "price_change",
+            "price_changes": [{"asset_id": "yes", "price": "0.40", "size": "1", "side": "SELL"}],
+        }))
+        clock.t = 19.9
+        self.assertFalse(watch.is_idle())
+        clock.t = 20.0
+        self.assertTrue(watch.note({"event_type": "book", "asset_id": "yes"}))
+        clock.t = 34.9
+        self.assertFalse(watch.is_idle())
+
+    def test_one_connection_never_receives_more_than_50_ids(self):
+        from polywang.arbitrage_bot import MARKET_WS_URL, run_market_stream
+        connect = _RecordingConnect()
+        runner = _FakeStreamRunner()
+        asyncio.run(self._run_until(
+            run_market_stream(runner, self._ids(51), connect=connect, idle_seconds=3600.0),
+            lambda: len(connect.subscribes) >= 2,
+        ))
+        sizes = [len(payload["assets_ids"]) for payload in connect.subscribes]
+        self.assertTrue(sizes)
+        self.assertTrue(all(size <= 50 for size in sizes))
+        self.assertEqual(max(sizes), 50)
+        self.assertEqual(sum(sizes), 51)
+        self.assertTrue(all(payload["type"] == "market" for payload in connect.subscribes))
+        self.assertTrue(all(call["url"] == MARKET_WS_URL for call in connect.calls))
+        self.assertTrue(all(call["kwargs"]["ping_interval"] == 10 for call in connect.calls))
+        self.assertTrue(all(call["kwargs"]["ping_timeout"] == 10 for call in connect.calls))
+
+    def test_200_ids_open_multiple_connections_of_at_most_50(self):
+        from polywang.arbitrage_bot import run_market_stream
+        connect = _RecordingConnect()
+        runner = _FakeStreamRunner()
+        token_ids = self._ids(200)
+        asyncio.run(self._run_until(
+            run_market_stream(runner, token_ids, connect=connect, idle_seconds=3600.0),
+            lambda: len(connect.subscribes) >= 4,
+        ))
+        self.assertGreaterEqual(len(connect.calls), 4)
+        self.assertEqual(len(connect.subscribes), 4)
+        subscribed = []
+        for payload in connect.subscribes:
+            self.assertLessEqual(len(payload["assets_ids"]), 50)
+            self.assertEqual(payload["type"], "market")
+            subscribed.extend(payload["assets_ids"])
+        self.assertEqual(subscribed, token_ids)
+        self.assertEqual(len(runner.invalidated), 4)
+
+    def test_idle_after_books_only_dump_reconnects_and_logs(self):
+        from polywang.arbitrage_bot import run_market_stream
+
+        books = [
+            {"event_type": "book", "asset_id": "tok-0", "asks": [], "bids": []},
+            {"event_type": "book", "asset_id": "tok-1", "asks": [], "bids": []},
+        ]
+
+        def messages(index):
+            return list(books) if index == 0 else []
+
+        connect = _RecordingConnect(messages)
+        runner = _FakeStreamRunner()
+        with self.assertLogs("arbitrage-bot", level="WARNING") as captured:
+            asyncio.run(self._run_until(
+                run_market_stream(
+                    runner, ["tok-0", "tok-1"],
+                    connect=connect, idle_seconds=0.05,
+                ),
+                lambda: len(connect.calls) >= 2 and any(
+                    "silent" in line and "last_event=book" in line for line in captured.output
+                ),
+            ))
+        self.assertGreaterEqual(len(connect.calls), 2)
+        self.assertTrue(connect.sockets[0].closed)
+        self.assertEqual([event["event_type"] for event in runner.processed], ["book", "book"])
+        self.assertTrue(any(
+            "shard 0 silent" in line and "tokens=2" in line and "last_event=book" in line
+            for line in captured.output
+        ))
+
+    def test_price_change_after_books_is_processed_and_keeps_socket(self):
+        from polywang.arbitrage_bot import run_market_stream
+
+        live_tape = [
+            {"event_type": "book", "asset_id": "tok-0", "asks": [], "bids": []},
+            {
+                "event_type": "price_change", "timestamp": "1",
+                "price_changes": [{"asset_id": "tok-0", "price": "0.41", "size": "2", "side": "SELL"}],
+            },
+        ]
+        connect = _RecordingConnect(lambda _index: live_tape)
+        runner = _FakeStreamRunner()
+        asyncio.run(self._run_until(
+            run_market_stream(
+                runner, ["tok-0"], connect=connect, idle_seconds=0.2,
+            ),
+            lambda: any(event.get("event_type") == "price_change" for event in runner.processed),
+        ))
+        self.assertEqual(len(connect.calls), 1)
+        self.assertEqual(runner.processed[-1]["event_type"], "price_change")
+
+    def test_jsonl_recorder_and_process_see_every_event(self):
+        from polywang.arbitrage_bot import run_market_stream
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "market-events.jsonl")
+            connect = _RecordingConnect(lambda _index: [
+                {"event_type": "book", "asset_id": "tok-0", "asks": [], "bids": []},
+                {
+                    "event_type": "price_change", "timestamp": "1",
+                    "price_changes": [{"asset_id": "tok-0", "price": "0.41", "size": "2", "side": "SELL"}],
+                },
+            ])
+            runner = _FakeStreamRunner()
+            with mock.patch.dict(os.environ, {"MARKET_EVENT_LOG": path}, clear=False):
+                asyncio.run(self._run_until(
+                    run_market_stream(runner, ["tok-0"], connect=connect, idle_seconds=3600.0),
+                    lambda: os.path.isfile(path) and sum(1 for _line in open(path, encoding="utf-8")) >= 2,
+                ))
+            with open(path, encoding="utf-8") as handle:
+                rows = [json.loads(line) for line in handle if line.strip()]
+            self.assertEqual([row["event_type"] for row in rows], ["book", "price_change"])
+            self.assertEqual(rows[0]["source"], "market")
+            self.assertEqual([event["event_type"] for event in runner.processed], ["book", "price_change"])
+
+    def test_invalidate_books_only_drops_the_reconnecting_shard(self):
+        from polywang.arbitrage_core import OrderBook
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ, {"WHALE_STATE_PATH": ""}, clear=False,
+        ):
+            first = BinaryMarket("m1", "c1", "One", "yes-a", "no-a")
+            second = BinaryMarket("m2", "c2", "Two", "yes-b", "no-b")
+            runner = PaperMarketRunner(
+                [first, second], os.path.join(directory, "ledger.json"), 100.0,
+                BinaryArbitrageScanner(),
+            )
+            for token_id in ("yes-a", "no-a", "yes-b", "no-b"):
+                book = OrderBook()
+                book.asks = {0.40: 10.0}
+                book.synced = True
+                runner.books[token_id] = book
+            runner.invalidate_books(["yes-a", "no-a"])
+            self.assertFalse(runner.books["yes-a"].synced)
+            self.assertFalse(runner.books["no-a"].synced)
+            self.assertTrue(runner.books["yes-b"].synced)
+            self.assertTrue(runner.books["no-b"].synced)
 
 
 if __name__ == "__main__":
