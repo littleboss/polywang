@@ -45,7 +45,7 @@ live 或 paper 运行时设置 `MARKET_EVENT_LOG=market-events.jsonl` 可记录�
 uv run polywang --markets 100 --cash 1000
 ```
 
-它只研究 Yes 和 No 两腿同时买入后合计支付 1.00 的二元市场。选市会先拉一个按成交量过滤的候选池（`MARKET_SCAN_POOL`），再按「1 tick 错价扣完 taker 费后是否仍为正」排序，所以 geopolitics 和极端价位会排在 0.50 附近的高费率市场前面。NegRisk 多结果市场默认只观测、不走双腿 FOK；独立 n 腿路径见下方开关。机会必须使用订单簿中的实际 ask 和深度，并覆盖两腿 taker 费用、可选 merge gas（`MERGE_GAS_USD`）、资金安全缓冲和最大仓位；纸面成交写入 `paper-ledger.json`，程序重启后会恢复账本。两腿仍是顺序 FOK，不是原子交易，`is_risk_free` 恒为 false。小额阶段保持 `AUTO_MERGE_COMPLETE_SETS=0`：merge gas 是固定成本，未实测就填 0 并打开自动 merge 会把亏损单显示成盈利。
+它只研究 Yes 和 No 两腿同时买入后合计支付 1.00 的二元市场。选市会先拉一个按成交量过滤的候选池（`MARKET_SCAN_POOL`），再按 **最低 yes_ask+no_ask** 排序（Gamma `outcomePrices` 作抓取代理，有盘口后用 live touch）。总和相同时优先 geopolitics（费率 0）。不再把 longshot 的 1-tick 理论（`ticks_to_breakeven` / `one_tick_net`）当作主排序。纸面 NegRisk 独立 n 腿路径默认打开（`ENABLE_NEGRISK_EXECUTION` 未设置即为开，`ENABLE_NEGRISK_LIVE` 保持未设置），账本写入 `paper-negrisk.json`，不会写 `live-orders.json`。机会必须使用订单簿中的实际 ask 和深度，并覆盖两腿 taker 费用、可选 merge gas（`MERGE_GAS_USD`）、资金安全缓冲和最大仓位；纸面成交写入 `paper-ledger.json`，程序重启后会恢复账本。两腿仍是顺序 FOK，不是原子交易，`is_risk_free` 恒为 false。小额阶段保持 `AUTO_MERGE_COMPLETE_SETS=0`：merge gas 是固定成本，未实测就填 0 并打开自动 merge 会把亏损单显示成盈利。
 
 新引擎只有在显式设置 `POLYMARKET_LIVE_CONFIRM=I_UNDERSTAND_THE_RISK`、官方 geoblock 放行、私钥存在且安装了 live extra 时，才会使用两腿 FOK 执行器：
 
@@ -166,9 +166,10 @@ fee = 股数 × 费率 × p × (1 - p)      # 只对 taker 收取，maker 免费
 unwind。这条路径**默认关闭**，也**不会**调用二元 `merge_positions`。
 
 ```bash
-ENABLE_NEGRISK_EXECUTION=1   # paper 即可执行
-ENABLE_NEGRISK_LIVE=1        # 实盘还要这一条
-NEGRISK_MARKET_LIMIT=10
+ENABLE_NEGRISK_EXECUTION=1   # paper 默认未设置即为开
+# ENABLE_NEGRISK_LIVE 保持未设置；实盘才显式设 1
+NEGRISK_MARKET_LIMIT=20
+PAPER_NEGRISK_JOURNAL=paper-negrisk.json
 ```
 
 只接受 Gamma 里已经列全的字段：一张 n 结果市场，或带齐 `markets[]` 子市场的
@@ -177,7 +178,8 @@ event。成交量池里散落的 `negRisk` 二元行不会在本地拼场；打�
 NO token 时才执行。组装后默认不 convert（`AUTO_CONVERT_NEGRISK=0`，0.6.0 没有
 `convert_positions`）。市场判定后进入 `RESOLVED_PENDING_REDEMPTION`，对每个
 child condition 调用 `redeem_positions`，确认后才 `SETTLED`。未完成篮子重启
-halt；已组装或待赎回库存计入暴露，写入 `live-negrisk.json`。
+halt；已组装或待赎回库存计入暴露。纸面写入 `paper-negrisk.json`，实盘写入
+`live-negrisk.json`，都不会写进 `live-orders.json`。
 
 二元组合套利另有可选 Maker/GTC（`ENABLE_MAKER_GTC=0`）：扫描按 0 费率，两腿
 `post_only` 限价挂着，超时撤单并对单边成交 FAK unwind。默认关闭。不要给

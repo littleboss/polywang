@@ -32,7 +32,7 @@ uv run polywang --status --live-journal live-orders.json \
 
 ## 首次小额实盘
 
-选市不再只按 24h 成交量。程序先拉一个更大的活跃市场池（`MARKET_SCAN_POOL`，默认 `max(limit×5, 100)`），再按 **1 tick 错价在扣完 taker 费后还剩多少** 排序：geopolitics（0 费率）和已经走到 0.90+ 的市场排在 0.50 附近的 politics 前面。NegRisk 多结果市场默认只记日志，**不会**进入双腿 FOK。若要走独立的 n 腿完整集合路径，必须另外打开 `ENABLE_NEGRISK_EXECUTION`（实盘还要 `ENABLE_NEGRISK_LIVE`），见下文。
+选市不再只按 24h 成交量。程序先拉一个更大的活跃市场池（`MARKET_SCAN_POOL`，默认 `max(limit×5, 100)`），再按 **最低 yes_ask+no_ask** 排序（抓取时用 Gamma `outcomePrices`，有盘口后用 live touch）。总和相同时优先 geopolitics（费率 0）。不再把 longshot 的 1-tick 理论排在前面。纸面 NegRisk 独立 n 腿路径默认打开（`ENABLE_NEGRISK_EXECUTION` 未设置即为开），账本是 `paper-negrisk.json`。实盘 NegRisk 仍要显式 `ENABLE_NEGRISK_LIVE`，见下文。二元组合套利的 Policy Gate / 风险闸门 fail-closed 行为不变。
 
 建议从极小的 `MAX_ORDER_USD`、单市场暴露和总暴露开始，并保留默认的 `LIVE_MAX_BOOK_LEVELS=1`。**小额阶段请保持 `AUTO_MERGE_COMPLETE_SETS=0`**：merge 的 gas 是固定成本，`$5` 单子上 `$0.30` gas 就会把 1 tick 的 geopolitics 利润吃掉。只有你实测过一笔 merge 的链上费用后，才把数字填进 `MERGE_GAS_USD` 并打开自动 merge。扫描净收益已经会减掉这个数字；填 `0` 同时又开 merge，等于把成本藏起来。
 
@@ -128,14 +128,14 @@ ENABLE_CRYPTO_LIVE=1
 
 ```bash
 ENABLE_NEGRISK_EXECUTION=1
-ENABLE_NEGRISK_LIVE=1          # 仅实盘需要
-NEGRISK_MARKET_LIMIT=10
+# ENABLE_NEGRISK_LIVE=1        # 仅实盘需要；纸面保持未设置
+NEGRISK_MARKET_LIMIT=20
 LIVE_MAX_OPEN_NEGRISK=2
 AUTO_CONVERT_NEGRISK=0         # 保持关闭：polymarket-client 0.6.0 没有 convert_positions
 AUTO_REDEEM_RESOLVED_POSITIONS=1
 ```
 
-成交量池里散落的 `negRisk` 二元行**不会**在本地拼成完整集合。打开执行后，程序只用它们当 Gamma event 的查找键（`events[].id` / `eventId` / `eventSlug`），再去拉带齐 `markets[]` 的完整 event。拉不到就跳过，缺腿就是方向性敞口。账本是 `live-negrisk.json`，和 `live-orders.json` 分开。
+成交量池里散落的 `negRisk` 二元行**不会**在本地拼成完整集合。打开执行后，程序只用它们当 Gamma event 的查找键（`events[].id` / `eventId` / `eventSlug`），再去拉带齐 `markets[]` 的完整 event。拉不到就跳过，缺腿就是方向性敞口。纸面账本是 `paper-negrisk.json`，实盘账本是 `live-negrisk.json`，都和 `live-orders.json` 分开。
 
 市场 resolution 后篮子进入 `RESOLVED_PENDING_REDEMPTION`，对账会对每个 child `condition_id` 调用官方 `redeem_positions`；输家腿余额可以为 0。确认后才变成 `SETTLED` 并释放风险预算。`ASSEMBLED` / `RESOLVED_PENDING_REDEMPTION` / `CONVERT_SUBMITTED` 在启动时不 halt（稳定库存）；未完成或未知结果仍 halt。
 

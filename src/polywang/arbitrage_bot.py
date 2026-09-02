@@ -29,7 +29,7 @@ from .macro_model import JsonlMacroFeed, MacroEventModel, MacroRelease
 from .crypto_model import CryptoObservation, CryptoStatArbModel, JsonlCryptoFeed
 from .polymarket_edge import (
     CalibrationTracker, EdgeEvaluator, NegRiskScanner,
-    combo_arb_universe_score, merge_gas_startup_warning, rank_combo_arb_markets,
+    combo_arb_universe_score, combo_ask_sum, merge_gas_startup_warning, rank_combo_arb_markets,
 )
 from .negrisk import (
     LiveNegRiskJournal,
@@ -205,6 +205,21 @@ def env_bool(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def resolve_negrisk_journal_path(live: bool, explicit: str = "") -> str:
+    """Paper NegRisk journal is never live-orders.json."""
+    if explicit and str(explicit).strip():
+        path = str(explicit).strip()
+    elif live:
+        path = (os.getenv("LIVE_NEGRISK_JOURNAL") or "live-negrisk.json").strip()
+    else:
+        path = (os.getenv("PAPER_NEGRISK_JOURNAL") or "paper-negrisk.json").strip()
+    if not path:
+        path = "live-negrisk.json" if live else "paper-negrisk.json"
+    if not live and os.path.basename(path) == "live-orders.json":
+        raise ValueError("paper NegRisk journal must not be live-orders.json")
+    return path
+
+
 def load_dotenv(path: str = "") -> None:
     """Load KEY=VALUE pairs from a local .env without overriding the process env."""
     dotenv_path = path or os.getenv("DOTENV_PATH", ".env")
@@ -235,7 +250,7 @@ def write_health(path: str, payload: dict) -> None:
 
 
 def fetch_markets(limit: int, *, get=None, pool: Optional[int] = None) -> List[BinaryMarket]:
-    """Fetch a volume-ordered pool, then keep the binary markets closest to combo-arb breakeven."""
+    """Fetch a volume-ordered pool, then keep the binary markets with the lowest yes+no ask sum."""
     binary, _negrisk = fetch_universe(limit, get=get, pool=pool, negrisk_limit=0)
     return binary
 
@@ -286,10 +301,13 @@ def fetch_universe(limit: int, *, get=None, pool: Optional[int] = None,
             head.category, head.implied_yes, tick_size=head.tick_size,
             taker_fee_rate=head.taker_fee_rate, fee_exponent=head.fee_exponent,
         )
+        combo = combo_ask_sum(head)
         LOG.info(
-            "Universe: %d binary candidates ranked, keeping %d; "
-            "top %s ticks_to_breakeven=%d one_tick_net=%.4f implied_yes=%s",
-            len(binary), len(selected), head.category, score.ticks_to_breakeven,
+            "Universe: %d binary candidates ranked by yes+no, keeping %d; "
+            "top %s combo_sum=%s ticks_to_breakeven=%d one_tick_net=%.4f implied_yes=%s",
+            len(binary), len(selected), head.category,
+            "unknown" if combo is None else f"{combo:.4f}",
+            score.ticks_to_breakeven,
             score.one_tick_net,
             "unknown" if head.implied_yes is None else f"{head.implied_yes:.3f}",
         )
@@ -1337,7 +1355,7 @@ def main() -> int:
     parser.add_argument("--ledger", default=os.getenv("PAPER_LEDGER", "paper-ledger.json"))
     parser.add_argument("--live-journal", default=os.getenv("LIVE_ORDER_JOURNAL", "live-orders.json"))
     parser.add_argument("--directional-journal", default=os.getenv("LIVE_DIRECTIONAL_JOURNAL", "live-directional.json"))
-    parser.add_argument("--negrisk-journal", default=os.getenv("LIVE_NEGRISK_JOURNAL", "live-negrisk.json"))
+    parser.add_argument("--negrisk-journal", default="", help="NegRisk journal path. Paper defaults to paper-negrisk.json, never live-orders.json")
     parser.add_argument("--health", action="store_true", help="Print the local health snapshot and exit")
     parser.add_argument("--status", action="store_true", help="Print the local live journal summary and exit")
     parser.add_argument("--cash", type=float, default=env_float("PAPER_CASH", 1000.0))
@@ -1348,6 +1366,14 @@ def main() -> int:
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    try:
+        if args.status and not args.negrisk_journal:
+            args.negrisk_journal = os.getenv("LIVE_NEGRISK_JOURNAL") or "live-negrisk.json"
+        else:
+            args.negrisk_journal = resolve_negrisk_journal_path(args.live, args.negrisk_journal)
+    except ValueError as error:
+        LOG.error("%s", error)
+        return 2
     health_path = os.getenv("LIVE_HEALTH_PATH", "live-health.json")
     if args.health:
         if not os.path.isfile(health_path):
@@ -1372,7 +1398,7 @@ def main() -> int:
         return 2
 
     want_negrisk = negrisk_execution_enabled(args.live)
-    negrisk_limit = env_int("NEGRISK_MARKET_LIMIT", 10) if want_negrisk else 0
+    negrisk_limit = env_int("NEGRISK_MARKET_LIMIT", 20) if want_negrisk else 0
     markets, negrisk_markets = fetch_universe(args.markets, negrisk_limit=negrisk_limit)
     if not markets:
         LOG.error("No active binary markets with Yes/No token IDs were found")

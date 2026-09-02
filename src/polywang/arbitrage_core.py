@@ -53,8 +53,8 @@ def _json_list(value):
     return value if isinstance(value, list) else []
 
 
-def _gamma_yes_price(payload: dict, outcomes: Optional[list] = None) -> Optional[float]:
-    """Best-effort Yes probability from a Gamma market object. Missing is None."""
+def _gamma_named_price(payload: dict, outcomes: Optional[list], name: str) -> Optional[float]:
+    """Best-effort Yes/No price from Gamma outcomePrices. Missing is None."""
     names = outcomes if outcomes is not None else _json_list(payload.get("outcomes"))
     prices = _json_list(payload.get("outcomePrices", payload.get("outcome_prices")))
     if len(names) != 2 or len(prices) != 2:
@@ -66,10 +66,20 @@ def _gamma_yes_price(payload: dict, outcomes: Optional[list] = None) -> Optional
         }
     except (TypeError, ValueError):
         return None
-    price = by_outcome.get("yes")
+    price = by_outcome.get(str(name).strip().lower())
     if price is None or not math.isfinite(price) or not (0.0 < price < 1.0):
         return None
     return price
+
+
+def _gamma_yes_price(payload: dict, outcomes: Optional[list] = None) -> Optional[float]:
+    """Best-effort Yes probability from a Gamma market object. Missing is None."""
+    return _gamma_named_price(payload, outcomes, "yes")
+
+
+def _gamma_no_price(payload: dict, outcomes: Optional[list] = None) -> Optional[float]:
+    """Best-effort No price from Gamma outcomePrices. Missing is None."""
+    return _gamma_named_price(payload, outcomes, "no")
 
 
 def _gamma_outcome_prices(payload: dict) -> Optional[Dict[str, float]]:
@@ -147,6 +157,7 @@ class BinaryMarket:
     fee_exponent: float = 1.0
     fees_enabled: bool = True
     implied_yes: Optional[float] = None
+    implied_no: Optional[float] = None
 
     @classmethod
     def from_gamma(cls, payload: dict) -> Optional["BinaryMarket"]:
@@ -228,6 +239,7 @@ class BinaryMarket:
             # charging it the category rate would reject entries that are free.
             fees_enabled=_as_bool(payload.get("feesEnabled", payload.get("fees_enabled", True)), True),
             implied_yes=_gamma_yes_price(payload, outcomes),
+            implied_no=_gamma_no_price(payload, outcomes),
         )
 
 
