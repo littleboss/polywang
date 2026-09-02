@@ -72,6 +72,9 @@ GAMMA_URL = "https://gamma-api.polymarket.com/markets"
 MARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 CLOB_REST_URL = "https://clob.polymarket.com"
 CLOB_BOOK_URL = f"{CLOB_REST_URL}/book"
+# Official py-clob-client: GET_ORDER_BOOKS="/books"; get_order_books POSTs
+# [{"token_id": ...}, ...]. Live probe: POST /books → 200; GET /books → 400.
+CLOB_BOOKS_URL = f"{CLOB_REST_URL}/books"
 # Empirical: a single CLOB market socket that subscribed 200 assets_ids stayed
 # ESTAB after the initial book dump and never emitted price_change / deltas.
 # Official docs do not publish a hard cap; keep each subscribe at this bound.
@@ -84,12 +87,16 @@ MARKET_WS_IDLE_RECONNECT_SECONDS = 15.0
 MARKET_WS_PING_INTERVAL = 10
 MARKET_WS_PING_TIMEOUT = 10
 MARKET_WS_CLOSE_TIMEOUT = 5
-# Paper-only REST fallback. Keep each subscribed token fresh enough that
-# MAX_BOOK_AGE_SECONDS=5 does not mark a live REST snapshot stale_book.
+# Paper-only REST fallback. One POST /books covers the 240-token paper
+# universe in a single RTT (≪4s). Serial GET /book at 40 rps is ~6s and
+# exceeds MAX_BOOK_AGE_SECONDS=5 — do not use that as the paper path.
 PAPER_REST_BOOK_CADENCE_SECONDS = 2.0
-PAPER_REST_BOOK_MAX_RPS = 40.0
-PAPER_REST_BOOK_CONCURRENCY = 10
+PAPER_REST_BOOK_MAX_RPS = 4.0
+PAPER_REST_BOOK_CONCURRENCY = 2
 PAPER_REST_BOOK_TIMEOUT_SECONDS = 5.0
+PAPER_REST_BOOK_BATCH_SIZE = 240
+PAPER_REST_BOOK_SKIP_FRESH_SECONDS = 2.0
+PAPER_REST_BOOK_MAX_ROUND_SECONDS = 4.0
 # Incremental / delta types that prove the tape is alive after the snapshot dump.
 MARKET_WS_INCREMENTAL_EVENT_TYPES = frozenset({
     "price_change",
@@ -198,6 +205,10 @@ class RestRateLimitError(Exception):
     def __init__(self, retry_after: float = 1.0):
         self.retry_after = max(0.0, float(retry_after))
         super().__init__(f"CLOB REST rate limited; retry after {self.retry_after:.1f}s")
+
+
+class RestBooksUnavailable(Exception):
+    """POST /books is missing; paper may fall back to GET /book."""
 
 
 def env_float(name: str, default: float) -> float:
@@ -818,6 +829,53 @@ def clob_book_to_event(token_id: str, payload: dict, *, now_ms: Optional[int] = 
     return event
 
 
+def clob_books_request_body(token_ids: Iterable[str]) -> List[dict]:
+    """Body for official POST /books — same shape as py-clob-client.get_order_books."""
+    return [{"token_id": str(token_id)} for token_id in token_ids if str(token_id)]
+
+
+def tokens_needing_rest_book(
+    runner,
+    token_ids: Iterable[str],
+    *,
+    now_ms: Optional[int] = None,
+    fresh_seconds: float = PAPER_REST_BOOK_SKIP_FRESH_SECONDS,
+) -> List[str]:
+    """Skip tokens whose local book age is already under `fresh_seconds`."""
+    received_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+    fresh_ms = max(0.0, float(fresh_seconds)) * 1000.0
+    books = getattr(runner, "books", None) or {}
+    needed: List[str] = []
+    for token_id in token_ids:
+        tid = str(token_id)
+        if not tid:
+            continue
+        book = books.get(tid)
+        if book is None or not getattr(book, "synced", False):
+            needed.append(tid)
+            continue
+        timestamp_ms = int(getattr(book, "timestamp_ms", 0) or 0)
+        if timestamp_ms <= 0 or received_ms - timestamp_ms >= fresh_ms:
+            needed.append(tid)
+    return needed
+
+
+def _clob_rest_retry_after(response) -> float:
+    raw = response.headers.get("Retry-After") if response is not None else None
+    try:
+        return float(raw) if raw not in (None, "") else 1.0
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def _raise_for_clob_rest(response, *, batch: bool = False) -> None:
+    if response.status_code == 429:
+        raise RestRateLimitError(_clob_rest_retry_after(response))
+    if batch and response.status_code == 404:
+        raise RestBooksUnavailable("POST /books returned 404")
+    response.raise_for_status()
+
+
 def _http_get_clob_book(token_id: str, session: Optional[requests.Session] = None) -> dict:
     """GET /book?token_id= — paper observation only, never places an order."""
     client = session if session is not None else requests
@@ -826,18 +884,47 @@ def _http_get_clob_book(token_id: str, session: Optional[requests.Session] = Non
         params={"token_id": str(token_id)},
         timeout=PAPER_REST_BOOK_TIMEOUT_SECONDS,
     )
-    if response.status_code == 429:
-        raw = response.headers.get("Retry-After")
-        try:
-            retry_after = float(raw) if raw not in (None, "") else 1.0
-        except (TypeError, ValueError):
-            retry_after = 1.0
-        raise RestRateLimitError(retry_after)
-    response.raise_for_status()
+    _raise_for_clob_rest(response)
     payload = response.json()
     if not isinstance(payload, dict):
         raise ValueError("CLOB /book did not return an object")
     return payload
+
+
+def _http_post_clob_books(token_ids: Iterable[str],
+                          session: Optional[requests.Session] = None) -> List[dict]:
+    """POST /books with [{token_id}] — paper observation only, never places an order."""
+    body = clob_books_request_body(token_ids)
+    if not body:
+        return []
+    client = session if session is not None else requests
+    response = client.post(
+        CLOB_BOOKS_URL,
+        json=body,
+        timeout=PAPER_REST_BOOK_TIMEOUT_SECONDS,
+    )
+    _raise_for_clob_rest(response, batch=True)
+    payload = response.json()
+    if isinstance(payload, list):
+        return [row for row in payload if isinstance(row, dict)]
+    if isinstance(payload, dict):
+        rows = payload.get("data") or payload.get("books") or []
+        if isinstance(rows, list):
+            return [row for row in rows if isinstance(row, dict)]
+    raise ValueError("CLOB POST /books did not return a list of books")
+
+
+def _default_paper_get_books(session: requests.Session):
+    """Prefer verified POST /books; fall back to GET /book only if /books is gone."""
+
+    def get_books(token_ids: List[str]) -> List[dict]:
+        try:
+            return _http_post_clob_books(token_ids, session)
+        except RestBooksUnavailable:
+            LOG.warning("Paper REST POST /books unavailable; falling back to GET /book")
+            return [_http_get_clob_book(token_id, session) for token_id in token_ids]
+
+    return get_books
 
 
 class _RequestLimiter:
@@ -1120,36 +1207,106 @@ async def _run_market_stream_shard(
             backoff = min(backoff * 2.0, 30.0)
 
 
-async def _inject_rest_book(
+async def _inject_rest_book_event(
     runner: PaperMarketRunner,
     recorder: JsonlEventRecorder,
     lock: asyncio.Lock,
     token_id: str,
-    get_book,
-    limiter: _RequestLimiter,
+    payload: dict,
 ) -> None:
-    delay = 0.25
-    payload = None
-    for _attempt in range(5):
-        await limiter.wait()
-        try:
-            payload = await asyncio.to_thread(get_book, token_id)
-            break
-        except RestRateLimitError as error:
-            wait = error.retry_after if error.retry_after > 0 else delay
-            LOG.warning("Paper REST /book hit 429; backing off %.1fs", wait)
-            limiter.backoff(wait)
-            await asyncio.sleep(wait)
-            delay = min(delay * 2.0, 8.0)
-        except Exception as error:
-            LOG.warning("Paper REST /book token failed: %s", error)
-            return
     if not isinstance(payload, dict):
         return
     event = clob_book_to_event(token_id, payload)
     async with lock:
         recorder.record(event)
         await runner.process(event)
+
+
+async def _fetch_rest_books_chunk(
+    chunk: List[str],
+    get_books,
+    get_book,
+    limiter: _RequestLimiter,
+) -> List[dict]:
+    delay = 0.25
+    for _attempt in range(5):
+        await limiter.wait()
+        try:
+            if get_books is not None:
+                rows = await asyncio.to_thread(get_books, chunk)
+            else:
+                rows = []
+                for token_id in chunk:
+                    rows.append(await asyncio.to_thread(get_book, token_id))
+            if isinstance(rows, list):
+                return [row for row in rows if isinstance(row, dict)]
+            return []
+        except RestRateLimitError as error:
+            wait = error.retry_after if error.retry_after > 0 else delay
+            LOG.warning("Paper REST /books hit 429; backing off %.2fs", wait)
+            limiter.backoff(wait)
+            await asyncio.sleep(wait)
+            delay = min(delay * 2.0, 8.0)
+        except Exception as error:
+            LOG.warning("Paper REST /books chunk failed: %s", error)
+            return []
+    return []
+
+
+async def paper_rest_book_round(
+    runner: PaperMarketRunner,
+    token_ids: List[str],
+    recorder: JsonlEventRecorder,
+    lock: asyncio.Lock,
+    *,
+    get_books=None,
+    get_book=None,
+    batch_size: int = PAPER_REST_BOOK_BATCH_SIZE,
+    skip_fresh_seconds: float = PAPER_REST_BOOK_SKIP_FRESH_SECONDS,
+    max_rps: float = PAPER_REST_BOOK_MAX_RPS,
+    limiter: Optional[_RequestLimiter] = None,
+) -> dict:
+    """Refresh stale paper books via POST /books. One 240-token batch is one RTT."""
+    ids = [str(token_id) for token_id in token_ids if str(token_id)]
+    wanted = tokens_needing_rest_book(runner, ids, fresh_seconds=skip_fresh_seconds)
+    started = time.monotonic()
+    if not wanted:
+        return {"tokens": 0, "requests": 0, "elapsed": 0.0, "path": "skip"}
+    if get_books is None and get_book is None:
+        raise ValueError("paper REST round needs get_books or get_book")
+    size = max(1, int(batch_size))
+    chunks = chunk_asset_ids(wanted, size)
+    rate = limiter or _RequestLimiter(max_rps)
+    injected = 0
+    requests = 0
+    path = "books" if get_books is not None else "book"
+    for chunk in chunks:
+        rows = await _fetch_rest_books_chunk(chunk, get_books, get_book, rate)
+        requests += 1 if get_books is not None else max(1, len(chunk))
+        if get_books is None and get_book is not None:
+            paired = list(zip(chunk, rows))
+        else:
+            by_asset = {}
+            for row in rows:
+                asset_id = str(row.get("asset_id") or row.get("token_id") or "")
+                if asset_id:
+                    by_asset[asset_id] = row
+            paired = [
+                (token_id, by_asset[token_id])
+                for token_id in chunk
+                if token_id in by_asset
+            ]
+        for token_id, payload in paired:
+            await _inject_rest_book_event(runner, recorder, lock, token_id, payload)
+            injected += 1
+    elapsed = time.monotonic() - started
+    if elapsed >= PAPER_REST_BOOK_MAX_ROUND_SECONDS:
+        LOG.warning(
+            "Paper REST /books round took %.2fs for %d tokens (%d request(s)); "
+            "target is <%ds so MAX_BOOK_AGE_SECONDS=5 stays clear",
+            elapsed, injected, requests, int(PAPER_REST_BOOK_MAX_ROUND_SECONDS),
+        )
+    return {"tokens": injected, "requests": requests, "elapsed": elapsed, "path": path}
 
 
 async def run_paper_rest_book_poll(
@@ -1159,38 +1316,41 @@ async def run_paper_rest_book_poll(
     lock: asyncio.Lock,
     *,
     get_book=None,
+    get_books=None,
     cadence_seconds: float = PAPER_REST_BOOK_CADENCE_SECONDS,
     max_rps: float = PAPER_REST_BOOK_MAX_RPS,
     concurrency: int = PAPER_REST_BOOK_CONCURRENCY,
+    batch_size: int = PAPER_REST_BOOK_BATCH_SIZE,
+    skip_fresh_seconds: float = PAPER_REST_BOOK_SKIP_FRESH_SECONDS,
 ) -> None:
-    """Paper-only CLOB GET /book poll. Does not place orders. Live WS stays fail-closed."""
+    """Paper-only CLOB POST /books poll. Does not place orders. Live WS stays fail-closed."""
     ids = [str(token_id) for token_id in token_ids if str(token_id)]
     if not ids:
         return
     session = None
-    getter = get_book
-    if getter is None:
+    batch_getter = get_books
+    single_getter = get_book
+    if batch_getter is None and single_getter is None:
         session = requests.Session()
-        getter = lambda token_id, _session=session: _http_get_clob_book(token_id, _session)
+        batch_getter = _default_paper_get_books(session)
     cadence = max(0.1, float(cadence_seconds))
-    workers = max(1, int(concurrency))
     limiter = _RequestLimiter(max_rps)
     LOG.info(
-        "Paper REST /book poller watching %d tokens (cadence=%.1fs max_rps=%.1f concurrency=%d)",
-        len(ids), cadence, max_rps, workers,
+        "Paper REST /books poller watching %d tokens (batch=%d cadence=%.1fs skip_fresh=%.1fs)",
+        len(ids), max(1, int(batch_size)), cadence, skip_fresh_seconds,
     )
     try:
         while True:
-            cycle_started = time.monotonic()
-            semaphore = asyncio.Semaphore(workers)
-
-            async def bounded(token_id: str):
-                async with semaphore:
-                    await _inject_rest_book(runner, recorder, lock, token_id, getter, limiter)
-
-            await asyncio.gather(*[bounded(token_id) for token_id in ids], return_exceptions=True)
-            elapsed = time.monotonic() - cycle_started
-            wait = cadence - elapsed
+            stats = await paper_rest_book_round(
+                runner, ids, recorder, lock,
+                get_books=batch_getter,
+                get_book=single_getter,
+                batch_size=batch_size,
+                skip_fresh_seconds=skip_fresh_seconds,
+                max_rps=max_rps,
+                limiter=limiter,
+            )
+            wait = cadence - float(stats.get("elapsed") or 0.0)
             if wait > 0:
                 await asyncio.sleep(wait)
     except asyncio.CancelledError:
@@ -1214,9 +1374,11 @@ async def run_market_stream(
     text_ping_timeout: float = MARKET_WS_PING_TIMEOUT,
     enable_rest_books: Optional[bool] = None,
     rest_get_book=None,
+    rest_get_books=None,
     rest_cadence_seconds: float = PAPER_REST_BOOK_CADENCE_SECONDS,
     rest_max_rps: float = PAPER_REST_BOOK_MAX_RPS,
     rest_concurrency: int = PAPER_REST_BOOK_CONCURRENCY,
+    rest_batch_size: int = PAPER_REST_BOOK_BATCH_SIZE,
 ) -> None:
     injected_connect = connect is not None
     if connect is None:
@@ -1226,7 +1388,7 @@ async def run_market_stream(
             raise SystemExit("Install websockets for the paper market stream: uv sync") from error
         connect = websockets.connect
     if enable_rest_books is None:
-        enable_rest_books = rest_get_book is not None or (
+        enable_rest_books = rest_get_book is not None or rest_get_books is not None or (
             not injected_connect and env_bool("ENABLE_PAPER_REST_BOOK", True)
         )
 
@@ -1266,9 +1428,11 @@ async def run_market_stream(
             rest_recorder,
             lock,
             get_book=rest_get_book,
+            get_books=rest_get_books,
             cadence_seconds=rest_cadence_seconds,
             max_rps=rest_max_rps,
             concurrency=rest_concurrency,
+            batch_size=rest_batch_size,
         ))
     await asyncio.gather(*tasks)
 

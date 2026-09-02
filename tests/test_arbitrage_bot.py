@@ -1021,6 +1021,131 @@ class MarketStreamSubscribeTests(unittest.TestCase):
             _http_get_clob_book("tok-1", session)
         self.assertAlmostEqual(raised.exception.retry_after, 1.5)
 
+    def test_http_post_clob_books_uses_official_batch_body(self):
+        from polywang.arbitrage_bot import (
+            CLOB_BOOKS_URL, RestBooksUnavailable, RestRateLimitError,
+            clob_books_request_body, _http_post_clob_books,
+        )
+
+        class Response:
+            def __init__(self, status_code, payload=None, headers=None):
+                self.status_code = status_code
+                self._payload = payload if payload is not None else []
+                self.headers = headers or {}
+
+            def raise_for_status(self):
+                if self.status_code >= 400 and self.status_code not in {404, 429}:
+                    raise RuntimeError(f"http {self.status_code}")
+
+            def json(self):
+                return self._payload
+
+        class Session:
+            def __init__(self):
+                self.calls = []
+                self.next = Response(200, [
+                    {"asset_id": "a", "asks": [], "bids": []},
+                    {"asset_id": "b", "asks": [], "bids": []},
+                ])
+
+            def post(self, url, json=None, timeout=None):
+                self.calls.append({"url": url, "json": list(json or []), "timeout": timeout})
+                return self.next
+
+        self.assertEqual(clob_books_request_body(["a", "b"]), [
+            {"token_id": "a"}, {"token_id": "b"},
+        ])
+        session = Session()
+        rows = _http_post_clob_books(["a", "b"], session)
+        self.assertEqual(session.calls[0]["url"], CLOB_BOOKS_URL)
+        self.assertEqual(session.calls[0]["json"], [{"token_id": "a"}, {"token_id": "b"}])
+        self.assertEqual([row["asset_id"] for row in rows], ["a", "b"])
+        session.next = Response(429, headers={"Retry-After": "2"})
+        with self.assertRaises(RestRateLimitError):
+            _http_post_clob_books(["a"], session)
+        session.next = Response(404, {"error": "missing"})
+        with self.assertRaises(RestBooksUnavailable):
+            _http_post_clob_books(["a"], session)
+
+    def test_240_token_rest_round_uses_batch_books_under_4s(self):
+        from polywang.arbitrage_bot import paper_rest_book_round
+        from polywang.market_replay import JsonlEventRecorder
+
+        token_ids = [f"tok-{index}" for index in range(240)]
+        calls = []
+
+        def get_books(batch):
+            calls.append(list(batch))
+            return [
+                {
+                    "asset_id": token_id,
+                    "asks": [{"price": "0.41", "size": "2"}],
+                    "bids": [{"price": "0.39", "size": "2"}],
+                }
+                for token_id in batch
+            ]
+
+        runner = _FakeStreamRunner()
+        recorder = JsonlEventRecorder("", source="rest-book")
+        started = time.monotonic()
+        stats = asyncio.run(paper_rest_book_round(
+            runner, token_ids, recorder, asyncio.Lock(),
+            get_books=get_books,
+            batch_size=240,
+            skip_fresh_seconds=0.0,
+            max_rps=100.0,
+        ))
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 4.0)
+        self.assertLess(stats["elapsed"], 4.0)
+        self.assertEqual(stats["path"], "books")
+        self.assertEqual(stats["requests"], 1)
+        self.assertEqual(stats["tokens"], 240)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls[0]), 240)
+        self.assertEqual(calls[0], token_ids)
+        self.assertEqual(len(runner.processed), 240)
+        self.assertTrue(all(event.get("source") == "rest-book" for event in runner.processed))
+        self.assertTrue(all(event.get("event_type") == "book" for event in runner.processed))
+
+    def test_rest_round_skips_books_fresher_than_2s(self):
+        from polywang.arbitrage_bot import paper_rest_book_round, tokens_needing_rest_book
+        from polywang.arbitrage_core import OrderBook
+        from polywang.market_replay import JsonlEventRecorder
+
+        now_ms = int(time.time() * 1000)
+        runner = _FakeStreamRunner()
+        runner.books = {}
+        fresh = OrderBook()
+        fresh.synced = True
+        fresh.timestamp_ms = now_ms - 500
+        stale = OrderBook()
+        stale.synced = True
+        stale.timestamp_ms = now_ms - 10_000
+        runner.books["fresh"] = fresh
+        runner.books["stale"] = stale
+        self.assertEqual(
+            tokens_needing_rest_book(runner, ["fresh", "stale"], now_ms=now_ms, fresh_seconds=2.0),
+            ["stale"],
+        )
+
+        calls = []
+
+        def get_books(batch):
+            calls.append(list(batch))
+            return [{"asset_id": token_id, "asks": [], "bids": []} for token_id in batch]
+
+        stats = asyncio.run(paper_rest_book_round(
+            runner, ["fresh", "stale"],
+            JsonlEventRecorder(""), asyncio.Lock(),
+            get_books=get_books,
+            skip_fresh_seconds=2.0,
+            max_rps=100.0,
+        ))
+        self.assertEqual(calls, [["stale"]])
+        self.assertEqual(stats["tokens"], 1)
+        self.assertEqual(stats["requests"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
