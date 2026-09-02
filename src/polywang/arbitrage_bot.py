@@ -285,6 +285,37 @@ def fetch_markets(limit: int, *, get=None, pool: Optional[int] = None) -> List[B
     return binary
 
 
+def drop_binary_markets_overlapping_negrisk(
+    markets: Iterable[BinaryMarket],
+    negrisk_markets: Optional[Iterable[NegRiskMarket]] = None,
+) -> List[BinaryMarket]:
+    """Drop binary keep-set rows whose Gamma `market_id` is also in NegRisk.
+
+    The universe must be unique on `market_id`. When the same Gamma id is in
+    both the binary keep-set and the NegRisk keep-set, NegRisk wins: the
+    binary copy is dropped and the drop is logged. Token / condition
+    collisions across *different* market_ids are not resolved here — the
+    runner still fail-closes on those.
+    """
+    negrisk_ids = {
+        str(market.market_id)
+        for market in (negrisk_markets or [])
+        if str(getattr(market, "market_id", "") or "")
+    }
+    kept: List[BinaryMarket] = []
+    for market in markets:
+        market_id = str(market.market_id)
+        if market_id and market_id in negrisk_ids:
+            LOG.info(
+                "Universe overlap: dropping binary market_id=%s from the "
+                "keep-set; overlapping Gamma id is kept on the NegRisk path",
+                market_id,
+            )
+            continue
+        kept.append(market)
+    return kept
+
+
 def fetch_universe(limit: int, *, get=None, pool: Optional[int] = None,
                    negrisk_limit: int = 0, get_event=None) -> tuple:
     """Return ranked binary combo-arb markets plus complete NegRisk fields.
@@ -294,6 +325,8 @@ def fetch_universe(limit: int, *, get=None, pool: Optional[int] = None,
     because a truncated field is not a complete set. When a NegRisk limit is
     set, those binaries are used only as event-lookup keys; the complete
     field comes from a Gamma event fetch, never from local grouping.
+    The binary keep-set is unique on `market_id` versus the NegRisk keep-set:
+    an overlapping Gamma id stays on the NegRisk path and is dropped here.
     """
     getter = get or _http_get_gamma
     keep = max(1, int(limit))
@@ -324,6 +357,9 @@ def fetch_universe(limit: int, *, get=None, pool: Optional[int] = None,
         for market in negrisk:
             _log_negrisk_market(market)
     ranked = rank_combo_arb_markets(binary)
+    keep_negrisk = max(0, int(negrisk_limit))
+    selected_negrisk = negrisk[:keep_negrisk]
+    ranked = drop_binary_markets_overlapping_negrisk(ranked, selected_negrisk)
     selected = ranked[:keep]
     if selected:
         head = selected[0]
@@ -341,8 +377,6 @@ def fetch_universe(limit: int, *, get=None, pool: Optional[int] = None,
             score.one_tick_net,
             "unknown" if head.implied_yes is None else f"{head.implied_yes:.3f}",
         )
-    keep_negrisk = max(0, int(negrisk_limit))
-    selected_negrisk = negrisk[:keep_negrisk]
     if selected_negrisk:
         LOG.info(
             "NegRisk universe: %d complete fields parsed, keeping %d for the independent path",
@@ -437,6 +471,9 @@ class PaperMarketRunner:
                  negrisk_markets: Optional[List[NegRiskMarket]] = None,
                  negrisk_scanner: Optional[NegRiskBookScanner] = None,
                  negrisk_executor=None):
+        # Same Gamma id in binary + NegRisk keep-sets: NegRisk wins. True
+        # token / condition collisions across different market_ids still raise.
+        markets = drop_binary_markets_overlapping_negrisk(markets, negrisk_markets)
         seen_identifiers = {}
         for market in markets:
             for kind, value in (
