@@ -645,9 +645,9 @@ class NegRiskScanner:
 class ComboUniverseScore:
     """How many 0.01-style ticks of Yes+No mispricing a market needs after fees.
 
-    Combo arb is a discrete-tick game. Politics at 0.50 needs three ticks;
-    geopolitics and 0.95 politics need one. Ranking by this number, not by
-    volume, is what raises the chance of seeing a tradeable book.
+    Diagnostic only. Universe ranking uses combo_ask_sum (lowest yes+no),
+    not this tick distance. Politics at 0.50 still needs three ticks;
+    geopolitics and 0.95 politics need one.
     """
     ticks_to_breakeven: int
     one_tick_net: float
@@ -657,8 +657,8 @@ class ComboUniverseScore:
     price_known: bool
 
     def sort_key(self) -> tuple:
-        # Unknown mid-prices are scored at p=0.50 (worst-case fee) and sorted last
-        # among equal tick counts so we do not promote a market we cannot locate.
+        # Diagnostic only. Universe ranking uses combo_ask_sum, not tick distance.
+        # Unknown mid-prices are scored at p=0.50 (worst-case fee).
         return (
             0 if self.price_known else 1,
             self.ticks_to_breakeven,
@@ -703,19 +703,71 @@ def combo_arb_universe_score(category: str, implied_yes: Optional[float] = None,
     )
 
 
-def rank_combo_arb_markets(markets: Sequence) -> list:
-    """Stable-rank binary markets by combo-arb tick distance, then 1-tick net."""
+def _finite_positive_price(value) -> Optional[float]:
+    try:
+        price = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(price) or price <= 0.0:
+        return None
+    return price
+
+
+def combo_ask_sum(market, books: Optional[dict] = None) -> Optional[float]:
+    """Yes ask + No ask. Live book touch wins; Gamma outcomePrices is the fetch proxy.
+
+    Do not invent No as ``1 - implied_yes``. A 0.48/0.48 book sums to 0.96;
+    a 0.001/0.999 longshot already sums to 1.00.
+    """
+    yes_token = getattr(market, "yes_token_id", None)
+    no_token = getattr(market, "no_token_id", None)
+    if books and yes_token and no_token:
+        yes_book = books.get(yes_token)
+        no_book = books.get(no_token)
+        if yes_book is not None and no_book is not None:
+            yes_touch = yes_book.best_ask() if hasattr(yes_book, "best_ask") else None
+            no_touch = no_book.best_ask() if hasattr(no_book, "best_ask") else None
+            if yes_touch and no_touch:
+                yes_px = _finite_positive_price(yes_touch[0])
+                no_px = _finite_positive_price(no_touch[0])
+                if yes_px is not None and no_px is not None:
+                    return yes_px + no_px
+    yes_px = _finite_positive_price(getattr(market, "implied_yes", None))
+    no_px = _finite_positive_price(getattr(market, "implied_no", None))
+    if yes_px is None or no_px is None:
+        return None
+    return yes_px + no_px
+
+
+def combo_rank_key(market, books: Optional[dict] = None) -> tuple:
+    """Lowest combo sum first; geopolitics / fee 0 wins ties. Unknown sums last."""
+    touch = combo_ask_sum(market, books)
+    known = touch is not None
+    category = getattr(market, "category", "other") or "other"
+    fee_model = PolymarketFeeModel(
+        category,
+        taker_fee_rate=getattr(market, "taker_fee_rate", None),
+        fee_exponent=getattr(market, "fee_exponent", 1.0) or 1.0,
+        fees_enabled=bool(getattr(market, "fees_enabled", True)),
+    )
+    zero_fee = (not fee_model.fees_enabled) or fee_model.taker_fee_rate <= 1e-12
+    return (
+        0 if known else 1,
+        touch if known else 2.0,
+        0 if zero_fee else 1,
+    )
+
+
+def rank_combo_arb_markets(markets: Sequence, books: Optional[dict] = None) -> list:
+    """Stable-rank binary markets by lowest yes_ask+no_ask, then zero-fee.
+
+    Gamma ``outcomePrices`` is the fetch proxy. When ``books`` has a live
+    touch on both legs, that sum replaces the proxy. Longshot 1-tick
+    theoretical (ticks_to_breakeven / one_tick_net) is not the sort key.
+    """
     scored = []
     for index, market in enumerate(markets):
-        implied = getattr(market, "implied_yes", None)
-        score = combo_arb_universe_score(
-            getattr(market, "category", "other"),
-            implied_yes=implied,
-            tick_size=getattr(market, "tick_size", 0.01) or 0.01,
-            taker_fee_rate=getattr(market, "taker_fee_rate", None),
-            fee_exponent=getattr(market, "fee_exponent", 1.0) or 1.0,
-        )
-        scored.append((score.sort_key(), index, market, score))
+        scored.append((combo_rank_key(market, books), index, market))
     scored.sort(key=lambda item: (item[0], item[1]))
     return [item[2] for item in scored]
 

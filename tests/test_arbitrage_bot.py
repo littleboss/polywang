@@ -89,25 +89,25 @@ class SettlementMappingTests(unittest.TestCase):
 
 
 class UniverseSelectionTests(unittest.TestCase):
-    def test_fetch_markets_ranks_by_breakeven_ticks_not_volume_order(self):
+    def test_fetch_markets_ranks_by_combo_sum_not_volume_or_longshot(self):
         from polywang.arbitrage_bot import fetch_markets
         rows = [
             {
-                "id": "vol-mid", "conditionId": "c1", "question": "Busy mid",
+                "id": "vol-longshot", "conditionId": "c1", "question": "Busy longshot",
                 "clobTokenIds": '["y1", "n1"]', "outcomes": '["Yes", "No"]',
-                "outcomePrices": '["0.50", "0.50"]', "category": "politics",
+                "outcomePrices": '["0.001", "0.999"]', "category": "politics",
                 "active": True, "closed": False,
             },
             {
                 "id": "geo", "conditionId": "c2", "question": "Geopolitics",
                 "clobTokenIds": '["y2", "n2"]', "outcomes": '["Yes", "No"]',
-                "outcomePrices": '["0.55", "0.45"]', "category": "geopolitics",
+                "outcomePrices": '["0.48", "0.48"]', "category": "geopolitics",
                 "active": True, "closed": False,
             },
             {
-                "id": "extreme", "conditionId": "c3", "question": "Extreme politics",
+                "id": "mid-pol", "conditionId": "c3", "question": "Mid politics",
                 "clobTokenIds": '["y3", "n3"]', "outcomes": '["Yes", "No"]',
-                "outcomePrices": '["0.95", "0.05"]', "category": "politics",
+                "outcomePrices": '["0.49", "0.49"]', "category": "politics",
                 "active": True, "closed": False,
             },
         ]
@@ -117,7 +117,9 @@ class UniverseSelectionTests(unittest.TestCase):
             return list(rows)
 
         selected = fetch_markets(2, get=getter, pool=3)
-        self.assertEqual([market.market_id for market in selected], ["geo", "extreme"])
+        self.assertEqual([market.market_id for market in selected], ["geo", "mid-pol"])
+        self.assertAlmostEqual(selected[0].implied_yes, 0.48)
+        self.assertAlmostEqual(selected[0].implied_no, 0.48)
 
     def test_fetch_markets_logs_negrisk_without_selecting_it(self):
         from polywang.arbitrage_bot import fetch_markets
@@ -315,10 +317,20 @@ class ScanRejectAndGammaTests(unittest.TestCase):
         self.assertEqual([market.market_id for market in selected], ["bin"])
 
     def test_default_floors_and_buffer_unchanged(self):
+        from polywang.negrisk import NegRiskBookScanner, negrisk_execution_enabled
         scanner = BinaryArbitrageScanner()
         self.assertEqual(scanner.min_net_profit_usd, 0.05)
         self.assertEqual(scanner.min_return, 0.002)
         self.assertEqual(scanner.safety_buffer_usd, 0.02)
+        nr = NegRiskBookScanner()
+        self.assertEqual(nr.min_net_profit_usd, 0.05)
+        self.assertEqual(nr.min_return, 0.002)
+        self.assertEqual(nr.safety_buffer_usd, 0.02)
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ENABLE_NEGRISK_LIVE", None)
+            os.environ.pop("ENABLE_MAKER_GTC", None)
+            self.assertFalse(negrisk_execution_enabled(True))
+            self.assertNotEqual(os.getenv("ENABLE_MAKER_GTC", "").strip().lower(), "1")
 
     def test_scan_reject_counter_flush_sums_to_attempts_and_logs_touch(self):
         from polywang.arbitrage_bot import ScanRejectCounter

@@ -8,7 +8,12 @@ import tempfile
 import unittest
 from unittest import mock
 
-from polywang.arbitrage_bot import PaperMarketRunner, fetch_markets, fetch_universe
+from polywang.arbitrage_bot import (
+    PaperMarketRunner,
+    fetch_markets,
+    fetch_universe,
+    resolve_negrisk_journal_path,
+)
 from polywang.arbitrage_core import (
     BinaryArbitrageScanner,
     BinaryMarket,
@@ -377,6 +382,64 @@ class RiskAndRunnerTests(unittest.TestCase):
             self.assertEqual(baskets[0]["direction"], "BUY_ALL_YES")
             self.assertTrue(any(pos.get("kind") == "negrisk" for pos in runner.ledger.state["positions"].values()))
             self.assertEqual(runner.live_journal, None)
+            live_orders = os.path.join(directory, "live-orders.json")
+            self.assertFalse(os.path.exists(live_orders))
+            self.assertNotEqual(os.path.basename(nr_journal.path), "live-orders.json")
+
+    def test_paper_negrisk_journal_default_is_not_live_orders(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("PAPER_NEGRISK_JOURNAL", None)
+            os.environ.pop("LIVE_NEGRISK_JOURNAL", None)
+            os.environ.pop("ENABLE_NEGRISK_LIVE", None)
+            paper_path = resolve_negrisk_journal_path(False)
+            self.assertEqual(paper_path, "paper-negrisk.json")
+            self.assertNotEqual(paper_path, "live-orders.json")
+            self.assertNotEqual(resolve_negrisk_journal_path(True), "live-orders.json")
+            self.assertIsNone(os.environ.get("ENABLE_NEGRISK_LIVE"))
+            with self.assertRaises(ValueError):
+                resolve_negrisk_journal_path(False, "live-orders.json")
+            with self.assertRaises(ValueError):
+                resolve_negrisk_journal_path(False, "/tmp/live-orders.json")
+
+    def test_paper_logs_under_one_negrisk_basket_without_live_orders(self):
+        market = NegRiskMarket.from_gamma(nway_payload())
+        binary = BinaryMarket("m1", "c1", "Binary", "yes-token", "no-token", category="geopolitics")
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ, {"WHALE_STATE_PATH": ""}, clear=False,
+        ):
+            os.environ.pop("ENABLE_NEGRISK_LIVE", None)
+            journal_path = os.path.join(directory, "paper-negrisk.json")
+            live_orders = os.path.join(directory, "live-orders.json")
+            nr_journal = LiveNegRiskJournal(journal_path)
+            nr_exec = PaperNegRiskExecutor(nr_journal)
+            runner = PaperMarketRunner(
+                [binary], os.path.join(directory, "ledger.json"), 100.0,
+                BinaryArbitrageScanner(min_net_profit_usd=0.01, min_return=0.0, safety_buffer_usd=0.0),
+                negrisk_markets=[market],
+                negrisk_scanner=NegRiskBookScanner(
+                    min_net_profit_usd=0.01, min_return=0.0, safety_buffer_usd=0.0,
+                ),
+                negrisk_executor=nr_exec,
+            )
+            nr_exec.ledger = runner.ledger
+            runner.max_book_age_seconds = 1e9
+            now = int(__import__("time").time() * 1000)
+            with self.assertLogs("arbitrage-bot", level="INFO") as captured:
+                for token in ("tok-a", "tok-b", "tok-c"):
+                    asyncio.run(runner.process({
+                        "event_type": "book", "asset_id": token, "timestamp": str(now),
+                        "hash": token, "asks": [{"price": "0.20", "size": "10"}], "bids": [],
+                    }))
+            baskets = list(nr_journal.state["baskets"].values())
+            self.assertEqual(len(baskets), 1)
+            self.assertEqual(baskets[0]["status"], "ASSEMBLED")
+            # 0.20 + 0.20 + 0.20 = 0.60 < 1.00 complete-set payout
+            self.assertLess(sum(0.20 for _ in ("A", "B", "C")), 1.0)
+            self.assertTrue(any("NEGRISK PAPER" in line for line in captured.output))
+            self.assertTrue(os.path.exists(journal_path))
+            self.assertFalse(os.path.exists(live_orders))
+            self.assertIsNone(os.environ.get("ENABLE_NEGRISK_LIVE"))
+            self.assertEqual(runner.live_journal, None)
 
     def test_fetch_markets_still_excludes_negrisk(self):
         rows = [
@@ -451,9 +514,14 @@ class RiskAndRunnerTests(unittest.TestCase):
             self.assertEqual(settled[0]["settlement_type"], "REDEEM")
             self.assertEqual(client.redeem_calls, [{"condition_id": "cnr"}])
 
-    def test_execution_flags_default_off(self):
+    def test_execution_flags_paper_default_on_live_fail_closed(self):
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("ENABLE_NEGRISK_EXECUTION", None)
+            os.environ.pop("ENABLE_NEGRISK_LIVE", None)
+            self.assertTrue(negrisk_execution_enabled(False))
+            self.assertFalse(negrisk_execution_enabled(True))
+            self.assertIsNone(os.environ.get("ENABLE_NEGRISK_LIVE"))
+        with mock.patch.dict(os.environ, {"ENABLE_NEGRISK_EXECUTION": "0"}, clear=False):
             os.environ.pop("ENABLE_NEGRISK_LIVE", None)
             self.assertFalse(negrisk_execution_enabled(False))
             self.assertFalse(negrisk_execution_enabled(True))

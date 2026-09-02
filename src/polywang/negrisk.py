@@ -1142,7 +1142,17 @@ class OfficialNegRiskExecutor:
 
 
 def negrisk_execution_enabled(live: bool) -> bool:
-    if os.getenv("ENABLE_NEGRISK_EXECUTION", "").strip().lower() not in {"1", "true", "yes", "on"}:
+    """Paper defaults on when ENABLE_NEGRISK_EXECUTION is unset.
+
+    Live stays fail-closed: it needs an explicit execution flag *and*
+    ENABLE_NEGRISK_LIVE. That live flag is never treated as on when unset.
+    """
+    raw = os.getenv("ENABLE_NEGRISK_EXECUTION")
+    if raw is None or str(raw).strip() == "":
+        enabled = not live
+    else:
+        enabled = str(raw).strip().lower() in {"1", "true", "yes", "on"}
+    if not enabled:
         return False
     if live and os.getenv("ENABLE_NEGRISK_LIVE", "").strip().lower() not in {"1", "true", "yes", "on"}:
         return False

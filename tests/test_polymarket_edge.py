@@ -17,6 +17,7 @@ from polywang.polymarket_edge import (
     PolymarketFeeModel,
     StrategyCalibration,
     combo_arb_universe_score,
+    combo_ask_sum,
     merge_gas_clears_at_order_usd,
     merge_gas_startup_warning,
     rank_combo_arb_markets,
@@ -327,13 +328,72 @@ class ComboUniverseRankTests(unittest.TestCase):
         self.assertFalse(unknown.price_known)
         self.assertEqual(unknown.ticks_to_breakeven, mid.ticks_to_breakeven)
 
-    def test_rank_puts_zero_fee_and_extremes_ahead_of_mid_politics(self):
+    def test_combo_ask_sum_does_not_invent_no_from_implied_yes(self):
         from polywang.arbitrage_core import BinaryMarket
-        mid = BinaryMarket("mid", "c", "Mid", "y1", "n1", category="politics", implied_yes=0.50)
-        extreme = BinaryMarket("ext", "c", "Ext", "y2", "n2", category="politics", implied_yes=0.95)
-        geo = BinaryMarket("geo", "c", "Geo", "y3", "n3", category="geopolitics", implied_yes=0.50)
-        ranked = rank_combo_arb_markets([mid, extreme, geo])
-        self.assertEqual([market.market_id for market in ranked], ["geo", "ext", "mid"])
+        only_yes = BinaryMarket(
+            "m", "c", "Only yes", "y", "n", category="geopolitics", implied_yes=0.48,
+        )
+        self.assertIsNone(combo_ask_sum(only_yes))
+
+    def test_rank_puts_lower_combo_sum_ahead_of_longshot_one_tick(self):
+        from polywang.arbitrage_core import BinaryMarket
+        longshot = BinaryMarket(
+            "startup", "c", "Longshot", "y1", "n1", category="politics",
+            implied_yes=0.001, implied_no=0.999,
+        )
+        geo = BinaryMarket(
+            "geo", "c", "Geo", "y2", "n2", category="geopolitics",
+            implied_yes=0.48, implied_no=0.48,
+        )
+        self.assertAlmostEqual(combo_ask_sum(longshot), 1.000, places=9)
+        self.assertAlmostEqual(combo_ask_sum(geo), 0.96, places=9)
+        ranked = rank_combo_arb_markets([longshot, geo])
+        self.assertEqual([market.market_id for market in ranked], ["geo", "startup"])
+
+    def test_rank_prefers_geopolitics_when_combo_sums_tie(self):
+        from polywang.arbitrage_core import BinaryMarket
+        mid = BinaryMarket(
+            "mid", "c", "Mid", "y1", "n1", category="politics",
+            implied_yes=0.50, implied_no=0.50,
+        )
+        geo = BinaryMarket(
+            "geo", "c", "Geo", "y2", "n2", category="geopolitics",
+            implied_yes=0.50, implied_no=0.50,
+        )
+        ranked = rank_combo_arb_markets([mid, geo])
+        self.assertEqual([market.market_id for market in ranked], ["geo", "mid"])
+
+    def test_rank_uses_live_touch_once_books_exist(self):
+        from polywang.arbitrage_core import BinaryMarket, OrderBook
+        longshot = BinaryMarket(
+            "startup", "c", "Longshot", "y-ls", "n-ls", category="politics",
+            implied_yes=0.001, implied_no=0.999,
+        )
+        geo = BinaryMarket(
+            "geo", "c", "Geo", "y-geo", "n-geo", category="geopolitics",
+            implied_yes=0.48, implied_no=0.48,
+        )
+        self.assertEqual(
+            [market.market_id for market in rank_combo_arb_markets([longshot, geo])],
+            ["geo", "startup"],
+        )
+
+        def book_with_ask(price):
+            book = OrderBook()
+            book.asks = {float(price): 10.0}
+            book.synced = True
+            return book
+
+        books = {
+            "y-ls": book_with_ask(0.40),
+            "n-ls": book_with_ask(0.40),
+            "y-geo": book_with_ask(0.49),
+            "n-geo": book_with_ask(0.49),
+        }
+        ranked = rank_combo_arb_markets([longshot, geo], books=books)
+        self.assertEqual([market.market_id for market in ranked], ["startup", "geo"])
+        self.assertAlmostEqual(combo_ask_sum(longshot, books), 0.80, places=9)
+        self.assertAlmostEqual(combo_ask_sum(geo, books), 0.98, places=9)
 
     def test_merge_gas_warning_flags_small_orders_and_hidden_gas(self):
         self.assertFalse(merge_gas_clears_at_order_usd(5.0, 0.30))

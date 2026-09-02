@@ -54,11 +54,20 @@ class MarketAndBookTests(unittest.TestCase):
             "outcomePrices": '["0.95", "0.05"]', "category": "politics",
         })
         self.assertAlmostEqual(parsed.implied_yes, 0.95)
+        self.assertAlmostEqual(parsed.implied_no, 0.05)
+        combo = BinaryMarket.from_gamma({
+            "id": "8", "conditionId": "c8", "question": "Combo",
+            "clobTokenIds": '["y", "n"]', "outcomes": '["Yes", "No"]',
+            "outcomePrices": '["0.48", "0.48"]', "category": "geopolitics",
+        })
+        self.assertAlmostEqual(combo.implied_yes, 0.48)
+        self.assertAlmostEqual(combo.implied_no, 0.48)
         missing = BinaryMarket.from_gamma({
             "id": "7", "conditionId": "c7", "question": "Test",
             "clobTokenIds": '["y", "n"]', "outcomes": '["Yes", "No"]',
         })
         self.assertIsNone(missing.implied_yes)
+        self.assertIsNone(missing.implied_no)
 
     def test_gamma_market_rejects_incomplete_or_duplicate_identifiers(self):
         self.assertIsNone(BinaryMarket.from_gamma({
