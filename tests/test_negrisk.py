@@ -534,6 +534,56 @@ class RiskAndRunnerTests(unittest.TestCase):
         }, clear=False):
             self.assertTrue(negrisk_execution_enabled(True))
 
+    def test_paper_negrisk_cannot_reuse_the_same_resting_level(self):
+        market = NegRiskMarket.from_gamma(nway_payload())
+        binary = BinaryMarket("m1", "c1", "Binary", "yes-token", "no-token", category="geopolitics")
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ, {"WHALE_STATE_PATH": ""}, clear=False,
+        ):
+            os.environ.pop("ENABLE_NEGRISK_LIVE", None)
+            os.environ.pop("POLYMARKET_LIVE_CONFIRM", None)
+            nr_journal = LiveNegRiskJournal(os.path.join(directory, "paper-negrisk.json"))
+            nr_exec = PaperNegRiskExecutor(nr_journal)
+            runner = PaperMarketRunner(
+                [binary], os.path.join(directory, "ledger.json"), 1000.0,
+                BinaryArbitrageScanner(),
+                negrisk_markets=[market],
+                negrisk_scanner=NegRiskBookScanner(),
+                negrisk_executor=nr_exec,
+            )
+            nr_exec.ledger = runner.ledger
+            runner.max_book_age_seconds = 1e9
+            now = int(__import__("time").time() * 1000)
+
+            def feed(round_id):
+                for token in ("tok-a", "tok-b", "tok-c"):
+                    asyncio.run(runner.process({
+                        "event_type": "book", "asset_id": token, "timestamp": str(now),
+                        "hash": f"{token}-{round_id}",
+                        "asks": [{"price": "0.20", "size": "10"}], "bids": [],
+                    }))
+
+            feed(1)
+            self.assertEqual(len(nr_journal.state["baskets"]), 1)
+            first_cash = float(runner.ledger.state["cash"])
+            # QUANT-08 RCA: 13 identical CS snapshots in ~70ms, each with a new hash.
+            for round_id in range(2, 14):
+                feed(round_id)
+            self.assertEqual(len(nr_journal.state["baskets"]), 1)
+            self.assertAlmostEqual(float(runner.ledger.state["cash"]), first_cash)
+            restored = synced_book({0.20: 10})
+            runner.paper_ask_depth.apply_to_book("tok-a", restored)
+            with self.assertRaisesRegex(ValueError, "insufficient paper book depth"):
+                runner.paper_ask_depth.ensure_shares(restored, 10.0)
+            self.assertIsNone(os.environ.get("ENABLE_NEGRISK_LIVE"))
+            self.assertNotEqual(os.getenv("POLYMARKET_LIVE_CONFIRM"), "I_UNDERSTAND_THE_RISK")
+            self.assertEqual(runner.scanner.min_net_profit_usd, 0.05)
+            self.assertEqual(runner.scanner.min_return, 0.002)
+            self.assertEqual(runner.scanner.safety_buffer_usd, 0.02)
+            self.assertEqual(runner.negrisk_scanner.min_net_profit_usd, 0.05)
+            self.assertEqual(runner.negrisk_scanner.min_return, 0.002)
+            self.assertEqual(runner.negrisk_scanner.safety_buffer_usd, 0.02)
+
 
 if __name__ == "__main__":
     unittest.main()

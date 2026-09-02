@@ -519,7 +519,38 @@ class ScanRejectAndGammaTests(unittest.TestCase):
         self.assertIn("net_below_floor=1", lines[0])
         self.assertIn("stale_book=1", lines[0])
         self.assertIn("leg_skew=1", lines[0])
+        self.assertIn("risk_skip_cash=0", lines[0])
+        self.assertIn("risk_skip_open_exposure=0", lines[0])
+        self.assertIn("risk_skip_position_limit=0", lines[0])
+        self.assertIn("risk_skip_other=0", lines[0])
         self.assertEqual(counter.attempts, 0)
+
+    def test_scan_reject_counter_risk_skip_reasons_do_not_double_count(self):
+        from polywang.arbitrage_bot import ScanRejectCounter, classify_risk_skip
+        lines = []
+
+        class Capture:
+            def info(self, message, *args):
+                lines.append(message % args if args else message)
+
+        self.assertEqual(classify_risk_skip(ValueError("insufficient paper cash")), "cash")
+        self.assertEqual(classify_risk_skip(ValueError("total exposure limit")), "open_exposure")
+        self.assertEqual(classify_risk_skip(ValueError("market exposure limit")), "position_limit")
+        self.assertEqual(classify_risk_skip(ValueError("maximum number of open live pairs reached")), "position_limit")
+        counter = ScanRejectCounter(flush_interval_s=3600.0, logger=Capture())
+        counter.record("risk_skip", detail="cash")
+        counter.record("risk_skip", detail="open_exposure")
+        counter.record("risk_skip", detail="position_limit")
+        self.assertEqual(counter.counts["risk_skip"], 3)
+        self.assertEqual(counter.attempts, 3)
+        self.assertEqual(counter.risk_skip_reasons["cash"], 1)
+        counter.flush()
+        self.assertEqual(len(lines), 1)
+        self.assertIn("risk_skip=3", lines[0])
+        self.assertIn("risk_skip_cash=1", lines[0])
+        self.assertIn("risk_skip_open_exposure=1", lines[0])
+        self.assertIn("risk_skip_position_limit=1", lines[0])
+        self.assertIn("risk_skip_other=0", lines[0])
 
     def test_paper_process_logs_rejects_and_does_not_write_live_orders(self):
         with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
@@ -583,6 +614,83 @@ class ScanRejectAndGammaTests(unittest.TestCase):
             self.assertEqual(runner.scan_rejects.counts["leg_skew"], 1)
             self.assertEqual(runner.scan_rejects.attempts, 1)
             self.assertIsNotNone(runner.scan_rejects.best_touch_sum)
+
+    def test_scan_rejects_flush_includes_risk_skip_reason_and_keeps_floors(self):
+        from polywang.arbitrage_bot import classify_risk_skip
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ, {"WHALE_STATE_PATH": "", "MAX_LEG_SKEW_MS": "500"}, clear=False,
+        ):
+            market = BinaryMarket(
+                "m1", "c1", "Fat combo", "yes-token", "no-token", category="geopolitics",
+            )
+            runner = PaperMarketRunner(
+                [market], os.path.join(directory, "ledger.json"), 1000.0,
+                BinaryArbitrageScanner(),
+            )
+            self.assertEqual(runner.scanner.min_net_profit_usd, 0.05)
+            self.assertEqual(runner.scanner.min_return, 0.002)
+            self.assertEqual(runner.scanner.safety_buffer_usd, 0.02)
+            runner.max_book_age_seconds = 1e9
+            runner.scan_rejects.flush_interval_s = 3600.0
+            runner.executor.max_total_exposure_fraction = 1.0
+            runner.executor.max_market_exposure_fraction = 1.0
+            runner.ledger.state["cash"] = 1.0
+            now = int(__import__("time").time() * 1000)
+            asyncio.run(runner.process({
+                "event_type": "book", "asset_id": "yes-token", "timestamp": str(now),
+                "hash": "y", "asks": [{"price": "0.45", "size": "50"}], "bids": [],
+            }))
+            asyncio.run(runner.process({
+                "event_type": "book", "asset_id": "no-token", "timestamp": str(now),
+                "hash": "n", "asks": [{"price": "0.46", "size": "50"}], "bids": [],
+            }))
+            self.assertEqual(runner.ledger.state["positions"], {})
+            self.assertGreater(runner.scan_rejects.counts["risk_skip"], 0)
+            self.assertGreater(runner.scan_rejects.risk_skip_reasons["cash"], 0)
+            self.assertGreater(runner.scan_rejects.best_net, 0.05)
+            self.assertAlmostEqual(runner.scan_rejects.best_touch_sum, 0.91)
+            self.assertEqual(
+                classify_risk_skip(ValueError("insufficient paper cash")), "cash",
+            )
+            with self.assertLogs("arbitrage-bot", level="INFO") as captured:
+                runner.scan_rejects.flush()
+            line = next(item for item in captured.output if "SCAN REJECTS:" in item)
+            self.assertIn("risk_skip=", line)
+            self.assertIn("risk_skip_cash=", line)
+            self.assertIn("risk_skip_open_exposure=", line)
+            self.assertIn("risk_skip_position_limit=", line)
+            self.assertRegex(line, r"risk_skip_cash=[1-9]")
+            self.assertEqual(runner.scanner.min_net_profit_usd, 0.05)
+            self.assertEqual(runner.scanner.min_return, 0.002)
+            self.assertEqual(runner.scanner.safety_buffer_usd, 0.02)
+
+    def test_scan_rejects_risk_skip_position_limit_stays_a_skip(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ, {"WHALE_STATE_PATH": "", "MAX_LEG_SKEW_MS": "500"}, clear=False,
+        ):
+            market = BinaryMarket(
+                "m1", "c1", "Fat combo", "yes-token", "no-token", category="geopolitics",
+            )
+            runner = PaperMarketRunner(
+                [market], os.path.join(directory, "ledger.json"), 1000.0,
+                BinaryArbitrageScanner(),
+            )
+            runner.max_book_age_seconds = 1e9
+            runner.scan_rejects.flush_interval_s = 3600.0
+            now = int(__import__("time").time() * 1000)
+            asyncio.run(runner.process({
+                "event_type": "book", "asset_id": "yes-token", "timestamp": str(now),
+                "hash": "y", "asks": [{"price": "0.45", "size": "80"}], "bids": [],
+            }))
+            asyncio.run(runner.process({
+                "event_type": "book", "asset_id": "no-token", "timestamp": str(now),
+                "hash": "n", "asks": [{"price": "0.46", "size": "80"}], "bids": [],
+            }))
+            self.assertEqual(runner.ledger.state["positions"], {})
+            self.assertGreater(runner.scan_rejects.counts["risk_skip"], 0)
+            self.assertGreater(runner.scan_rejects.risk_skip_reasons["position_limit"], 0)
+            self.assertEqual(runner.scan_rejects.accepted, 0)
+            self.assertEqual(runner.scanner.min_net_profit_usd, 0.05)
 
 
 class _FakeClock:
