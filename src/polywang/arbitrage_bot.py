@@ -1078,26 +1078,37 @@ async def _run_market_stream_shard(
                         )
                     )
                     tasks.add(ping_task)
-                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-                for task in pending:
-                    task.cancel()
-                await asyncio.gather(*pending, return_exceptions=True)
-                for task in done:
-                    if task.cancelled():
-                        continue
-                    exc = task.exception()
-                    if exc is not None:
-                        raise exc
-                    if task is pump_task and task.result() == "idle":
-                        LOG.warning(
-                            "Market stream shard %d silent: no frames of any kind for %.1fs "
-                            "(tokens=%d last_event=%s age=%.1fs); reconnecting",
-                            shard_index,
-                            idle_seconds,
-                            len(token_ids),
-                            watch.last_event_type or "none",
-                            watch.last_event_age(),
-                        )
+                try:
+                    done, pending = await asyncio.wait(
+                        tasks, return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for task in pending:
+                        task.cancel()
+                    await asyncio.gather(*pending, return_exceptions=True)
+                    for task in done:
+                        if task.cancelled():
+                            continue
+                        exc = task.exception()
+                        if exc is not None:
+                            raise exc
+                        if task is pump_task and task.result() == "idle":
+                            LOG.warning(
+                                "Market stream shard %d silent: no frames of any kind for %.1fs "
+                                "(tokens=%d last_event=%s age=%.1fs); reconnecting",
+                                shard_index,
+                                idle_seconds,
+                                len(token_ids),
+                                watch.last_event_type or "none",
+                                watch.last_event_age(),
+                            )
+                finally:
+                    for task in (ping_task, pump_task):
+                        if task is not None and not task.done():
+                            task.cancel()
+                    await asyncio.gather(
+                        *[task for task in (ping_task, pump_task) if task is not None],
+                        return_exceptions=True,
+                    )
         except asyncio.CancelledError:
             raise
         except Exception as error:
