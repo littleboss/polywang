@@ -447,6 +447,80 @@ class OrderBook:
                 self.bids[price] = remaining
 
 
+class PaperAskDepthLedger:
+    """Paper remaining ask size after simulated complete-set fills.
+
+    A websocket `book` snapshot restores the resting tape. Paper fills are
+    not on that tape, so a later snapshot of the same size would otherwise
+    walk the same level again (QUANT-20260902-08: 13 identical NegRisk
+    baskets in ~70ms). Subtract consumed size from matching prices after
+    every local book update. Live FOK does not use this ledger.
+    """
+
+    def __init__(self):
+        self._consumed: Dict[Tuple[str, float], float] = {}
+
+    @staticmethod
+    def price_key(price: float) -> float:
+        return round(float(price), 8)
+
+    def consume(self, token_id: str, fills: Sequence[Tuple[float, float]]) -> None:
+        token = str(token_id)
+        for price, quantity in fills:
+            qty = float(quantity)
+            if qty <= 0.0 or not math.isfinite(qty):
+                continue
+            key = (token, self.price_key(price))
+            self._consumed[key] = self._consumed.get(key, 0.0) + qty
+
+    def remaining_at(self, token_id: str, price: float, displayed: float) -> float:
+        taken = self._consumed.get((str(token_id), self.price_key(price)), 0.0)
+        return max(0.0, float(displayed) - taken)
+
+    def apply_to_book(self, token_id: str, book: "OrderBook") -> None:
+        """Reduce a freshly restored snapshot by paper-consumed size."""
+        asks = getattr(book, "asks", None)
+        if not asks:
+            return
+        token = str(token_id)
+        for price in list(asks):
+            taken = self._consumed.get((token, self.price_key(price)), 0.0)
+            if taken <= 0.0:
+                continue
+            remaining = float(asks[price]) - taken
+            if remaining <= 1e-12:
+                asks.pop(price, None)
+            else:
+                asks[price] = remaining
+
+    def ensure_shares(self, book: "OrderBook", shares: float) -> None:
+        """Fail closed when the (already overlayed) book cannot fill `shares`."""
+        _, _, fills = book.walk_asks(shares)
+        filled = sum(quantity for _, quantity in fills)
+        if filled + 1e-12 < float(shares):
+            raise ValueError("insufficient paper book depth")
+
+
+def market_event_asset_ids(event: dict) -> List[str]:
+    """Token ids a market-channel book or price_change event would update."""
+    event_type = _event_name(_response_value(event, "event_type", "type", default=""))
+    payload = _response_value(event, "payload", default=None)
+    if payload is not None:
+        event = payload
+    ids: List[str] = []
+    if event_type == "book":
+        token_id = str(_response_value(event, "asset_id", "token_id", default="") or "")
+        if token_id:
+            ids.append(token_id)
+    elif event_type == "price_change":
+        changes = _response_value(event, "price_changes", default=()) or ()
+        for change in changes:
+            token_id = str(_response_value(change, "asset_id", "token_id", default="") or "")
+            if token_id:
+                ids.append(token_id)
+    return ids
+
+
 @dataclass
 class ArbitrageOpportunity:
     market_id: str

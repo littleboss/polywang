@@ -17,6 +17,7 @@ from polywang.arbitrage_core import (
     OfficialFOKExecutor,
     LiveRiskController,
     RiskHaltError,
+    PaperAskDepthLedger,
     PaperArbitrageExecutor,
     UnhedgedPairError,
     handle_market_event,
@@ -203,6 +204,36 @@ class MarketAndBookTests(unittest.TestCase):
         }, mapping, books), [])
         self.assertFalse(books["yes-token"].synced)
         self.assertIn("hash chain", books["yes-token"].gap_reason)
+
+
+class PaperAskDepthLedgerTests(unittest.TestCase):
+    def _book(self, size=10.0, price=0.20):
+        book = OrderBook()
+        book.asks = {price: size}
+        book.synced = True
+        book.timestamp_ms = 1
+        return book
+
+    def test_one_snapshot_cannot_fill_the_same_level_twice(self):
+        ledger = PaperAskDepthLedger()
+        book = self._book(10.0)
+        ledger.ensure_shares(book, 10.0)
+        ledger.consume("tok-a", [(0.20, 10.0)])
+        restored = self._book(10.0)
+        ledger.apply_to_book("tok-a", restored)
+        self.assertEqual(restored.asks, {})
+        with self.assertRaisesRegex(ValueError, "insufficient paper book depth"):
+            ledger.ensure_shares(restored, 10.0)
+
+    def test_remaining_size_bounds_a_second_basket(self):
+        ledger = PaperAskDepthLedger()
+        ledger.consume("tok-a", [(0.20, 10.0)])
+        restored = self._book(20.0)
+        ledger.apply_to_book("tok-a", restored)
+        self.assertAlmostEqual(restored.asks[0.20], 10.0)
+        ledger.ensure_shares(restored, 10.0)
+        with self.assertRaisesRegex(ValueError, "insufficient paper book depth"):
+            ledger.ensure_shares(restored, 10.01)
 
 
 class ScannerTests(unittest.TestCase):

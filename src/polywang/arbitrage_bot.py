@@ -51,6 +51,7 @@ from .arbitrage_core import (
     LiveDirectionalJournal,
     LiveOrderJournal,
     OrderBook,
+    PaperAskDepthLedger,
     PaperArbitrageExecutor,
     PaperDirectionalExecutor,
     OfficialFOKExecutor,
@@ -58,6 +59,7 @@ from .arbitrage_core import (
     RiskHaltError,
     UnhedgedPairError,
     handle_market_event,
+    market_event_asset_ids,
     consume_user_stream,
     intent_from_best_ask,
     intent_from_inventory_bid,
@@ -122,6 +124,33 @@ SCAN_REJECT_REASONS = (
     "risk_skip",
 )
 
+# Concrete gates behind risk_skip. Counted in addition to risk_skip itself
+# (attempts still use SCAN_REJECT_REASONS only, so the skip is not dropped).
+RISK_SKIP_REASONS = (
+    "cash",
+    "open_exposure",
+    "position_limit",
+    "other",
+)
+
+
+def classify_risk_skip(error: BaseException) -> str:
+    """Map LiveRiskController / paper cash-gate errors to SCAN mix buckets."""
+    text = " ".join(str(error).strip().lower().split())
+    if "insufficient paper cash" in text:
+        return "cash"
+    if "total exposure" in text:
+        return "open_exposure"
+    if (
+        "market exposure" in text
+        or "open live pairs" in text
+        or "open pairs" in text
+        or "open directional" in text
+        or "open negrisk" in text
+    ):
+        return "position_limit"
+    return "other"
+
 
 class ScanRejectCounter:
     """Count binary-scan skips and flush a 60s window summary.
@@ -135,16 +164,20 @@ class ScanRejectCounter:
         self.flush_interval_s = max(0.0, float(flush_interval_s))
         self.log = logger or LOG
         self.counts = {reason: 0 for reason in SCAN_REJECT_REASONS}
+        self.risk_skip_reasons = {reason: 0 for reason in RISK_SKIP_REASONS}
         self.accepted = 0
         self.best_touch_sum: Optional[float] = None
         self.best_net: Optional[float] = None
         self.dual_synced_markets: set = set()
         self._window_start = time.monotonic()
 
-    def record(self, reason: str) -> None:
+    def record(self, reason: str, detail: Optional[str] = None) -> None:
         if reason not in self.counts:
             raise ValueError(f"unknown scan reject reason: {reason}")
         self.counts[reason] += 1
+        if reason == "risk_skip":
+            bucket = detail if detail in self.risk_skip_reasons else "other"
+            self.risk_skip_reasons[bucket] += 1
         self.maybe_flush()
 
     def record_accept(self) -> None:
@@ -180,9 +213,12 @@ class ScanRejectCounter:
         touch = "n/a" if self.best_touch_sum is None else f"{self.best_touch_sum:.4f}"
         net = "n/a" if self.best_net is None else f"{self.best_net:.4f}"
         reason_parts = " ".join(f"{name}={self.counts[name]}" for name in SCAN_REJECT_REASONS)
+        risk_parts = " ".join(
+            f"risk_skip_{name}={self.risk_skip_reasons[name]}" for name in RISK_SKIP_REASONS
+        )
         self.log.info(
             "SCAN REJECTS: attempts=%d rejects=%d accepted=%d "
-            "dual_synced_markets=%d best_yes_ask+no_ask=%s best_net=%s | %s",
+            "dual_synced_markets=%d best_yes_ask+no_ask=%s best_net=%s | %s | %s",
             attempts,
             reject_total,
             self.accepted,
@@ -190,8 +226,10 @@ class ScanRejectCounter:
             touch,
             net,
             reason_parts,
+            risk_parts,
         )
         self.counts = {reason: 0 for reason in SCAN_REJECT_REASONS}
+        self.risk_skip_reasons = {reason: 0 for reason in RISK_SKIP_REASONS}
         self.accepted = 0
         self.best_touch_sum = None
         self.best_net = None
@@ -542,6 +580,7 @@ class PaperMarketRunner:
         self.max_book_age_seconds = env_float("MAX_BOOK_AGE_SECONDS", 5.0)
         self.max_leg_skew_ms = max(0, int(env_float("MAX_LEG_SKEW_MS", 1000.0)))
         self.last_fingerprint = set()
+        self.paper_ask_depth = None if self.live else PaperAskDepthLedger()
         self.scan_rejects = ScanRejectCounter(
             flush_interval_s=env_float("SCAN_REJECT_FLUSH_SECONDS", 60.0),
         )
@@ -650,6 +689,11 @@ class PaperMarketRunner:
                     )
             return
         affected = handle_market_event(event, self.token_to_market, self.books)
+        if self.paper_ask_depth is not None:
+            for token_id in market_event_asset_ids(event):
+                book = self.books.get(token_id)
+                if book is not None:
+                    self.paper_ask_depth.apply_to_book(token_id, book)
         now_ms = int(time.time() * 1000)
         for market_id in affected:
             if market_id in self.negrisk_markets:
@@ -713,12 +757,15 @@ class PaperMarketRunner:
                 LOG.critical("UNHEDGED LIVE PAIR: stopping the process for manual reconciliation")
                 raise
             except ValueError as error:
-                self.scan_rejects.record("risk_skip")
+                self.scan_rejects.record("risk_skip", detail=classify_risk_skip(error))
                 LOG.info("Skip %s: %s", market.title, error)
                 continue
             if opportunity.is_taker:
                 yes_book.consume_asks(yes_fills)
                 no_book.consume_asks(no_fills)
+                if self.paper_ask_depth is not None:
+                    self.paper_ask_depth.consume(market.yes_token_id, yes_fills)
+                    self.paper_ask_depth.consume(market.no_token_id, no_fills)
             self.last_fingerprint.add(opportunity.fingerprint)
             self.scan_rejects.record_accept()
             if self.live:
@@ -729,6 +776,20 @@ class PaperMarketRunner:
                          market.title, opportunity.shares, opportunity.capital_required,
                          opportunity.net_profit, result.position_id)
         self.scan_rejects.maybe_flush()
+
+    def _ensure_negrisk_book_depth(self, opportunity) -> None:
+        """Fail closed when remaining (paper-overlayed) depth cannot fill the basket."""
+        for leg in opportunity.legs:
+            book = self.books.get(leg.token_id)
+            if book is None or not book.synced:
+                raise ValueError("insufficient paper book depth")
+            if self.paper_ask_depth is not None:
+                self.paper_ask_depth.ensure_shares(book, opportunity.shares)
+                continue
+            _, _, fills = book.walk_asks(opportunity.shares)
+            filled = sum(quantity for _, quantity in fills)
+            if filled + 1e-12 < opportunity.shares:
+                raise ValueError("insufficient paper book depth")
 
     async def _scan_negrisk(self, market_id: str, now_ms: int) -> None:
         if self.negrisk_scanner is None:
@@ -753,6 +814,11 @@ class PaperMarketRunner:
             return
         opportunity = self.negrisk_scanner.scan(market, self.books)
         if not opportunity or opportunity.fingerprint in self.last_fingerprint:
+            return
+        try:
+            self._ensure_negrisk_book_depth(opportunity)
+        except ValueError as error:
+            LOG.info("Skip NegRisk %s: %s", market.title, error)
             return
         if self.negrisk_executor is None:
             LOG.info(
@@ -779,6 +845,8 @@ class PaperMarketRunner:
             book = self.books.get(leg.token_id)
             if book is not None:
                 book.consume_asks(leg.fills)
+            if self.paper_ask_depth is not None:
+                self.paper_ask_depth.consume(leg.token_id, leg.fills)
         self.last_fingerprint.add(opportunity.fingerprint)
         LOG.info(
             "NEGRISK %s: %s | %s | %.4f shares | net $%.4f | basket %s",
