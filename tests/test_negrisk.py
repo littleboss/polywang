@@ -10,13 +10,16 @@ from unittest import mock
 
 from polywang.arbitrage_bot import (
     PaperMarketRunner,
+    classify_risk_skip,
     fetch_markets,
     fetch_universe,
     resolve_negrisk_journal_path,
+    write_health,
 )
 from polywang.arbitrage_core import (
     BinaryArbitrageScanner,
     BinaryMarket,
+    JsonLedger,
     LiveOrderJournal,
     LiveRiskController,
     OfficialFOKExecutor,
@@ -583,6 +586,187 @@ class RiskAndRunnerTests(unittest.TestCase):
             self.assertEqual(runner.negrisk_scanner.min_net_profit_usd, 0.05)
             self.assertEqual(runner.negrisk_scanner.min_return, 0.002)
             self.assertEqual(runner.negrisk_scanner.safety_buffer_usd, 0.02)
+
+
+class PaperSettlementAccountingTests(unittest.TestCase):
+    """QUANT-20260904-01: paper ledger settlement must clear journal + health."""
+
+    def _market_and_opportunity(self, suffix):
+        tokens = (f"t{suffix}a", f"t{suffix}b", f"t{suffix}c")
+        market = NegRiskMarket.from_gamma(nway_payload(
+            id=f"nr{suffix}",
+            conditionId=f"c-nr{suffix}",
+            clobTokenIds=json.dumps(list(tokens)),
+            question=f"Who wins {suffix}",
+        ))
+        books = {token: synced_book({0.20: 10}) for token in tokens}
+        opportunity = NegRiskBookScanner(
+            min_net_profit_usd=0.01, min_return=0.0, safety_buffer_usd=0.0,
+        ).scan(market, books)
+        self.assertIsNotNone(opportunity)
+        return market, opportunity
+
+    def _health(self, path, journal):
+        write_health(path, {
+            "negrisk_exposure": journal.open_exposure(),
+            "open_negrisk": len(journal.incomplete_baskets()),
+        })
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+
+    def test_settle_n_paper_baskets_clears_journal_health_and_risk_gate(self):
+        binary = BinaryMarket("m1", "c1", "Binary", "yes-token", "no-token", category="geopolitics")
+        markets = []
+        opportunities = []
+        for suffix in ("1", "2", "3"):
+            market, opportunity = self._market_and_opportunity(suffix)
+            markets.append(market)
+            opportunities.append(opportunity)
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ, {"WHALE_STATE_PATH": ""}, clear=False,
+        ):
+            os.environ.pop("ENABLE_NEGRISK_LIVE", None)
+            journal_path = os.path.join(directory, "paper-negrisk.json")
+            health_path = os.path.join(directory, "live-health.json")
+            nr_journal = LiveNegRiskJournal(journal_path)
+            nr_exec = PaperNegRiskExecutor(nr_journal)
+            runner = PaperMarketRunner(
+                [binary], os.path.join(directory, "ledger.json"), 1000.0,
+                BinaryArbitrageScanner(min_net_profit_usd=0.01, min_return=0.0, safety_buffer_usd=0.0),
+                negrisk_markets=markets,
+                negrisk_scanner=NegRiskBookScanner(
+                    min_net_profit_usd=0.01, min_return=0.0, safety_buffer_usd=0.0,
+                ),
+                negrisk_executor=nr_exec,
+            )
+            nr_exec.ledger = runner.ledger
+            opened = [nr_exec.execute(opportunity) for opportunity in opportunities]
+            self.assertEqual(len(opened), 3)
+            self.assertEqual(len(nr_journal.incomplete_baskets()), 3)
+            self.assertTrue(all(basket["status"] == "ASSEMBLED" for basket in nr_journal.state["baskets"].values()))
+            ghost_exposure = nr_journal.open_exposure()
+            self.assertGreater(ghost_exposure, 0.0)
+            snapshot = self._health(health_path, nr_journal)
+            self.assertEqual(snapshot["open_negrisk"], 3)
+            self.assertAlmostEqual(snapshot["negrisk_exposure"], ghost_exposure)
+
+            pairs = LiveOrderJournal(os.path.join(directory, "pairs.json"))
+            risk = LiveRiskController(
+                pairs,
+                equity_usd=40.0,
+                state_path=os.path.join(directory, "risk.json"),
+                kill_switch_path=os.path.join(directory, "missing-kill"),
+                max_total_exposure_fraction=0.25,
+                max_market_exposure_fraction=0.25,
+                negrisk_journal=nr_journal,
+                max_open_negrisk=10,
+            )
+            with self.assertRaises(RiskHaltError) as raised:
+                risk.check_negrisk(opportunities[0])
+            self.assertIn("total exposure", str(raised.exception))
+            self.assertEqual(classify_risk_skip(raised.exception), "open_exposure")
+
+            asyncio.run(runner.process({
+                "event_type": "market_resolved", "market": "nr1", "winning_outcome": "A",
+            }))
+            asyncio.run(runner.process({
+                "event_type": "market_resolved", "market": "nr2", "winning_outcome": "A",
+            }))
+            remaining = nr_journal.incomplete_baskets()
+            self.assertEqual(len(remaining), 1)
+            self.assertEqual(remaining[0]["market_id"], "nr3")
+            self.assertEqual(remaining[0]["status"], "ASSEMBLED")
+            settled_statuses = {
+                record["status"]
+                for record in nr_journal.state["baskets"].values()
+                if record["market_id"] in {"nr1", "nr2"}
+            }
+            self.assertEqual(settled_statuses, {"SETTLED"})
+            remaining_cost = float(remaining[0]["capital_reserved"])
+            self.assertAlmostEqual(nr_journal.open_exposure(), remaining_cost)
+            snapshot = self._health(health_path, nr_journal)
+            self.assertEqual(snapshot["open_negrisk"], 1)
+            self.assertAlmostEqual(snapshot["negrisk_exposure"], remaining_cost)
+            self.assertLess(snapshot["negrisk_exposure"], ghost_exposure)
+
+            asyncio.run(runner.process({
+                "event_type": "market_resolved", "market": "nr3", "winning_outcome": "A",
+            }))
+            self.assertEqual(nr_journal.incomplete_baskets(), [])
+            self.assertEqual(nr_journal.open_exposure(), 0.0)
+            self.assertTrue(all(
+                record["status"] == "SETTLED" for record in nr_journal.state["baskets"].values()
+            ))
+            snapshot = self._health(health_path, nr_journal)
+            self.assertEqual(snapshot["open_negrisk"], 0)
+            self.assertEqual(snapshot["negrisk_exposure"], 0.0)
+            risk.check_negrisk(opportunities[0])
+            self.assertEqual(classify_risk_skip(ValueError("total exposure limit")), "open_exposure")
+            self.assertEqual(runner.scanner.min_net_profit_usd, 0.01)
+            self.assertEqual(runner.negrisk_scanner.min_net_profit_usd, 0.01)
+            self.assertIsNone(os.environ.get("ENABLE_NEGRISK_LIVE"))
+
+    def test_paper_runner_resolution_settles_assembled_complete_set(self):
+        market = NegRiskMarket.from_gamma(nway_payload())
+        binary = BinaryMarket("m1", "c1", "Binary", "yes-token", "no-token", category="geopolitics")
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ, {"WHALE_STATE_PATH": ""}, clear=False,
+        ):
+            nr_journal = LiveNegRiskJournal(os.path.join(directory, "paper-negrisk.json"))
+            nr_exec = PaperNegRiskExecutor(nr_journal)
+            runner = PaperMarketRunner(
+                [binary], os.path.join(directory, "ledger.json"), 100.0,
+                BinaryArbitrageScanner(min_net_profit_usd=0.01, min_return=0.0, safety_buffer_usd=0.0),
+                negrisk_markets=[market],
+                negrisk_scanner=NegRiskBookScanner(
+                    min_net_profit_usd=0.01, min_return=0.0, safety_buffer_usd=0.0,
+                ),
+                negrisk_executor=nr_exec,
+            )
+            nr_exec.ledger = runner.ledger
+            runner.max_book_age_seconds = 1e9
+            now = int(__import__("time").time() * 1000)
+            for token in ("tok-a", "tok-b", "tok-c"):
+                asyncio.run(runner.process({
+                    "event_type": "book", "asset_id": token, "timestamp": str(now),
+                    "hash": token, "asks": [{"price": "0.20", "size": "10"}], "bids": [],
+                }))
+            self.assertEqual(len(nr_journal.incomplete_baskets()), 1)
+            self.assertGreater(nr_journal.open_exposure(), 0.0)
+            asyncio.run(runner.process({
+                "event_type": "market_resolved", "market": "nr1", "winning_outcome": "A",
+            }))
+            baskets = list(nr_journal.state["baskets"].values())
+            self.assertEqual(len(baskets), 1)
+            self.assertEqual(baskets[0]["status"], "SETTLED")
+            self.assertEqual(baskets[0]["settlement_type"], "PAPER_LEDGER")
+            self.assertEqual(nr_journal.incomplete_baskets(), [])
+            self.assertEqual(nr_journal.open_exposure(), 0.0)
+            self.assertTrue(all(pos.get("settled") for pos in runner.ledger.state["positions"].values()))
+
+    def test_legacy_settled_ledger_pairs_assembled_journal_one_to_one(self):
+        _market, opportunity = self._market_and_opportunity("legacy")
+        with tempfile.TemporaryDirectory() as directory:
+            journal = LiveNegRiskJournal(os.path.join(directory, "paper-negrisk.json"))
+            ledger = JsonLedger(os.path.join(directory, "ledger.json"), initial_cash=1000.0)
+            executor = PaperNegRiskExecutor(journal, ledger)
+            first = executor.execute(opportunity)
+            second = executor.execute(opportunity)
+            for position in ledger.state["positions"].values():
+                position.pop("basket_id", None)
+            ledger.save()
+            open_ids = {first.basket_id, second.basket_id}
+            self.assertEqual({record["basket_id"] for record in journal.incomplete_baskets()}, open_ids)
+            # Settle only one ledger row: one journal basket must remain ASSEMBLED.
+            position_id = next(iter(ledger.state["positions"]))
+            ledger.settle(position_id, "A")
+            cleared = executor.settle_baskets()
+            self.assertEqual(len(cleared), 1)
+            remaining = journal.incomplete_baskets()
+            self.assertEqual(len(remaining), 1)
+            self.assertEqual(remaining[0]["status"], "ASSEMBLED")
+            self.assertIn(remaining[0]["basket_id"], open_ids)
+            self.assertAlmostEqual(journal.open_exposure(), float(remaining[0]["capital_reserved"]))
 
 
 if __name__ == "__main__":

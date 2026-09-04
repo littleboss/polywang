@@ -842,6 +842,7 @@ class PaperNegRiskExecutor:
     def execute(self, opportunity: NegRiskBookOpportunity):
         if opportunity.shares <= 0.0:
             raise ValueError("cannot execute an empty NegRisk basket")
+        position_id = ""
         if self.ledger is not None:
             required = opportunity.capital_required
             cash = float(self.ledger.state["cash"])
@@ -855,7 +856,7 @@ class PaperNegRiskExecutor:
                 "shares": opportunity.shares,
                 "cost": opportunity.capital_required,
             })
-            position_id = f"nr:{opportunity.market_id}:{int(time.time() * 1_000_000)}"
+            position_id = f"nr:{opportunity.market_id}:{time.time_ns()}"
             self.ledger.state["positions"][position_id] = {
                 "position_id": position_id,
                 "market_id": opportunity.market_id,
@@ -872,9 +873,15 @@ class PaperNegRiskExecutor:
             }
             self.ledger.save()
         basket_id = self.journal.create_basket(opportunity)
+        if self.ledger is not None and position_id:
+            self.ledger.state["positions"][position_id]["basket_id"] = basket_id
+            self.ledger.save()
+        order_ids = []
         for index, leg in enumerate(opportunity.legs):
+            order_id = f"paper-nr-{index}-{basket_id}"
+            order_ids.append(order_id)
             self.journal.set_leg_order(
-                basket_id, leg.token_id, f"paper-nr-{index}", opportunity.shares, status="FILLED",
+                basket_id, leg.token_id, order_id, opportunity.shares, status="FILLED",
             )
         self.journal.set_status(basket_id, "ASSEMBLED")
         return SimpleNamespace(
@@ -882,8 +889,80 @@ class PaperNegRiskExecutor:
             shares=opportunity.shares,
             direction=opportunity.direction,
             status="ASSEMBLED",
-            order_ids=tuple(f"paper-nr-{index}" for index in range(len(opportunity.legs))),
+            order_ids=tuple(order_ids),
         )
+
+    def _settled_negrisk_positions(self) -> List[dict]:
+        if self.ledger is None:
+            return []
+        return [
+            position
+            for position in self.ledger.state.get("positions", {}).values()
+            if isinstance(position, dict)
+            and position.get("settled")
+            and str(position.get("kind") or "") == "negrisk"
+        ]
+
+    def _mark_paper_settled(self, basket_id: str) -> dict:
+        return self.journal.mark_settled(
+            basket_id,
+            "paper-ledger",
+            settlement_type="PAPER_LEDGER",
+        )
+
+    def settle_baskets(self) -> List[dict]:
+        """Mark paper journal baskets SETTLED once the ledger has paid them out.
+
+        Paper has no on-chain redeem. Ledger settlement used to credit cash while
+        leaving the journal at ASSEMBLED, so live-health ``open_negrisk`` and
+        ``negrisk_exposure`` kept counting ghost inventory.
+
+        Matching is 1:1: prefer the ledger row's ``basket_id``, then pair leftover
+        legacy rows (no basket_id) with one still-open journal basket on the same
+        market. ``RESOLVED_PENDING_REDEMPTION`` settles immediately.
+        """
+        claimed: set = set()
+        settled: List[dict] = []
+
+        def claim(basket_id: str) -> None:
+            if not basket_id or basket_id in claimed:
+                return
+            record = self.journal._record(basket_id)
+            if record.get("status") in self.journal.TERMINAL_STATUSES:
+                claimed.add(basket_id)
+                return
+            settled.append(self._mark_paper_settled(basket_id))
+            claimed.add(basket_id)
+
+        for record in list(self.journal.incomplete_baskets()):
+            if str(record.get("status") or "") == "RESOLVED_PENDING_REDEMPTION":
+                claim(str(record.get("basket_id") or ""))
+
+        leftover_by_market: Dict[str, int] = {}
+        for position in self._settled_negrisk_positions():
+            basket_id = str(position.get("basket_id") or "")
+            if basket_id:
+                try:
+                    claim(basket_id)
+                    continue
+                except KeyError:
+                    pass
+            market_id = str(position.get("market_id") or "")
+            if market_id:
+                leftover_by_market[market_id] = leftover_by_market.get(market_id, 0) + 1
+
+        for record in list(self.journal.incomplete_baskets()):
+            basket_id = str(record.get("basket_id") or "")
+            if basket_id in claimed:
+                continue
+            if str(record.get("status") or "") not in {"ASSEMBLED", "CONVERT_SUBMITTED"}:
+                continue
+            market_id = str(record.get("market_id") or "")
+            if leftover_by_market.get(market_id, 0) <= 0:
+                continue
+            leftover_by_market[market_id] -= 1
+            claim(basket_id)
+        return settled
 
 
 @dataclass
