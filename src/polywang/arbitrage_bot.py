@@ -662,6 +662,22 @@ class PaperMarketRunner:
                 if market and resolved_id in {market.market_id, market.condition_id} and not position.get("settled"):
                     self.ledger.settle(position_id, winning)
                     LOG.info("PAPER SETTLE: %s | position %s", market.title, position_id)
+            if self.negrisk_journal:
+                marked = 0
+                for resolved_market in self.negrisk_markets.values():
+                    if resolved_id in {resolved_market.market_id, resolved_market.condition_id}:
+                        marked += self.negrisk_journal.mark_resolved(resolved_id, winning)
+                if marked:
+                    LOG.info("PAPER NEGRISK RESOLUTION: %s basket(s) pending paper settlement", marked)
+                settler = getattr(self.negrisk_executor, "settle_baskets", None)
+                settled_baskets = settler() if settler is not None else []
+                if inspect.isawaitable(settled_baskets):
+                    settled_baskets = await settled_baskets
+                if settled_baskets:
+                    LOG.info(
+                        "PAPER NEGRISK SETTLED: %s basket(s) cleared from open exposure",
+                        len(settled_baskets),
+                    )
             return
         if event_type == "last_trade_price":
             token_id = str(value("asset_id", "token_id", default=""))
@@ -2130,6 +2146,13 @@ def main() -> int:
             paper_negrisk = PaperNegRiskExecutor(negrisk_journal, runner.ledger)
             runner.negrisk_executor = paper_negrisk
             runner.negrisk_journal = negrisk_journal
+            recovered = paper_negrisk.settle_baskets()
+            if recovered:
+                LOG.info(
+                    "PAPER NEGRISK SETTLED: %s basket(s) already paid on the ledger; "
+                    "cleared from open exposure",
+                    len(recovered),
+                )
         directional_journal = LiveDirectionalJournal(args.directional_journal)
         runner.directional_executor = PaperDirectionalExecutor(directional_journal)
         _attach_research(runner, directional_journal)
