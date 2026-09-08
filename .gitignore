@@ -24,3 +24,5 @@ live-kill-switch
 whale-intelligence.json
 calibration.json
 market-events.jsonl
+market-events.jsonl.*
+monitor-exceptions.jsonl

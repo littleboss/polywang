@@ -25,6 +25,17 @@ from .sports_channel import (
     consume_sports_channel, evaluate_sports_candidate,
 )
 from .market_replay import JsonlEventRecorder
+from .monitor import (
+    BOOK_HEALTH_MAX_EVENT_BYTES,
+    HealthPublisher,
+    bind_health_publisher,
+    book_health_report,
+    compute_health_payload,
+    configure_exception_log,
+    maybe_load_json_state,
+    record_monitor_exception,
+    write_health,
+)
 from .macro_model import JsonlMacroFeed, MacroEventModel, MacroRelease
 from .crypto_model import CryptoObservation, CryptoStatArbModel, JsonlCryptoFeed
 from .polymarket_edge import (
@@ -305,17 +316,6 @@ def load_dotenv(path: str = "") -> None:
                 os.environ[key] = value
 
 
-def write_health(path: str, payload: dict) -> None:
-    if not path:
-        return
-    directory = os.path.dirname(os.path.abspath(path)) or "."
-    os.makedirs(directory, exist_ok=True)
-    body = dict(payload)
-    body["updated_at"] = time.time()
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(body, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-
 
 def fetch_markets(limit: int, *, get=None, pool: Optional[int] = None) -> List[BinaryMarket]:
     """Fetch a volume-ordered pool, then keep the binary markets with the lowest yes+no ask sum."""
@@ -588,6 +588,12 @@ class PaperMarketRunner:
         self.calibration = None
         self.edge_evaluator = None
         self.last_directional_event = ""
+        self.health_publisher = None
+
+    def _publish_health(self, running: bool = True) -> None:
+        publisher = getattr(self, "health_publisher", None)
+        if publisher is not None:
+            publisher.flush(running=running)
 
     def invalidate_books(self, token_ids: Optional[Iterable[str]] = None) -> None:
         """Require fresh snapshots after a market-stream reconnect.
@@ -656,12 +662,14 @@ class PaperMarketRunner:
                                 "LIVE NEGRISK SETTLED: %s basket(s) after confirmed redemption",
                                 len(settled_baskets),
                             )
+                            self._publish_health()
                 return
             for position_id, position in list(self.ledger.state["positions"].items()):
                 market = self.markets.get(position.get("market_id")) or self.negrisk_markets.get(position.get("market_id"))
                 if market and resolved_id in {market.market_id, market.condition_id} and not position.get("settled"):
                     self.ledger.settle(position_id, winning)
                     LOG.info("PAPER SETTLE: %s | position %s", market.title, position_id)
+                    self._publish_health()
             if self.negrisk_journal:
                 marked = 0
                 for resolved_market in self.negrisk_markets.values():
@@ -678,6 +686,7 @@ class PaperMarketRunner:
                         "PAPER NEGRISK SETTLED: %s basket(s) cleared from open exposure",
                         len(settled_baskets),
                     )
+                    self._publish_health()
             return
         if event_type == "last_trade_price":
             token_id = str(value("asset_id", "token_id", default=""))
@@ -991,9 +1000,22 @@ def _clob_rest_retry_after(response) -> float:
 
 def _raise_for_clob_rest(response, *, batch: bool = False) -> None:
     if response.status_code == 429:
+        record_monitor_exception(
+            RestRateLimitError(_clob_rest_retry_after(response)),
+            source="rest-book",
+            kind="http_429",
+            extra={"status_code": 429},
+        )
         raise RestRateLimitError(_clob_rest_retry_after(response))
     if batch and response.status_code == 404:
         raise RestBooksUnavailable("POST /books returned 404")
+    if response.status_code >= 500:
+        record_monitor_exception(
+            f"CLOB REST HTTP {response.status_code}",
+            source="rest-book",
+            kind="http_500",
+            extra={"status_code": int(response.status_code)},
+        )
     response.raise_for_status()
 
 
@@ -1324,6 +1346,9 @@ async def _run_market_stream_shard(
                 "Market stream shard %d disconnected: %s; reconnecting in %.1fs",
                 shard_index, error, backoff,
             )
+            record_monitor_exception(
+                error, source="market", extra={"shard": shard_index},
+            )
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2.0, 30.0)
 
@@ -1589,6 +1614,7 @@ async def run_official_market_stream(executor: OfficialFOKExecutor,
             raise
         except Exception as error:
             LOG.warning("Official market stream disconnected: %s; reconnecting in %.1fs", error, backoff)
+            record_monitor_exception(error, source="official-market")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2.0, 30.0)
         finally:
@@ -1618,6 +1644,7 @@ async def run_user_stream(executor: OfficialFOKExecutor,
             raise
         except Exception as error:
             LOG.warning("User stream disconnected: %s; reconnecting in %.1fs", error, backoff)
+            record_monitor_exception(error, source="user")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2.0, 30.0)
 
@@ -1740,6 +1767,7 @@ async def run_sports_stream(executor: OfficialFOKExecutor, tracker: SportsStateT
             raise
         except Exception as error:
             LOG.warning("Sports stream disconnected: %s; reconnecting in %.1fs", error, backoff)
+            record_monitor_exception(error, source="sports")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2.0, 30.0)
 
@@ -1858,23 +1886,86 @@ async def run_health_loop(path: str, risk: Optional[LiveRiskController],
                           journal: Optional[LiveOrderJournal],
                           directional: Optional[LiveDirectionalJournal],
                           stop: asyncio.Event,
-                          negrisk: Optional[LiveNegRiskJournal] = None) -> None:
+                          negrisk: Optional[LiveNegRiskJournal] = None,
+                          ledger: Optional[JsonLedger] = None,
+                          publisher: Optional[HealthPublisher] = None) -> None:
     interval = max(1.0, env_float("LIVE_HEALTH_INTERVAL_SECONDS", 5.0))
-    while not stop.is_set():
-        write_health(path, {
-            "status": "halted" if risk and risk.state.get("halted") else "running",
-            "halt_reason": (risk.state.get("halt_reason") if risk else ""),
-            "pair_exposure": journal.open_exposure() if journal else 0.0,
-            "directional_exposure": directional.open_exposure() if directional else 0.0,
-            "negrisk_exposure": negrisk.open_exposure() if negrisk else 0.0,
-            "open_pairs": len(journal.incomplete_pairs()) if journal else 0,
-            "open_directional": len(directional.incomplete_trades()) if directional else 0,
-            "open_negrisk": len(negrisk.incomplete_baskets()) if negrisk else 0,
-        })
-        try:
-            await asyncio.wait_for(stop.wait(), timeout=interval)
-        except asyncio.TimeoutError:
-            continue
+    writer = publisher or HealthPublisher(
+        path, ledger=ledger, pair_journal=journal, directional=directional,
+        negrisk=negrisk, risk=risk,
+    )
+    try:
+        while not stop.is_set():
+            writer.flush(running=True)
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                continue
+    finally:
+        writer.flush(running=False)
+
+
+def _health_sources(args) -> dict:
+    ledger_path = getattr(args, "ledger", None) or os.getenv("PAPER_LEDGER", "paper-ledger.json")
+    pair_path = getattr(args, "live_journal", None) or os.getenv("LIVE_ORDER_JOURNAL", "live-orders.json")
+    directional_path = (
+        getattr(args, "directional_journal", None)
+        or os.getenv("LIVE_DIRECTIONAL_JOURNAL", "live-directional.json")
+    )
+    negrisk_path = getattr(args, "negrisk_journal", None) or ""
+    if not negrisk_path:
+        negrisk_path = os.getenv("PAPER_NEGRISK_JOURNAL") or os.getenv("LIVE_NEGRISK_JOURNAL") or "paper-negrisk.json"
+    return {
+        "ledger": maybe_load_json_state(JsonLedger, ledger_path),
+        "pair_journal": maybe_load_json_state(LiveOrderJournal, pair_path),
+        "directional": maybe_load_json_state(LiveDirectionalJournal, directional_path),
+        "negrisk": maybe_load_json_state(LiveNegRiskJournal, negrisk_path),
+    }
+
+
+def _print_health_snapshot(health_path: str, args) -> int:
+    if not os.path.isfile(health_path):
+        print(json.dumps({"status": "missing", "path": health_path}, indent=2, sort_keys=True))
+        return 1
+    sources = _health_sources(args)
+    stored = None
+    with open(health_path, encoding="utf-8") as handle:
+        stored = json.load(handle)
+    snapshot = compute_health_payload(
+        ledger=sources["ledger"],
+        pair_journal=sources["pair_journal"],
+        directional=sources["directional"],
+        negrisk=sources["negrisk"],
+        stored=stored if isinstance(stored, dict) else None,
+        running=None,
+        pid=(stored or {}).get("pid") if isinstance(stored, dict) else None,
+    )
+    if snapshot.get("status") == "stopped":
+        persist = dict(snapshot)
+        if isinstance(stored, dict) and stored.get("heartbeat_at") is not None:
+            persist["heartbeat_at"] = stored.get("heartbeat_at")
+        write_health(health_path, persist)
+    print(json.dumps(snapshot, indent=2, sort_keys=True))
+    return 0
+
+
+def _print_book_health(health_path: str, args) -> int:
+    sources = _health_sources(args)
+    events_path = os.getenv("MARKET_EVENT_LOG", "market-events.jsonl")
+    exceptions_path = os.getenv("MONITOR_EXCEPTIONS_LOG", "monitor-exceptions.jsonl")
+    max_bytes = env_int("BOOK_HEALTH_MAX_EVENT_BYTES", BOOK_HEALTH_MAX_EVENT_BYTES)
+    report = book_health_report(
+        events_path=events_path,
+        exceptions_path=exceptions_path,
+        health_path=health_path if os.path.isfile(health_path) else "",
+        ledger=sources["ledger"],
+        pair_journal=sources["pair_journal"],
+        directional=sources["directional"],
+        negrisk=sources["negrisk"],
+        max_event_bytes=max_bytes,
+    )
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0
 
 
 def _install_stop_signal(stop: asyncio.Event) -> None:
@@ -1947,6 +2038,8 @@ def main() -> int:
     parser.add_argument("--directional-journal", default=os.getenv("LIVE_DIRECTIONAL_JOURNAL", "live-directional.json"))
     parser.add_argument("--negrisk-journal", default="", help="NegRisk journal path. Paper defaults to paper-negrisk.json, never live-orders.json")
     parser.add_argument("--health", action="store_true", help="Print the local health snapshot and exit")
+    parser.add_argument("--book-health", action="store_true", help="Morning book-health: bounded event tail + exception counts")
+    parser.add_argument("--morning-health", action="store_true", help="Alias for --book-health")
     parser.add_argument("--status", action="store_true", help="Print the local live journal summary and exit")
     parser.add_argument("--cash", type=float, default=env_float("PAPER_CASH", 1000.0))
     parser.add_argument("--max-order", type=float, default=env_float("MAX_ORDER_USD", 100.0))
@@ -1966,12 +2059,9 @@ def main() -> int:
         return 2
     health_path = os.getenv("LIVE_HEALTH_PATH", "live-health.json")
     if args.health:
-        if not os.path.isfile(health_path):
-            print(json.dumps({"status": "missing", "path": health_path}, indent=2, sort_keys=True))
-            return 1
-        with open(health_path, encoding="utf-8") as handle:
-            print(handle.read())
-        return 0
+        return _print_health_snapshot(health_path, args)
+    if args.book_health or args.morning_health:
+        return _print_book_health(health_path, args)
     if args.status:
         payload = {
             "pairs": LiveOrderJournal(args.live_journal).summary(),
@@ -1986,6 +2076,8 @@ def main() -> int:
     if args.live and os.getenv("POLYMARKET_LIVE_CONFIRM") != "I_UNDERSTAND_THE_RISK":
         LOG.error("Set POLYMARKET_LIVE_CONFIRM=I_UNDERSTAND_THE_RISK to unlock live FOK execution")
         return 2
+
+    configure_exception_log(os.getenv("MONITOR_EXCEPTIONS_LOG", "monitor-exceptions.jsonl"))
 
     want_negrisk = negrisk_execution_enabled(args.live)
     negrisk_limit = env_int("NEGRISK_MARKET_LIMIT", 20) if want_negrisk else 0
@@ -2083,6 +2175,17 @@ def main() -> int:
             )
             runner.directional_executor = directional
             _attach_research(runner, directional_journal)
+            health_publisher = HealthPublisher(
+                health_path,
+                ledger=runner.ledger,
+                pair_journal=journal,
+                directional=directional_journal,
+                negrisk=negrisk_journal,
+                risk=risk,
+            )
+            bind_health_publisher(health_publisher, journal, directional_journal, negrisk_journal)
+            runner.health_publisher = health_publisher
+            health_publisher.flush(running=True)
             stop = asyncio.Event()
             _install_stop_signal(stop)
             market_task = asyncio.create_task(
@@ -2095,7 +2198,10 @@ def main() -> int:
                 )
             )
             health_task = asyncio.create_task(
-                run_health_loop(health_path, risk, journal, directional_journal, stop, negrisk_journal)
+                run_health_loop(
+                    health_path, risk, journal, directional_journal, stop, negrisk_journal,
+                    ledger=runner.ledger, publisher=health_publisher,
+                )
             )
             tasks = {market_task, user_task, reconcile_task, health_task}
             tasks |= _research_tasks(runner, executor, directional)
@@ -2156,10 +2262,23 @@ def main() -> int:
         directional_journal = LiveDirectionalJournal(args.directional_journal)
         runner.directional_executor = PaperDirectionalExecutor(directional_journal)
         _attach_research(runner, directional_journal)
+        health_publisher = HealthPublisher(
+            health_path,
+            ledger=runner.ledger,
+            pair_journal=None,
+            directional=directional_journal,
+            negrisk=negrisk_journal,
+        )
+        bind_health_publisher(health_publisher, runner.ledger, directional_journal, negrisk_journal)
+        runner.health_publisher = health_publisher
+        health_publisher.flush(running=True)
         stop = asyncio.Event()
         _install_stop_signal(stop)
         health_task = asyncio.create_task(
-            run_health_loop(health_path, None, None, directional_journal, stop, negrisk_journal)
+            run_health_loop(
+                health_path, None, None, directional_journal, stop, negrisk_journal,
+                ledger=runner.ledger, publisher=health_publisher,
+            )
         )
         market_task = asyncio.create_task(run_market_stream(runner, list(runner.token_to_market)))
         tasks = {market_task, health_task} | _research_tasks(runner)

@@ -27,7 +27,7 @@ uv run polywang-replay --markets fixtures/replay/markets.json --events fixtures/
 
 仓库自带 `fixtures/replay/` 作为可提交的示例数据集。回放会按事件里的 `fee_rate_bps` 回填费率，并用排队/拒单/第二腿失败模型估计成交；`executed_net_profit` 仍然是模拟值。
 
-live 或 paper 运行时设置 `MARKET_EVENT_LOG=market-events.jsonl` 可记录收到的 raw/typed market event、源类型和本机接收时间，之后可直接作为盘口回放输入。记录器只保存事件，不会把订单响应或成交假设写成历史成交；成交真实性仍需单独保存 `live-orders.json` 并做对账。
+live 或 paper 运行时设置 `MARKET_EVENT_LOG=market-events.jsonl` 可记录收到的 raw/typed market event、源类型和本机接收时间，之后可直接作为盘口回放输入。活动文件大约到 512MB 或满 24 小时会轮转，避免单文件膨胀到几十 GB。断线、HTTP 429/500、EIP-712、text PONG 超时等馈源故障写入独立的 `monitor-exceptions.jsonl`，早盘 `--book-health` / `--morning-health` 只从这个文件读异常计数，并对事件带做最多 64MB 的尾部读取。记录器只保存事件，不会把订单响应或成交假设写成历史成交；成交真实性仍需单独保存 `live-orders.json` 并做对账。
 
 回放结果只是“按记录盘口可见的机会报告”，还需要用真实订单回报校验成交率、延迟、拒单和实际手续费，不能把回放净收益直接当成可实现 PnL。启用 `--consume-fills` 和执行延迟后，`executed_net_profit` 只代表通过模拟深度、价格上限和新鲜度检查的回放成交；顶层 `net_profit` 仍是所有可见信号的汇总，不能替代真实 PnL。
 
@@ -35,7 +35,7 @@ live 或 paper 运行时设置 `MARKET_EVENT_LOG=market-events.jsonl` 可记录�
 
 `src/polywang/macro_model.py` 从 `MACRO_FEED_PATH` JSONL 读取带时间戳的 actual/consensus/std，按 `event_id` 去重，并可用 `MACRO_MARKET_MAP` 绑定指标到市场。`src/polywang/crypto_model.py` 从 `CRYPTO_REFERENCE_FEED_PATH` 读取独立参考概率，或用 spot/strike/vol/T 计算数字期权 `N(d2)`；进入对侧 Polymarket token，退出用 SELL 平自有库存，不用 CEX 期货对冲。两者默认 `executable=false`，只有显式执行开关、样本外校准和风控限额同时满足才会下单。
 
-启动时会读取本地 `.env`（不覆盖已有环境变量）。模板见 `.env.example`。实盘循环会写 `live-health.json`；`uv run polywang --health` 可查看。收到 SIGINT/SIGTERM 时，默认 `LIVE_CANCEL_ON_SHUTDOWN=1` 会撤销未完成订单。方向性库存记在 `live-directional.json`，计入同一套暴露限额。
+启动时会读取本地 `.env`（不覆盖已有环境变量）。模板见 `.env.example`。交易循环会写 `live-health.json`：`open_negrisk` / 暴露以 `paper-ledger.json` 未结算仓位为准，journal 只补仍未入账的未结篮子；文件里带 `pid` 和 `heartbeat_at`，进程不在了 `--health` 必须报 `status=stopped`。`uv run polywang --health` 和 `uv run polywang --book-health` 可查看。收到 SIGINT/SIGTERM 时，默认 `LIVE_CANCEL_ON_SHUTDOWN=1` 会撤销未完成订单。方向性库存记在 `live-directional.json`，计入同一套暴露限额。
 
 ## 确定性二元套利引擎
 

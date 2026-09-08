@@ -15,7 +15,7 @@ import math
 import os
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Iterable, List, Optional
 import random
 
@@ -29,12 +29,44 @@ from .arbitrage_core import (
 from .polymarket_edge import PolymarketFeeModel
 
 
-class JsonlEventRecorder:
-    """Append raw/typed stream events with local receipt metadata."""
+DEFAULT_EVENT_LOG_MAX_BYTES = 512 * 1024 * 1024
+DEFAULT_EVENT_LOG_MAX_AGE_SECONDS = 24 * 3600
 
-    def __init__(self, path: str = "", source: str = "market"):
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    try:
+        value = int(raw) if raw else default
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+class JsonlEventRecorder:
+    """Append raw/typed stream events with local receipt metadata.
+
+    The active file is rotated when it reaches ``max_bytes`` (~512MB) or
+    ``max_age_seconds`` (24h), whichever comes first. Rotated files keep the
+    same basename plus a UTC stamp so the live tape stays bounded.
+    """
+
+    def __init__(self, path: str = "", source: str = "market",
+                 max_bytes: Optional[int] = None, max_age_seconds: Optional[float] = None,
+                 clock=None):
         self.path = path
         self.source = source
+        self.max_bytes = int(
+            max_bytes if max_bytes is not None
+            else _env_int("MARKET_EVENT_LOG_MAX_BYTES", DEFAULT_EVENT_LOG_MAX_BYTES)
+        )
+        age = (
+            max_age_seconds if max_age_seconds is not None
+            else _env_int("MARKET_EVENT_LOG_MAX_AGE_SECONDS", DEFAULT_EVENT_LOG_MAX_AGE_SECONDS)
+        )
+        self.max_age_seconds = float(age)
+        self.clock = clock or time.time
+        self._opened_at: Optional[float] = None
+        self.rotated_paths: List[str] = []
 
     @staticmethod
     def _jsonable(event):
@@ -45,9 +77,62 @@ class JsonlEventRecorder:
             return dict(event)
         raise TypeError(f"event is not JSON serializable: {type(event).__name__}")
 
+    def _file_origin(self) -> float:
+        if not os.path.isfile(self.path):
+            return float(self.clock())
+        try:
+            with open(self.path, "r", encoding="utf-8") as handle:
+                first = handle.readline()
+            if first:
+                row = json.loads(first)
+                stamp = row.get("received_at_ms")
+                if stamp not in (None, ""):
+                    return float(stamp) / 1000.0
+        except (OSError, TypeError, ValueError):
+            pass
+        try:
+            return float(os.path.getctime(self.path))
+        except OSError:
+            return float(self.clock())
+
+    def _maybe_rotate(self) -> Optional[str]:
+        if not self.path or not os.path.isfile(self.path):
+            if self._opened_at is None:
+                self._opened_at = float(self.clock())
+            return None
+        if self._opened_at is None:
+            self._opened_at = self._file_origin()
+        try:
+            size = os.path.getsize(self.path)
+        except OSError:
+            return None
+        age = float(self.clock()) - float(self._opened_at)
+        if size < self.max_bytes and age < self.max_age_seconds:
+            return None
+        if size <= 0:
+            self._opened_at = float(self.clock())
+            return None
+        return self.rotate()
+
+    def rotate(self) -> Optional[str]:
+        """Rename the active tape and start a new empty file on next write."""
+        if not self.path or not os.path.isfile(self.path):
+            return None
+        stamp = datetime.fromtimestamp(int(self.clock()), tz=timezone.utc).strftime("%Y%m%dT%H%M%S")
+        dest = f"{self.path}.{stamp}"
+        suffix = 1
+        while os.path.exists(dest):
+            dest = f"{self.path}.{stamp}.{suffix}"
+            suffix += 1
+        os.replace(self.path, dest)
+        self.rotated_paths.append(dest)
+        self._opened_at = float(self.clock())
+        return dest
+
     def record(self, event, received_at_ms: Optional[int] = None) -> None:
         if not self.path:
             return
+        self._maybe_rotate()
         payload = self._jsonable(event)
         if not isinstance(payload, dict):
             raise TypeError("recorded event must serialize to an object")
@@ -60,6 +145,9 @@ class JsonlEventRecorder:
         with open(self.path, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n")
             handle.flush()
+        if self._opened_at is None:
+            self._opened_at = float(self.clock())
+        self._maybe_rotate()
 
 
 @dataclass(frozen=True)

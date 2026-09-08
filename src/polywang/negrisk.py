@@ -574,6 +574,7 @@ class LiveNegRiskJournal:
     def __init__(self, path: str):
         self.path = path
         self.state = {"baskets": {}, "events": []}
+        self.on_flush = None
         self.load()
 
     def load(self) -> None:
@@ -606,6 +607,9 @@ class LiveNegRiskJournal:
             except OSError:
                 pass
             raise
+        callback = self.on_flush
+        if callback:
+            callback()
 
     def create_basket(self, opportunity: NegRiskBookOpportunity) -> str:
         basket_id = f"nr:{opportunity.market_id}:{time.time_ns()}"
