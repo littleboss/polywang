@@ -24,11 +24,12 @@ uv run polywang-replay \
 
 ```bash
 uv run polywang --health
+uv run polywang --book-health
 uv run polywang --status --live-journal live-orders.json \
   --directional-journal live-directional.json
 ```
 
-`--health` 读 `LIVE_HEALTH_PATH`（默认 `live-health.json`）。进程在跑时应周期性更新该文件；文件缺失则退出码为 1。`--status` 汇总 pair 账本和方向性库存。
+`--health` 读 `LIVE_HEALTH_PATH`（默认 `live-health.json`），并按账本重算未结仓。进程活着时应周期性写 `pid` / `heartbeat_at`；进程已死则报告 `status=stopped`，不会停在 `running`。文件缺失则退出码为 1。`--book-health`（`--morning-health`）最多读 64MB 事件带尾部，异常计数只来自 `monitor-exceptions.jsonl`。`--status` 汇总 pair 账本和方向性库存。
 
 ## 首次小额实盘
 
@@ -63,7 +64,8 @@ uv run polywang --live --markets 20 --max-order 5
 - 可先运行 `uv run polywang --status --live-journal live-orders.json` 查看 pair 状态、暴露、PnL、未确认结算和 `UNHEDGED` 列表；该命令不联网、不读取私钥。
 - `live-orders.json`：确认每个 pair 的两腿订单、实际成交、手续费、交易 hash 和状态。
 - `live-risk.json`：确认暴露、每日亏损和 halt 状态没有异常。
-- `market-events.jsonl`：保留原始/typed 市场事件和本机接收时间，用于事后回放。
+- `market-events.jsonl`：保留原始/typed 市场事件和本机接收时间，用于事后回放。活动文件约 512MB 或 24 小时轮转。
+- `monitor-exceptions.jsonl`：断线、HTTP 429/500、EIP-712、text PONG 超时等馈源故障；早盘健康不要去扫盘口深度事件。
 - 重点区分 `HEDGED`、`RESOLVED_PENDING_REDEMPTION` 和 `SETTLED`；市场已判定不等于抵押品已到账。
 - User Stream 是实时来源，REST 是兜底；常规对账使用已知订单和增量成交水位，启动及定期恢复轮次会扫描账户内全部 open order 和外部持仓。任何 journal 之外的订单或条件 token 都会 halt。不要把 REST 查询返回的历史成交数量直接当成本轮新增成交。
 - 市场频道增量必须连续：`sequence` 断档、`prev_hash` 对不上或未知 `schema_version` 会清空本地盘口，直到下一张 snapshot。丢失增量后不得继续用残缺盘口下单。

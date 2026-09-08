@@ -809,6 +809,7 @@ class JsonLedger:
         self.initial_cash = float(initial_cash)
         self.state = {"initial_cash": float(initial_cash), "cash": float(initial_cash),
                       "positions": {}, "trades": []}
+        self.on_flush = None
         self.load()
 
     def load(self) -> None:
@@ -840,6 +841,9 @@ class JsonLedger:
             except OSError:
                 pass
             raise
+        callback = self.on_flush
+        if callback:
+            callback()
 
     def open_pair(self, opportunity: ArbitrageOpportunity) -> PaperPosition:
         required = opportunity.capital_required
@@ -934,6 +938,7 @@ class LiveOrderJournal:
     def __init__(self, path: str):
         self.path = path
         self.state = {"pairs": {}, "events": [], "trade_watermarks": {}}
+        self.on_flush = None
         self.load()
 
     def load(self) -> None:
@@ -967,6 +972,9 @@ class LiveOrderJournal:
             except OSError:
                 pass
             raise
+        callback = self.on_flush
+        if callback:
+            callback()
 
     def create_pair(self, opportunity: ArbitrageOpportunity) -> str:
         pair_id = f"{opportunity.market_id}:{time.time_ns()}"
@@ -1474,6 +1482,7 @@ class LiveDirectionalJournal:
     def __init__(self, path: str):
         self.path = path
         self.state = {"trades": {}, "events": []}
+        self.on_flush = None
         self.load()
 
     def load(self) -> None:
@@ -1506,6 +1515,9 @@ class LiveDirectionalJournal:
             except OSError:
                 pass
             raise
+        callback = self.on_flush
+        if callback:
+            callback()
 
     def create(self, intent: "DirectionalIntent") -> str:
         trade_id = f"{intent.source or 'dir'}:{intent.market_id}:{time.time_ns()}"
@@ -2383,6 +2395,16 @@ class OfficialFOKExecutor:
                 await asyncio.sleep(min(2.0, 0.25 * (2 ** attempt)))
             except Exception as error:
                 status = self._exception_status(error)
+                try:
+                    from .monitor import classify_feed_fault, record_monitor_exception
+                    kind = "http_429" if status == 429 else "http_500" if status == 500 else classify_feed_fault(error, default="feed_fault")
+                    if kind in {"http_429", "http_500", "eip712"}:
+                        record_monitor_exception(
+                            error, source="official-client", kind=kind,
+                            extra={"status_code": status} if status else None,
+                        )
+                except Exception:
+                    pass
                 if status == 425 and attempt < self.max_retries:
                     await asyncio.sleep(min(2.0, 0.25 * (2 ** attempt)))
                     continue
