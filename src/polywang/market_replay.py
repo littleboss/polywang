@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import math
 import os
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -28,13 +30,78 @@ from .arbitrage_core import (
 )
 from .polymarket_edge import PolymarketFeeModel
 
+LOG = logging.getLogger(__name__)
+
+# Paper/live MARKET_EVENT_LOG used to append forever (one run hit ~52GB).
+# Size-rotate so a long paper tape cannot fill the disk, but keep the newest
+# active file plus N rotated siblings for RCA / replay.
+DEFAULT_MARKET_EVENT_LOG_MAX_BYTES = 1 * 1024 * 1024 * 1024  # 1 GiB
+DEFAULT_MARKET_EVENT_LOG_BACKUP_COUNT = 1
+_PATH_LOCKS: Dict[str, threading.Lock] = {}
+_PATH_LOCKS_GUARD = threading.Lock()
+
+
+def _env_non_negative_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        value = int(str(raw).strip(), 10)
+    except ValueError:
+        return default
+    if value < 0:
+        return default
+    return value
+
+
+def market_event_log_max_bytes(explicit: Optional[int] = None) -> int:
+    """Active-file size cap. Values <= 0 fall back to the 1 GiB default."""
+    if explicit is not None:
+        return int(explicit) if explicit > 0 else DEFAULT_MARKET_EVENT_LOG_MAX_BYTES
+    return _env_non_negative_int(
+        "MARKET_EVENT_LOG_MAX_BYTES", DEFAULT_MARKET_EVENT_LOG_MAX_BYTES
+    ) or DEFAULT_MARKET_EVENT_LOG_MAX_BYTES
+
+
+def market_event_log_backup_count(explicit: Optional[int] = None) -> int:
+    """How many rotated siblings to keep (path.1, path.2, ...)."""
+    if explicit is not None:
+        return max(0, int(explicit))
+    return _env_non_negative_int(
+        "MARKET_EVENT_LOG_BACKUP_COUNT", DEFAULT_MARKET_EVENT_LOG_BACKUP_COUNT
+    )
+
+
+def _lock_for_path(path: str) -> threading.Lock:
+    with _PATH_LOCKS_GUARD:
+        lock = _PATH_LOCKS.get(path)
+        if lock is None:
+            lock = threading.Lock()
+            _PATH_LOCKS[path] = lock
+        return lock
+
 
 class JsonlEventRecorder:
-    """Append raw/typed stream events with local receipt metadata."""
+    """Append raw/typed stream events with local receipt metadata.
 
-    def __init__(self, path: str = "", source: str = "market"):
+    When ``MARKET_EVENT_LOG`` is set, the active JSONL is rotated (not
+    disabled) once it reaches ``MARKET_EVENT_LOG_MAX_BYTES``. The newest
+    events stay in the active file; older chunks are kept as ``path.1`` …
+    ``path.N`` up to ``MARKET_EVENT_LOG_BACKUP_COUNT``.
+    """
+
+    def __init__(
+        self,
+        path: str = "",
+        source: str = "market",
+        max_bytes: Optional[int] = None,
+        backup_count: Optional[int] = None,
+    ):
         self.path = path
         self.source = source
+        self.max_bytes = market_event_log_max_bytes(max_bytes)
+        self.backup_count = market_event_log_backup_count(backup_count)
+        self.rotations = 0
 
     @staticmethod
     def _jsonable(event):
@@ -44,6 +111,54 @@ class JsonlEventRecorder:
         if isinstance(event, dict):
             return dict(event)
         raise TypeError(f"event is not JSON serializable: {type(event).__name__}")
+
+    def _file_size(self) -> int:
+        try:
+            return os.path.getsize(self.path)
+        except OSError:
+            return 0
+
+    def _rotate(self) -> None:
+        path = os.path.abspath(self.path)
+        backups = self.backup_count
+        if backups <= 0:
+            # Still keep writing; drop the bloated active file only.
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+            self.rotations += 1
+            LOG.info(
+                "Truncated MARKET_EVENT_LOG %s after exceeding %d bytes "
+                "(backup_count=0; logging continues)",
+                path, self.max_bytes,
+            )
+            with open(path, "a", encoding="utf-8"):
+                pass
+            return
+        oldest = f"{path}.{backups}"
+        try:
+            os.remove(oldest)
+        except FileNotFoundError:
+            pass
+        for index in range(backups - 1, 0, -1):
+            src = f"{path}.{index}"
+            dst = f"{path}.{index + 1}"
+            if os.path.isfile(src):
+                os.replace(src, dst)
+        if os.path.isfile(path):
+            os.replace(path, f"{path}.1")
+        with open(path, "a", encoding="utf-8"):
+            pass
+        self.rotations += 1
+        LOG.info(
+            "Rotated MARKET_EVENT_LOG %s -> %s.1 (max_bytes=%d backup_count=%d)",
+            path, path, self.max_bytes, backups,
+        )
+
+    def _maybe_rotate(self) -> None:
+        if self._file_size() >= self.max_bytes:
+            self._rotate()
 
     def record(self, event, received_at_ms: Optional[int] = None) -> None:
         if not self.path:
@@ -55,11 +170,16 @@ class JsonlEventRecorder:
         payload.setdefault(
             "received_at_ms", int(received_at_ms if received_at_ms is not None else time.time() * 1000)
         )
-        directory = os.path.dirname(os.path.abspath(self.path)) or "."
+        abs_path = os.path.abspath(self.path)
+        directory = os.path.dirname(abs_path) or "."
         os.makedirs(directory, exist_ok=True)
-        with open(self.path, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n")
-            handle.flush()
+        line = json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n"
+        with _lock_for_path(abs_path):
+            self._maybe_rotate()
+            with open(self.path, "a", encoding="utf-8") as handle:
+                handle.write(line)
+                handle.flush()
+            self._maybe_rotate()
 
 
 @dataclass(frozen=True)

@@ -63,11 +63,31 @@ uv run polywang --live --markets 20 --max-order 5
 - 可先运行 `uv run polywang --status --live-journal live-orders.json` 查看 pair 状态、暴露、PnL、未确认结算和 `UNHEDGED` 列表；该命令不联网、不读取私钥。
 - `live-orders.json`：确认每个 pair 的两腿订单、实际成交、手续费、交易 hash 和状态。
 - `live-risk.json`：确认暴露、每日亏损和 halt 状态没有异常。
-- `market-events.jsonl`：保留原始/typed 市场事件和本机接收时间，用于事后回放。
+- `market-events.jsonl`：保留原始/typed 市场事件和本机接收时间，用于事后回放。默认按体积轮转（活动文件约 1 GiB，再留一份 `market-events.jsonl.1`），不会无上限增长。见下方「MARKET_EVENT_LOG 磁盘恢复」。
 - 重点区分 `HEDGED`、`RESOLVED_PENDING_REDEMPTION` 和 `SETTLED`；市场已判定不等于抵押品已到账。
 - User Stream 是实时来源，REST 是兜底；常规对账使用已知订单和增量成交水位，启动及定期恢复轮次会扫描账户内全部 open order 和外部持仓。任何 journal 之外的订单或条件 token 都会 halt。不要把 REST 查询返回的历史成交数量直接当成本轮新增成交。
 - 市场频道增量必须连续：`sequence` 断档、`prev_hash` 对不上或未知 `schema_version` 会清空本地盘口，直到下一张 snapshot。丢失增量后不得继续用残缺盘口下单。
 - Yes/No 两腿时间戳差超过 `MAX_LEG_SKEW_MS`（默认 1000）时跳过扫描，避免用不同时刻的盘口拼出虚假组合价。
+
+## MARKET_EVENT_LOG 磁盘恢复
+
+`MARKET_EVENT_LOG`（默认文件名 `market-events.jsonl`）是完整事件带，长纸面跑曾经涨到几十 GB。代码侧已做体积轮转：
+
+| 变量 | 默认 | 作用 |
+|------|------|------|
+| `MARKET_EVENT_LOG_MAX_BYTES` | `1073741824`（1 GiB） | 活动文件超过该大小后轮转 |
+| `MARKET_EVENT_LOG_BACKUP_COUNT` | `1` | 保留的旧文件个数（`*.jsonl.1` …） |
+
+`MAX_BYTES<=0` 或不合法数字会回退到 1 GiB，避免再次变成无上限。轮转后记录继续写，不会静默关闭。
+
+若磁盘已经被旧版本或僵尸写入进程占满：
+
+1. 停掉纸面/实盘进程（确认没有残留 writer：`ps` / 健康文件停更）。
+2. 删除或归档磁带：`rm -f market-events.jsonl market-events.jsonl.*`，或先 `gzip` 再挪走。
+3. 用 `df -h` 确认有空闲空间。
+4. 再启动。新事件写入空的活动文件；之后由轮转封顶。
+
+需要更长 RCA 窗口时：把 `MARKET_EVENT_LOG_BACKUP_COUNT` 调到 `2`/`3`（磁盘约为 `(1+N) × MAX_BYTES`），或定期把轮转文件拷到别的盘。不要为了省日志去关 Policy Gate / 利润地板，也不要打开实盘。
 
 ## 链上交易超时
 

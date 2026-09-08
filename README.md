@@ -29,6 +29,8 @@ uv run polywang-replay --markets fixtures/replay/markets.json --events fixtures/
 
 live 或 paper 运行时设置 `MARKET_EVENT_LOG=market-events.jsonl` 可记录收到的 raw/typed market event、源类型和本机接收时间，之后可直接作为盘口回放输入。记录器只保存事件，不会把订单响应或成交假设写成历史成交；成交真实性仍需单独保存 `live-orders.json` 并做对账。
 
+长跑时这条 JSONL 会按体积轮转，避免无限增长占满磁盘：活动文件默认到 **1 GiB**（`MARKET_EVENT_LOG_MAX_BYTES`）就改名为 `market-events.jsonl.1`，并继续往新的活动文件写。默认只保留 **1** 个轮转副本（`MARKET_EVENT_LOG_BACKUP_COUNT`），磁盘上大约最多 2 GiB。轮转不会关掉记录；需要更长回放窗口时再调高 `BACKUP_COUNT`，或把 `.1` / `.2` 先 `gzip` 挪到冷存储。磁盘已经被旧进程撑满时：先停掉写入进程，删除或归档 `market-events.jsonl*`，确认 `df -h` 有空间后再重启。`0` 或不合法的上限会回退到 1 GiB，不能靠它重新变成无上限。
+
 回放结果只是“按记录盘口可见的机会报告”，还需要用真实订单回报校验成交率、延迟、拒单和实际手续费，不能把回放净收益直接当成可实现 PnL。启用 `--consume-fills` 和执行延迟后，`executed_net_profit` 只代表通过模拟深度、价格上限和新鲜度检查的回放成交；顶层 `net_profit` 仍是所有可见信号的汇总，不能替代真实 PnL。
 
 `src/polywang/sports_channel.py` 在默认配置下只记日志。设置 `ENABLE_SPORTS_EXECUTION=1`（实盘还需 `ENABLE_SPORTS_LIVE=1`）、`SPORTS_MARKET_MAP` 以及通过校准/边际闸门后，候选会走独立的方向性 BUY 执行器，而不是 Yes+No 组合 FOK。

@@ -3,8 +3,14 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from polywang.market_replay import BinaryMarketReplay, JsonlEventRecorder
+from polywang.market_replay import (
+    DEFAULT_MARKET_EVENT_LOG_BACKUP_COUNT,
+    DEFAULT_MARKET_EVENT_LOG_MAX_BYTES,
+    BinaryMarketReplay,
+    JsonlEventRecorder,
+)
 from polywang.arbitrage_core import BinaryArbitrageScanner, BinaryMarket
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -23,6 +29,74 @@ class ReplayTests(unittest.TestCase):
                 row = json.loads(handle.readline())
             self.assertEqual(row["received_at_ms"], 1700000000123)
             self.assertEqual(row["source"], "market")
+
+    def test_recorder_rotates_when_file_exceeds_max_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "market-events.jsonl")
+            recorder = JsonlEventRecorder(path, max_bytes=400, backup_count=1)
+            for index in range(30):
+                recorder.record({
+                    "event_type": "book",
+                    "asset_id": f"tok-{index:02d}",
+                    "timestamp": str(1_700_000_000_000 + index),
+                    "asks": [],
+                    "bids": [],
+                }, received_at_ms=1_700_000_000_000 + index)
+            self.assertGreaterEqual(recorder.rotations, 1)
+            self.assertTrue(os.path.isfile(path))
+            self.assertTrue(os.path.isfile(path + ".1"))
+            self.assertFalse(os.path.isfile(path + ".2"))
+            self.assertLess(os.path.getsize(path), 400)
+            self.assertGreater(os.path.getsize(path + ".1"), 0)
+            with open(path + ".1", encoding="utf-8") as handle:
+                rotated = [json.loads(line) for line in handle if line.strip()]
+            self.assertTrue(rotated)
+            self.assertEqual(rotated[0]["event_type"], "book")
+            self.assertLessEqual(
+                os.path.getsize(path) + os.path.getsize(path + ".1"),
+                400 * 2 + 200,
+            )
+            recorder.record({
+                "event_type": "price_change",
+                "asset_id": "tok-live",
+                "timestamp": "1700000000999",
+            }, received_at_ms=1_700_000_000_999)
+            with open(path, encoding="utf-8") as handle:
+                after = [json.loads(line) for line in handle if line.strip()]
+            self.assertTrue(after)
+            self.assertEqual(after[-1]["event_type"], "price_change")
+            self.assertEqual(after[-1]["source"], "market")
+
+    def test_recorder_drops_oldest_backup_instead_of_growing_forever(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "market-events.jsonl")
+            recorder = JsonlEventRecorder(path, max_bytes=180, backup_count=1)
+            for index in range(40):
+                recorder.record({
+                    "event_type": "book",
+                    "asset_id": f"tok-{index:02d}",
+                    "n": index,
+                }, received_at_ms=index)
+            self.assertGreaterEqual(recorder.rotations, 2)
+            names = sorted(os.listdir(directory))
+            self.assertEqual(names, ["market-events.jsonl", "market-events.jsonl.1"])
+            total = sum(
+                os.path.getsize(os.path.join(directory, name)) for name in names
+            )
+            self.assertLess(total, 180 * 2 + 200)
+
+    def test_recorder_env_zero_or_invalid_keeps_the_default_cap(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "MARKET_EVENT_LOG_MAX_BYTES": "0",
+                "MARKET_EVENT_LOG_BACKUP_COUNT": "not-a-number",
+            },
+            clear=False,
+        ):
+            recorder = JsonlEventRecorder("market-events.jsonl")
+        self.assertEqual(recorder.max_bytes, DEFAULT_MARKET_EVENT_LOG_MAX_BYTES)
+        self.assertEqual(recorder.backup_count, DEFAULT_MARKET_EVENT_LOG_BACKUP_COUNT)
 
     def test_iso_timestamp_from_typed_event_is_accepted(self):
         market = BinaryMarket("m1", "c1", "Test", "yes", "no")
