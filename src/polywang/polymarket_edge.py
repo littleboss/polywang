@@ -241,6 +241,61 @@ class PolymarketFeeModel:
         return self.fee_per_share(price, is_taker=True) / price
 
 
+def modeled_taker_fee_usd(
+    fee_model: "PolymarketFeeModel",
+    fills: Sequence[Tuple[float, float]],
+    *,
+    is_taker: bool = True,
+) -> float:
+    """Sum official taker fees for ``(price, shares)`` fills at decision prices."""
+    total = 0.0
+    for price, quantity in fills:
+        total += fee_model.fee_usd(float(quantity), float(price), is_taker=is_taker)
+    return total
+
+
+def decision_fee_fields(
+    gross_profit: float,
+    modeled_fees: float,
+    *,
+    safety_buffer_usd: float = 0.0,
+    merge_gas_usd: float = 0.0,
+) -> Tuple[float, float]:
+    """Return ``(expected_net, post_fee_net)`` used at admit time.
+
+    ``expected_net`` is the pre-fee edge after the existing safety buffer and
+    merge-gas costs. ``post_fee_net`` subtracts modeled taker fees and is the
+    number compared to ``min_net_profit_usd``.
+    """
+    expected_net = float(gross_profit) - float(safety_buffer_usd) - float(merge_gas_usd)
+    post_fee_net = expected_net - float(modeled_fees)
+    return expected_net, post_fee_net
+
+
+def admit_net_reject_reason(
+    *,
+    expected_net: float,
+    post_fee_net: float,
+    min_net_profit_usd: float,
+    return_on_capital: float,
+    min_return: float,
+) -> Optional[str]:
+    """SCAN reject reason when a combo fails the post-fee dollar / ROC floors.
+
+    ``fee_drag`` means the pre-fee expected edge cleared ``min_net_profit`` but
+    modeled taker fees pulled ``post_fee_net`` below the floor.
+    ``net_after_fee_below_floor`` is the remaining post-fee dollar miss
+    (including books that never had a pre-fee edge).
+    """
+    if post_fee_net >= min_net_profit_usd and return_on_capital >= min_return:
+        return None
+    if post_fee_net < min_net_profit_usd:
+        if expected_net >= min_net_profit_usd:
+            return "fee_drag"
+        return "net_after_fee_below_floor"
+    return "roc_below_floor"
+
+
 @dataclass
 class BookFill:
     """Result of consuming resting liquidity up to a budget."""

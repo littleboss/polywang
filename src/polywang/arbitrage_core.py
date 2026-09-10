@@ -19,7 +19,13 @@ import time
 from decimal import Decimal, ROUND_DOWN
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-from .polymarket_edge import PolymarketFeeModel, resolve_category
+from .polymarket_edge import (
+    PolymarketFeeModel,
+    admit_net_reject_reason,
+    decision_fee_fields,
+    modeled_taker_fee_usd,
+    resolve_category,
+)
 
 
 def maker_gtc_enabled() -> bool:
@@ -557,6 +563,9 @@ class ArbitrageOpportunity:
         "sequential FOK legs are not atomic; a first-leg fill with a second-leg "
         "failure is unwound with FAK and may slip, partially fill, or remain open"
     )
+    modeled_fees: float = 0.0
+    expected_net: float = 0.0
+    post_fee_net: float = 0.0
 
     @property
     def capital_required(self) -> float:
@@ -708,8 +717,8 @@ class BinaryArbitrageScanner:
             no_cost, no_avg, no_fills = self._cost_for(no_book, shares, no_levels)
             if not yes_fills or not no_fills:
                 continue
-            yes_fee = sum(fee_model.fee_usd(quantity, price, is_taker=taker) for price, quantity in yes_fills)
-            no_fee = sum(fee_model.fee_usd(quantity, price, is_taker=taker) for price, quantity in no_fills)
+            yes_fee = modeled_taker_fee_usd(fee_model, yes_fills, is_taker=taker)
+            no_fee = modeled_taker_fee_usd(fee_model, no_fills, is_taker=taker)
             yes_worst_price = yes_fills[-1][0]
             no_worst_price = no_fills[-1][0]
             yes_execution_amount = shares * yes_worst_price
@@ -727,7 +736,13 @@ class BinaryArbitrageScanner:
                 + yes_execution_fee_cap + no_execution_fee_cap
             )
             gross = shares - yes_cost - no_cost
-            net = gross - yes_fee - no_fee - self.safety_buffer_usd - self.merge_gas_usd
+            modeled_fees = yes_fee + no_fee
+            expected_net, post_fee_net = decision_fee_fields(
+                gross, modeled_fees,
+                safety_buffer_usd=self.safety_buffer_usd,
+                merge_gas_usd=self.merge_gas_usd,
+            )
+            net = post_fee_net
             capital = yes_cost + no_cost + yes_fee + no_fee
             result = ArbitrageOpportunity(
                 market_id=market.market_id,
@@ -768,23 +783,35 @@ class BinaryArbitrageScanner:
                     "resting GTC legs are not atomic; a timeout cancels leftovers "
                     "and FAK-unwinds a one-sided fill, which may slip or remain open"
                 ),
+                modeled_fees=modeled_fees,
+                expected_net=expected_net,
+                post_fee_net=post_fee_net,
             )
-            if best_any is None or result.net_profit > best_any.net_profit:
+            if best_any is None or result.post_fee_net > best_any.post_fee_net:
                 best_any = result
-            if result.net_profit >= self.min_net_profit_usd and result.return_on_capital >= self.min_return:
-                if best is None or result.net_profit > best.net_profit:
+            if admit_net_reject_reason(
+                expected_net=result.expected_net,
+                post_fee_net=result.post_fee_net,
+                min_net_profit_usd=self.min_net_profit_usd,
+                return_on_capital=result.return_on_capital,
+                min_return=self.min_return,
+            ) is None:
+                if best is None or result.post_fee_net > best.post_fee_net:
                     best = result
         if best_any is not None:
-            self.last_best_net = float(best_any.net_profit)
+            self.last_best_net = float(best_any.post_fee_net)
         if best is not None:
             return best
         if best_any is None:
             self.last_reject_reason = "no_depth"
             return None
-        if best_any.net_profit < self.min_net_profit_usd:
-            self.last_reject_reason = "net_below_floor"
-        else:
-            self.last_reject_reason = "roc_below_floor"
+        self.last_reject_reason = admit_net_reject_reason(
+            expected_net=best_any.expected_net,
+            post_fee_net=best_any.post_fee_net,
+            min_net_profit_usd=self.min_net_profit_usd,
+            return_on_capital=best_any.return_on_capital,
+            min_return=self.min_return,
+        ) or "net_after_fee_below_floor"
         return None
 
 
@@ -861,7 +888,14 @@ class JsonLedger:
         )
         self.state["cash"] = float(self.state["cash"]) - required
         self.state["positions"][position_id] = asdict(position)
-        self.state["trades"].append({"type": "OPEN_PAIR", "opportunity": asdict(opportunity), "position_id": position_id})
+        self.state["trades"].append({
+            "type": "OPEN_PAIR",
+            "opportunity": asdict(opportunity),
+            "position_id": position_id,
+            "expected_net": float(opportunity.expected_net),
+            "modeled_fees": float(opportunity.modeled_fees),
+            "post_fee_net": float(opportunity.post_fee_net),
+        })
         self.save()
         return position
 
@@ -990,6 +1024,9 @@ class LiveOrderJournal:
             "capital_required": float(opportunity.capital_required),
             "capital_reserved": float(opportunity.execution_capital_required),
             "expected_net_profit": float(opportunity.net_profit),
+            "expected_net": float(opportunity.expected_net),
+            "modeled_fees": float(opportunity.modeled_fees),
+            "post_fee_net": float(opportunity.post_fee_net),
             "yes_order_id": "",
             "no_order_id": "",
             "yes_order_status": "",

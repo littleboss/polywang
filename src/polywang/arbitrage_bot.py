@@ -132,6 +132,8 @@ SCAN_REJECT_REASONS = (
     "no_depth",
     "below_min_size",
     "net_below_floor",
+    "fee_drag",
+    "net_after_fee_below_floor",
     "roc_below_floor",
     "fingerprint_dup",
     "walk_mismatch",
@@ -800,9 +802,13 @@ class PaperMarketRunner:
                 LOG.info("LIVE ARB HEDGED/PENDING USER CONFIRMATION: %s | %.4f shares | pair %s | YES %s | NO %s",
                          market.title, result.shares, result.pair_id, result.yes_order_id, result.no_order_id)
             else:
-                LOG.info("PAPER ARB: %s | %.4f shares | capital $%.4f | net after buffer $%.4f | position %s",
-                         market.title, opportunity.shares, opportunity.capital_required,
-                         opportunity.net_profit, result.position_id)
+                LOG.info(
+                    "PAPER ARB: %s | %.4f shares | capital $%.4f | expected_net $%.4f | "
+                    "modeled_fees $%.4f | post_fee_net $%.4f | position %s",
+                    market.title, opportunity.shares, opportunity.capital_required,
+                    opportunity.expected_net, opportunity.modeled_fees,
+                    opportunity.post_fee_net, result.position_id,
+                )
         self.scan_rejects.maybe_flush()
 
     def _ensure_negrisk_book_depth(self, opportunity) -> None:
@@ -837,15 +843,26 @@ class PaperMarketRunner:
         if now_ms + 30_000 < oldest:
             return
         if now_ms - oldest > self.max_book_age_seconds * 1000:
+            self.scan_rejects.record("stale_book")
             return
         if newest - oldest > self.max_leg_skew_ms:
+            self.scan_rejects.record("leg_skew")
             return
         opportunity = self.negrisk_scanner.scan(market, self.books)
-        if not opportunity or opportunity.fingerprint in self.last_fingerprint:
+        if self.negrisk_scanner.last_best_net is not None:
+            self.scan_rejects.observe_net(self.negrisk_scanner.last_best_net)
+        if opportunity is None:
+            reason = self.negrisk_scanner.last_reject_reason
+            if reason in self.scan_rejects.counts:
+                self.scan_rejects.record(reason)
+            return
+        if opportunity.fingerprint in self.last_fingerprint:
+            self.scan_rejects.record("fingerprint_dup")
             return
         try:
             self._ensure_negrisk_book_depth(opportunity)
         except ValueError as error:
+            self.scan_rejects.record("walk_mismatch")
             LOG.info("Skip NegRisk %s: %s", market.title, error)
             return
         if self.negrisk_executor is None:
@@ -867,6 +884,7 @@ class PaperMarketRunner:
             LOG.critical("UNHEDGED NEGRISK BASKET: stopping the process for manual reconciliation")
             raise
         except ValueError as error:
+            self.scan_rejects.record("risk_skip", detail=classify_risk_skip(error))
             LOG.info("Skip NegRisk %s: %s", market.title, error)
             return
         for leg in opportunity.legs:
@@ -876,10 +894,12 @@ class PaperMarketRunner:
             if self.paper_ask_depth is not None:
                 self.paper_ask_depth.consume(leg.token_id, leg.fills)
         self.last_fingerprint.add(opportunity.fingerprint)
+        self.scan_rejects.record_accept()
         LOG.info(
-            "NEGRISK %s: %s | %s | %.4f shares | net $%.4f | basket %s",
+            "NEGRISK %s: %s | %s | %.4f shares | expected_net $%.4f | modeled_fees $%.4f | post_fee_net $%.4f | basket %s",
             "LIVE" if self.live else "PAPER", market.title, opportunity.direction,
-            opportunity.shares, opportunity.net_profit, result.basket_id,
+            opportunity.shares, opportunity.expected_net, opportunity.modeled_fees,
+            opportunity.post_fee_net, result.basket_id,
         )
 
     async def execute_directional(self, intent: DirectionalIntent):

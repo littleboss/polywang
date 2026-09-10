@@ -517,6 +517,8 @@ class ScanRejectAndGammaTests(unittest.TestCase):
         self.assertIn("best_yes_ask+no_ask=0.9700", lines[0])
         self.assertIn("best_net=-0.0400", lines[0])
         self.assertIn("net_below_floor=1", lines[0])
+        self.assertIn("fee_drag=0", lines[0])
+        self.assertIn("net_after_fee_below_floor=0", lines[0])
         self.assertIn("stale_book=1", lines[0])
         self.assertIn("leg_skew=1", lines[0])
         self.assertIn("risk_skip_cash=0", lines[0])
@@ -580,7 +582,8 @@ class ScanRejectAndGammaTests(unittest.TestCase):
                 sum(runner.scan_rejects.counts.values()) + runner.scan_rejects.accepted,
                 runner.scan_rejects.attempts,
             )
-            self.assertGreater(runner.scan_rejects.counts["net_below_floor"], 0)
+            self.assertGreater(runner.scan_rejects.counts["fee_drag"], 0)
+            self.assertEqual(runner.scan_rejects.counts["net_below_floor"], 0)
             self.assertIsNotNone(runner.scan_rejects.best_touch_sum)
             self.assertAlmostEqual(runner.scan_rejects.best_touch_sum, 0.98)
             self.assertEqual(runner.scan_rejects.dual_synced_markets, {"m1"})
