@@ -184,10 +184,15 @@ class PaperSupervisorTests(unittest.TestCase):
             stop_file = os.path.join(directory, "paper-supervisor.stop")
             counter_path = os.path.join(directory, "starts.txt")
             child = (
-                "import os, sys, time\n"
+                "import os, time\n"
                 f"path = {counter_path!r}\n"
-                "n = int(open(path, encoding='utf-8').read()) if os.path.isfile(path) else 0\n"
-                "open(path, 'w', encoding='utf-8').write(str(n + 1))\n"
+                "n = 0\n"
+                "if os.path.isfile(path):\n"
+                "    raw = open(path, encoding='utf-8').read().strip()\n"
+                "    n = int(raw) if raw else 0\n"
+                "tmp = path + '.tmp'\n"
+                "open(tmp, 'w', encoding='utf-8').write(str(n + 1))\n"
+                "os.replace(tmp, path)\n"
                 "time.sleep(30)\n"
             )
 
@@ -200,7 +205,8 @@ class PaperSupervisorTests(unittest.TestCase):
                 sleeps["n"] += 1
                 if os.path.isfile(counter_path):
                     with open(counter_path, encoding="utf-8") as handle:
-                        started = int(handle.read() or "0")
+                        raw = handle.read().strip()
+                    started = int(raw) if raw else 0
                     if started >= 2:
                         with open(stop_file, "w", encoding="utf-8") as handle:
                             handle.write("stop\n")
@@ -221,9 +227,18 @@ class PaperSupervisorTests(unittest.TestCase):
                 max_restarts=3,
             )
 
+            def _counter():
+                if not os.path.isfile(counter_path):
+                    return 0
+                with open(counter_path, encoding="utf-8") as handle:
+                    raw = handle.read().strip()
+                return int(raw) if raw else 0
+
             def kill_first_child():
                 deadline = time.time() + 5
                 while supervisor.child is None and time.time() < deadline:
+                    time.sleep(0.01)
+                while _counter() < 1 and time.time() < deadline:
                     time.sleep(0.01)
                 child_proc = supervisor.child
                 self.assertIsNotNone(child_proc)
@@ -234,8 +249,7 @@ class PaperSupervisorTests(unittest.TestCase):
             killer.start()
             code = supervisor.run()
             killer.join(timeout=5)
-            with open(counter_path, encoding="utf-8") as handle:
-                self.assertGreaterEqual(int(handle.read()), 2)
+            self.assertGreaterEqual(_counter(), 2)
             with open(health_path, encoding="utf-8") as handle:
                 health = json.load(handle)
             self.assertEqual(health["status"], "stopped")
