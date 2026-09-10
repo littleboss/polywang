@@ -1,0 +1,19 @@
+[Unit]
+Description=polywang paper supervisor (QUANT-20260909-01)
+Documentation=file:docs/LIVE_RUNBOOK.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/polywang
+# Wrapper respawns the paper child. systemd only restarts the wrapper.
+ExecStart=/usr/bin/uv run python scripts/paper_supervisor.py
+# Clean stop: touch paper-supervisor.stop first, then stop this unit.
+Restart=on-failure
+RestartSec=5
+EnvironmentFile=-/opt/polywang/.env
+# Secrets stay in EnvironmentFile / the process environment. Do not put keys here.
+
+[Install]
+WantedBy=multi-user.target
