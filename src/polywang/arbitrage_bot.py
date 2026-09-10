@@ -32,8 +32,11 @@ from .monitor import (
     book_health_report,
     compute_health_payload,
     configure_exception_log,
+    install_health_atexit,
+    mark_health_stopped,
     maybe_load_json_state,
     record_monitor_exception,
+    record_process_exit,
     write_health,
 )
 from .macro_model import JsonlMacroFeed, MacroEventModel, MacroRelease
@@ -1902,7 +1905,7 @@ async def run_health_loop(path: str, risk: Optional[LiveRiskController],
             except asyncio.TimeoutError:
                 continue
     finally:
-        writer.flush(running=False)
+        writer.flush(running=False, halt_reason="shutdown", last_error="health loop stopped")
 
 
 def _health_sources(args) -> dict:
@@ -1944,7 +1947,14 @@ def _print_health_snapshot(health_path: str, args) -> int:
         persist = dict(snapshot)
         if isinstance(stored, dict) and stored.get("heartbeat_at") is not None:
             persist["heartbeat_at"] = stored.get("heartbeat_at")
+        persist["last_error"] = persist.get("last_error") or persist.get("halt_reason") or "process not alive"
         write_health(health_path, persist)
+        if isinstance(stored, dict) and stored.get("status") != "stopped":
+            record_process_exit(
+                persist.get("halt_reason") or "dead pid or stale heartbeat",
+                source="health-check",
+                extra={"pid": persist.get("pid"), "exit_code": persist.get("exit_code")},
+            )
     print(json.dumps(snapshot, indent=2, sort_keys=True))
     return 0
 
@@ -1970,11 +1980,34 @@ def _print_book_health(health_path: str, args) -> int:
 
 def _install_stop_signal(stop: asyncio.Event) -> None:
     loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
+    signals = [signal.SIGINT, signal.SIGTERM]
+    if hasattr(signal, "SIGHUP"):
+        signals.append(signal.SIGHUP)
+    for sig in signals:
         try:
             loop.add_signal_handler(sig, stop.set)
         except (NotImplementedError, RuntimeError):
             signal.signal(sig, lambda *_: stop.set())
+
+
+def _flush_crash_health(health_path: str, error: BaseException, *, exit_code: int) -> None:
+    """Best-effort stopped flush when the bot dies with a Python exception."""
+    last_error = f"{type(error).__name__}: {error}"
+    halt_reason = "keyboard interrupt" if isinstance(error, KeyboardInterrupt) else "uncaught exception"
+    try:
+        mark_health_stopped(
+            health_path,
+            exit_code=exit_code,
+            last_error=last_error,
+            halt_reason=halt_reason,
+        )
+        record_process_exit(
+            last_error,
+            source="paper-runner",
+            extra={"exit_code": exit_code, "halt_reason": halt_reason},
+        )
+    except Exception:
+        LOG.exception("failed to flush stopped health after crash")
 
 
 def _parse_json_map(raw: str) -> dict:
@@ -2186,6 +2219,7 @@ def main() -> int:
             bind_health_publisher(health_publisher, journal, directional_journal, negrisk_journal)
             runner.health_publisher = health_publisher
             health_publisher.flush(running=True)
+            install_health_atexit(health_publisher)
             stop = asyncio.Event()
             _install_stop_signal(stop)
             market_task = asyncio.create_task(
@@ -2233,11 +2267,17 @@ def main() -> int:
 
         try:
             asyncio.run(run_live())
-        except KeyboardInterrupt:
+        except KeyboardInterrupt as error:
             LOG.info("Stopped")
+            _flush_crash_health(health_path, error, exit_code=0)
         except RiskHaltError as error:
             LOG.critical("LIVE RISK HALT: %s", error)
+            _flush_crash_health(health_path, error, exit_code=3)
             return 3
+        except Exception as error:
+            LOG.exception("live runner crashed")
+            _flush_crash_health(health_path, error, exit_code=1)
+            return 1
         return 0
 
     async def run_paper() -> None:
@@ -2272,6 +2312,7 @@ def main() -> int:
         bind_health_publisher(health_publisher, runner.ledger, directional_journal, negrisk_journal)
         runner.health_publisher = health_publisher
         health_publisher.flush(running=True)
+        install_health_atexit(health_publisher)
         stop = asyncio.Event()
         _install_stop_signal(stop)
         health_task = asyncio.create_task(
@@ -2299,8 +2340,13 @@ def main() -> int:
 
     try:
         asyncio.run(run_paper())
-    except KeyboardInterrupt:
+    except KeyboardInterrupt as error:
         LOG.info("Stopped")
+        _flush_crash_health(health_path, error, exit_code=0)
+    except Exception as error:
+        LOG.exception("paper runner crashed")
+        _flush_crash_health(health_path, error, exit_code=1)
+        return 1
     return 0
 
 

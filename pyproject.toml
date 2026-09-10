@@ -18,6 +18,7 @@ live = [
 [project.scripts]
 polywang = "polywang.arbitrage_bot:main"
 polywang-replay = "polywang.market_replay:main"
+polywang-supervise = "polywang.paper_supervisor:main"
 
 [build-system]
 requires = ["hatchling"]

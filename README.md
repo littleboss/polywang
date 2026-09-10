@@ -17,6 +17,18 @@ uv run python -m unittest discover -s tests -v
 
 # 纸面扫描，不需要密钥
 uv run polywang --markets 100 --cash 1000
+
+# 纸面监督进程（QUANT-20260909-01）：子进程意外退出会写 status=stopped 并退避拉起
+uv run python scripts/paper_supervisor.py --markets 100 --cash 1000
+# 等价：uv run polywang-supervise --markets 100 --cash 1000
+```
+
+监督进程是**增量**的，不必先杀掉已经在跑的 `uv run polywang`。干净停机（不要再拉起）任选其一：
+
+```bash
+touch paper-supervisor.stop          # 或设置 PAPER_SUPERVISOR_STOP=1
+# 然后对监督进程发 SIGTERM，或杀掉 paper 子进程；监督进程检测到 stop 文件后不会 respawn
+rm -f paper-supervisor.stop         # 下次要再托管时删掉
 ```
 
 历史盘口回放使用 Gamma 市场 JSON 和原始 CLOB 事件 JSONL，并复用线上同一套盘口/手续费/深度扫描逻辑：
@@ -35,7 +47,7 @@ live 或 paper 运行时设置 `MARKET_EVENT_LOG=market-events.jsonl` 可记录�
 
 `src/polywang/macro_model.py` 从 `MACRO_FEED_PATH` JSONL 读取带时间戳的 actual/consensus/std，按 `event_id` 去重，并可用 `MACRO_MARKET_MAP` 绑定指标到市场。`src/polywang/crypto_model.py` 从 `CRYPTO_REFERENCE_FEED_PATH` 读取独立参考概率，或用 spot/strike/vol/T 计算数字期权 `N(d2)`；进入对侧 Polymarket token，退出用 SELL 平自有库存，不用 CEX 期货对冲。两者默认 `executable=false`，只有显式执行开关、样本外校准和风控限额同时满足才会下单。
 
-启动时会读取本地 `.env`（不覆盖已有环境变量）。模板见 `.env.example`。交易循环会写 `live-health.json`：`open_negrisk` / 暴露以 `paper-ledger.json` 未结算仓位为准，journal 只补仍未入账的未结篮子；文件里带 `pid` 和 `heartbeat_at`，进程不在了 `--health` 必须报 `status=stopped`。`uv run polywang --health` 和 `uv run polywang --book-health` 可查看。收到 SIGINT/SIGTERM 时，默认 `LIVE_CANCEL_ON_SHUTDOWN=1` 会撤销未完成订单。方向性库存记在 `live-directional.json`，计入同一套暴露限额。
+启动时会读取本地 `.env`（不覆盖已有环境变量）。模板见 `.env.example`。交易循环会写 `live-health.json`：`open_negrisk` / 暴露以 `paper-ledger.json` 未结算仓位为准，journal 只补仍未入账的未结篮子；文件里带 `pid` 和 `heartbeat_at`，进程不在了 `--health` 必须报 `status=stopped`。优雅退出、未捕获异常、`atexit`，以及监督进程发现子进程死亡时，都会把 `live-health.json` 刷成 `status=stopped`，并带上 `exit_code` / `last_error` / `halt_reason`。监督进程还会往 `monitor-exceptions.jsonl` 追加一行 `process_exit`。`uv run polywang --health` 和 `uv run polywang --book-health` 可查看。收到 SIGINT/SIGTERM/SIGHUP 时，默认 `LIVE_CANCEL_ON_SHUTDOWN=1` 会撤销未完成订单。方向性库存记在 `live-directional.json`，计入同一套暴露限额。
 
 ## 确定性二元套利引擎
 
@@ -217,9 +229,12 @@ NegRisk n 腿开 GTC。
 │   ├── negrisk.py          # 完整集合扫描、n 腿账本、独立 FOK 执行器
 │   ├── whale_intelligence.py
 │   ├── market_replay.py
+│   ├── paper_supervisor.py # 纸面监督：respawn + 死亡时刷 stopped
 │   ├── sports_channel.py
 │   ├── macro_model.py
 │   └── crypto_model.py
+├── scripts/paper_supervisor.py  # 纸面监督进程入口
+├── deploy/polywang-paper.service
 ├── tests/                  # 单元测试，只用标准库、不联网
 ├── fixtures/               # 可提交的回放/宏观/crypto 示例数据
 └── docs/LIVE_RUNBOOK.md    # 小额实盘手册
@@ -231,6 +246,7 @@ NegRisk n 腿开 GTC。
 |------|------|
 | `uv run polywang` | 纸面/实盘扫描器 |
 | `uv run polywang-replay` | 历史盘口回放 |
+| `uv run python scripts/paper_supervisor.py` / `uv run polywang-supervise` | 纸面监督：意外退出后刷 stopped 并退避拉起 |
 | `uv run python -m unittest discover -s tests` | 测试 |
 
 ## 修改代码时的注意事项

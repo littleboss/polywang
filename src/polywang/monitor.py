@@ -12,6 +12,7 @@ without scanning multi-GB depth events.
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import time
@@ -20,6 +21,8 @@ from typing import Callable, Dict, List, Optional
 BOOK_HEALTH_MAX_EVENT_BYTES = 64 * 1024 * 1024
 DEFAULT_HEALTH_STALE_SECONDS = 30.0
 DEFAULT_EXCEPTIONS_LOG = "monitor-exceptions.jsonl"
+DEFAULT_SUPERVISOR_STOP_FILE = "paper-supervisor.stop"
+PROCESS_EXIT_KIND = "process_exit"
 
 DISCONNECT_KINDS = frozenset({
     "disconnect",
@@ -28,6 +31,7 @@ DISCONNECT_KINDS = frozenset({
     "eip712",
     "pong_timeout",
     "feed_fault",
+    PROCESS_EXIT_KIND,
 })
 
 _exception_log_path = ""
@@ -197,6 +201,91 @@ def journal_only_open_baskets(ledger, negrisk) -> List[dict]:
     return leftover
 
 
+def stop_flag_is_set(path: Optional[str] = None, environ: Optional[dict] = None) -> bool:
+    """True when the operator asked the paper supervisor not to respawn.
+
+    Either ``PAPER_SUPERVISOR_STOP=1`` (or true/yes) or an existing stop file
+    (default ``paper-supervisor.stop``) is enough. Clean stop must not loop.
+    """
+    env = os.environ if environ is None else environ
+    flag = str(env.get("PAPER_SUPERVISOR_STOP") or "").strip().lower()
+    if flag in {"1", "true", "yes", "on"}:
+        return True
+    if path is None:
+        stop_path = env.get("PAPER_SUPERVISOR_STOP_FILE") or DEFAULT_SUPERVISOR_STOP_FILE
+    else:
+        stop_path = path
+    return bool(stop_path) and os.path.isfile(str(stop_path))
+
+
+def should_respawn(*, stop_file: Optional[str] = None, environ: Optional[dict] = None) -> bool:
+    """Respawn only when the explicit stop file/flag is absent."""
+    return not stop_flag_is_set(stop_file, environ)
+
+
+def next_backoff_seconds(previous: float, *, start: float = 1.0, maximum: float = 30.0) -> float:
+    """Double the last delay, capped so the first respawn stays inside 60s."""
+    start = max(0.0, float(start))
+    maximum = max(start, float(maximum))
+    if previous <= 0:
+        return start
+    return min(maximum, float(previous) * 2.0)
+
+
+def mark_health_stopped(
+    path: str,
+    *,
+    exit_code: Optional[int] = None,
+    last_error: str = "",
+    halt_reason: str = "",
+    now: Optional[float] = None,
+    extra: Optional[dict] = None,
+) -> dict:
+    """Force ``status=stopped`` while keeping the last exposure snapshot.
+
+    Used by the paper supervisor and crash/atexit paths. Does not recompute
+    ledger counts, so a dead child cannot zero out open inventory.
+    """
+    stored = load_health_file(path) or {}
+    clock = float(now if now is not None else time.time())
+    reason = str(halt_reason or last_error or stored.get("halt_reason") or "process not alive")
+    error = str(last_error or stored.get("last_error") or reason)
+    payload = dict(stored)
+    payload["status"] = "stopped"
+    payload["halt_reason"] = reason
+    payload["last_error"] = error
+    payload["last_flush_at"] = clock
+    if exit_code is not None:
+        payload["exit_code"] = int(exit_code)
+    elif stored.get("exit_code") not in (None, ""):
+        payload["exit_code"] = stored["exit_code"]
+    if extra:
+        for key, value in extra.items():
+            if key == "status":
+                continue
+            payload[key] = value
+    return write_health(path, payload, now=clock)
+
+
+def record_process_exit(
+    message: str,
+    *,
+    path: str = "",
+    source: str = "paper-supervisor",
+    extra: Optional[dict] = None,
+    now: Optional[float] = None,
+) -> Optional[dict]:
+    """Append a ``process_exit`` line to the existing exception tape."""
+    return record_monitor_exception(
+        message,
+        source=source,
+        kind=PROCESS_EXIT_KIND,
+        extra=extra,
+        path=path,
+        now=now,
+    )
+
+
 def compute_health_payload(
     *,
     ledger=None,
@@ -209,6 +298,9 @@ def compute_health_payload(
     pid: Optional[int] = None,
     now: Optional[float] = None,
     stale_after: Optional[float] = None,
+    exit_code: Optional[int] = None,
+    last_error: Optional[str] = None,
+    halt_reason: Optional[str] = None,
 ) -> dict:
     """Recompute health from the ledger; journals only add still-open rows."""
     clock = float(now if now is not None else time.time())
@@ -240,15 +332,17 @@ def compute_health_payload(
     status = resolve_runtime_status(
         stored, risk=risk, running=running, now=clock, stale_after=stale_after,
     )
-    halt_reason = ""
-    if risk is not None and getattr(risk, "state", None):
-        halt_reason = str(risk.state.get("halt_reason") or "")
+    reason = str(halt_reason) if halt_reason else ""
+    if not reason and risk is not None and getattr(risk, "state", None):
+        reason = str(risk.state.get("halt_reason") or "")
+    error = str(last_error) if last_error else ""
     if status == "stopped":
-        halt_reason = halt_reason or "process not alive"
+        reason = reason or error or "process not alive"
+        error = error or reason
 
     payload = {
         "status": status,
-        "halt_reason": halt_reason,
+        "halt_reason": reason,
         "pair_exposure": float(pair_exposure),
         "directional_exposure": directional.open_exposure() if directional else 0.0,
         "negrisk_exposure": float(negrisk_exposure),
@@ -258,6 +352,10 @@ def compute_health_payload(
         "heartbeat_at": clock,
         "last_flush_at": clock,
     }
+    if error:
+        payload["last_error"] = error
+    if exit_code is not None:
+        payload["exit_code"] = int(exit_code)
     if pid is not None:
         payload["pid"] = int(pid)
     elif stored and stored.get("pid") not in (None, ""):
@@ -290,7 +388,15 @@ class HealthPublisher:
         self.stale_after = stale_after
         self.last_payload: Optional[dict] = None
 
-    def snapshot(self, *, running: Optional[bool] = True, now: Optional[float] = None) -> dict:
+    def snapshot(
+        self,
+        *,
+        running: Optional[bool] = True,
+        now: Optional[float] = None,
+        exit_code: Optional[int] = None,
+        last_error: str = "",
+        halt_reason: str = "",
+    ) -> dict:
         stored = load_health_file(self.path)
         return compute_health_payload(
             ledger=self.ledger,
@@ -303,12 +409,45 @@ class HealthPublisher:
             pid=self.pid,
             now=now,
             stale_after=self.stale_after,
+            exit_code=exit_code,
+            last_error=last_error or None,
+            halt_reason=halt_reason or None,
         )
 
-    def flush(self, running: Optional[bool] = True, now: Optional[float] = None) -> dict:
-        payload = self.snapshot(running=running, now=now)
+    def flush(
+        self,
+        running: Optional[bool] = True,
+        now: Optional[float] = None,
+        *,
+        exit_code: Optional[int] = None,
+        last_error: str = "",
+        halt_reason: str = "",
+    ) -> dict:
+        payload = self.snapshot(
+            running=running,
+            now=now,
+            exit_code=exit_code,
+            last_error=last_error,
+            halt_reason=halt_reason,
+        )
         self.last_payload = write_health(self.path, payload, now=now)
         return self.last_payload
+
+
+def install_health_atexit(publisher: HealthPublisher, *, halt_reason: str = "process exiting"):
+    """Flush ``status=stopped`` if the process exits without a prior stop write."""
+
+    def _flush() -> None:
+        try:
+            stored = load_health_file(publisher.path) or {}
+            if str(stored.get("status") or "") == "stopped" and stored.get("halt_reason"):
+                return
+            publisher.flush(running=False, halt_reason=halt_reason, last_error=halt_reason)
+        except Exception:
+            return
+
+    atexit.register(_flush)
+    return _flush
 
 
 def bind_health_publisher(publisher: HealthPublisher, *flushables) -> HealthPublisher:
@@ -497,7 +636,16 @@ def book_health_report(
     if stored and health.get("status") == "stopped" and health_path:
         persist = dict(health)
         persist["heartbeat_at"] = stored.get("heartbeat_at", health.get("heartbeat_at"))
+        persist["last_error"] = persist.get("last_error") or persist.get("halt_reason") or "process not alive"
         write_health(health_path, persist, now=now)
+        if stored.get("status") != "stopped":
+            record_process_exit(
+                persist.get("halt_reason") or "dead pid or stale heartbeat",
+                path=exceptions_path,
+                source="book-health",
+                extra={"pid": stored.get("pid"), "exit_code": persist.get("exit_code")},
+                now=now,
+            )
     tail = tail_jsonl_bytes(events_path, max_event_bytes)
     last_event_ms = None
     for row in reversed(tail["rows"]):

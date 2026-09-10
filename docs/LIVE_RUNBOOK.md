@@ -29,7 +29,39 @@ uv run polywang --status --live-journal live-orders.json \
   --directional-journal live-directional.json
 ```
 
-`--health` 读 `LIVE_HEALTH_PATH`（默认 `live-health.json`），并按账本重算未结仓。进程活着时应周期性写 `pid` / `heartbeat_at`；进程已死则报告 `status=stopped`，不会停在 `running`。文件缺失则退出码为 1。`--book-health`（`--morning-health`）最多读 64MB 事件带尾部，异常计数只来自 `monitor-exceptions.jsonl`。`--status` 汇总 pair 账本和方向性库存。
+`--health` 读 `LIVE_HEALTH_PATH`（默认 `live-health.json`），并按账本重算未结仓。进程活着时应周期性写 `pid` / `heartbeat_at`；进程已死则报告 `status=stopped`，不会停在 `running`，并带 `exit_code` / `last_error` / `halt_reason`（监督进程或下一次 `--health` 写入）。文件缺失则退出码为 1。`--book-health`（`--morning-health`）最多读 64MB 事件带尾部，异常计数只来自 `monitor-exceptions.jsonl`（含 `process_exit`）。`--status` 汇总 pair 账本和方向性库存。
+
+## 纸面监督进程（QUANT-20260909-01）
+
+`uv run polywang` 仍可单独跑。监督进程是加法：不必杀掉当前 paper 才能合并本改动。它负责：
+
+1. 拉起 `uv run polywang`（拒绝 `--live`）；
+2. 子进程意外退出后，立刻把 `live-health.json` 写成 `status=stopped`，并带 `exit_code` / `last_error` / `halt_reason`；
+3. 往 `monitor-exceptions.jsonl` 追加一行 `kind=process_exit`；
+4. 退避后重新拉起（默认 1s、2s、… 上限 30s，第一次 respawn 远小于 60s）。
+
+```bash
+uv run python scripts/paper_supervisor.py --markets 100 --cash 1000
+# 或：uv run polywang-supervise --markets 100 --cash 1000
+```
+
+本地验收：
+
+```bash
+# 1) 杀掉 paper 子进程：health 应在监督进程下一拍（默认 ≤1s，验收窗口 30s）变成 stopped，并在 60s 内被拉起
+kill -9 "$(python -c 'import json; print(json.load(open("live-health.json"))["pid"])')"
+# 观察 live-health.json 的 status/exit_code/halt_reason，以及新 pid
+
+# 2) 干净停机，不要 respawn
+touch paper-supervisor.stop
+kill -9 "$(python -c 'import json; print(json.load(open("live-health.json"))["pid"])')"
+# 监督进程应退出且不再拉起。也可直接 SIGTERM 监督进程本身。
+rm -f paper-supervisor.stop
+```
+
+环境变量：`PAPER_SUPERVISOR_STOP=1`、`PAPER_SUPERVISOR_STOP_FILE`（默认 `paper-supervisor.stop`）、`PAPER_SUPERVISOR_BACKOFF_START` / `_MAX`、`PAPER_SUPERVISOR_CMD`（覆盖子命令，仍禁止 `--live`）。密钥继续只放环境 / 本地 `.env`，不要写进命令行或仓库。
+
+可选 systemd 单元见 `deploy/polywang-paper.service`：它只看管监督进程自己；子进程重启由 Python wrapper 负责。`Restart=on-failure` 不要和 wrapper 叠成双层死循环——干净停机请先 `touch paper-supervisor.stop`。
 
 ## 首次小额实盘
 
@@ -76,6 +108,15 @@ uv run polywang --live --markets 20 --max-order 5
 `MERGE_SUBMITTED` 或 `REDEEM_SUBMITTED` 表示交易可能已经提交。等待超时后程序会在后续对账中查询原 transaction ID/hash，不会再次提交同一操作；确认成功会自动完成账本。若交易处于未知或失败状态，应通过官方账户/链上记录人工确认，不要手工把 JSON 状态改成 `SETTLED`。
 
 ## 停机
+
+纸面监督进程的干净停机（**不要**再拉起 paper）：
+
+```bash
+touch paper-supervisor.stop    # 或 PAPER_SUPERVISOR_STOP=1
+# 然后 SIGTERM 监督进程，或杀掉 paper 子进程
+# 监督进程看到 stop 文件后不会 respawn
+rm -f paper-supervisor.stop    # 下次托管前删掉
+```
 
 创建 `live-kill-switch` 文件或设置 `POLYMARKET_KILL_SWITCH=1` 会持久化停止新单，并立刻：
 

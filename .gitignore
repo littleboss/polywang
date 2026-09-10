@@ -26,3 +26,5 @@ calibration.json
 market-events.jsonl
 market-events.jsonl.*
 monitor-exceptions.jsonl
+paper-supervisor.stop
+paper-supervisor.pid

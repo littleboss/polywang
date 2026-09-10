@@ -19,9 +19,14 @@ from polywang.monitor import (
     classify_feed_fault,
     compute_health_payload,
     count_exception_kinds,
+    mark_health_stopped,
+    next_backoff_seconds,
     process_is_alive,
     record_monitor_exception,
+    record_process_exit,
     resolve_runtime_status,
+    should_respawn,
+    stop_flag_is_set,
     tail_jsonl_bytes,
 )
 from polywang.negrisk import LiveNegRiskJournal, NegRiskBookScanner, NegRiskMarket, PaperNegRiskExecutor
@@ -157,6 +162,68 @@ class HealthFromLedgerTests(unittest.TestCase):
         snapshot = compute_health_payload(stored=stored, running=True, pid=os.getpid())
         self.assertEqual(snapshot["status"], "running")
 
+    def test_mark_health_stopped_keeps_exposure_and_writes_exit_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "live-health.json")
+            write_health(path, {
+                "status": "running",
+                "open_negrisk": 3,
+                "negrisk_exposure": 12.5,
+                "pid": 4242,
+                "heartbeat_at": 1_700_000_000.0,
+            })
+            payload = mark_health_stopped(
+                path,
+                exit_code=137,
+                last_error="signal 9",
+                halt_reason="child killed by signal 9",
+                now=1_700_000_030.0,
+            )
+            self.assertEqual(payload["status"], "stopped")
+            self.assertEqual(payload["exit_code"], 137)
+            self.assertEqual(payload["last_error"], "signal 9")
+            self.assertEqual(payload["halt_reason"], "child killed by signal 9")
+            self.assertEqual(payload["open_negrisk"], 3)
+            self.assertEqual(payload["negrisk_exposure"], 12.5)
+            self.assertEqual(payload["pid"], 4242)
+            with open(path, encoding="utf-8") as handle:
+                stored = json.load(handle)
+            self.assertEqual(stored["status"], "stopped")
+            self.assertEqual(stored["exit_code"], 137)
+
+    def test_publisher_flush_stopped_includes_exit_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "live-health.json")
+            publisher = HealthPublisher(path, pid=os.getpid())
+            publisher.flush(
+                running=False,
+                exit_code=1,
+                last_error="RuntimeError: boom",
+                halt_reason="uncaught exception",
+            )
+            with open(path, encoding="utf-8") as handle:
+                stored = json.load(handle)
+            self.assertEqual(stored["status"], "stopped")
+            self.assertEqual(stored["exit_code"], 1)
+            self.assertEqual(stored["last_error"], "RuntimeError: boom")
+            self.assertEqual(stored["halt_reason"], "uncaught exception")
+            self.assertNotEqual(stored["halt_reason"], "")
+
+    def test_stop_flag_blocks_respawn(self):
+        with tempfile.TemporaryDirectory() as directory:
+            stop_file = os.path.join(directory, "paper-supervisor.stop")
+            self.assertTrue(should_respawn(stop_file=stop_file, environ={}))
+            self.assertFalse(stop_flag_is_set(stop_file, {}))
+            with open(stop_file, "w", encoding="utf-8") as handle:
+                handle.write("stop\n")
+            self.assertFalse(should_respawn(stop_file=stop_file, environ={}))
+            self.assertTrue(stop_flag_is_set(stop_file, {}))
+            self.assertFalse(should_respawn(environ={"PAPER_SUPERVISOR_STOP": "1"}))
+            self.assertTrue(next_backoff_seconds(0.0, start=1.0, maximum=30.0) <= 60.0)
+            self.assertEqual(next_backoff_seconds(0.0, start=1.0, maximum=30.0), 1.0)
+            self.assertEqual(next_backoff_seconds(1.0, start=1.0, maximum=30.0), 2.0)
+            self.assertEqual(next_backoff_seconds(16.0, start=1.0, maximum=30.0), 30.0)
+
 
 class EventRotationAndExceptionTests(unittest.TestCase):
     def test_rotation_bounds_active_file_by_size(self):
@@ -236,7 +303,16 @@ class EventRotationAndExceptionTests(unittest.TestCase):
             self.assertEqual(counts["http_500"], 1)
             self.assertEqual(counts["eip712"], 1)
             self.assertEqual(counts["pong_timeout"], 1)
+            self.assertEqual(counts["process_exit"], 0)
             self.assertEqual(counts["total"], 5)
+            record_process_exit(
+                "child killed by signal 9",
+                path=exceptions_path,
+                extra={"exit_code": -9, "pid": 99},
+            )
+            after = count_exception_kinds(exceptions_path)
+            self.assertEqual(after["process_exit"], 1)
+            self.assertEqual(after["total"], 6)
             report = book_health_report(
                 events_path=events_path,
                 exceptions_path=exceptions_path,
@@ -248,10 +324,37 @@ class EventRotationAndExceptionTests(unittest.TestCase):
             self.assertEqual(report["exceptions"]["http_429"], 1)
             self.assertEqual(report["exceptions"]["eip712"], 1)
             self.assertEqual(report["exceptions"]["pong_timeout"], 1)
-            self.assertEqual(report["exceptions"]["total"], 5)
+            self.assertEqual(report["exceptions"]["process_exit"], 1)
+            self.assertEqual(report["exceptions"]["total"], 6)
             tail = tail_jsonl_bytes(events_path, 4096)
             self.assertLessEqual(tail["bytes_read"], 4096)
             self.assertTrue(all(row.get("event_type") == "book" for row in tail["rows"]))
+
+    def test_book_health_records_process_exit_when_pid_is_dead(self):
+        with tempfile.TemporaryDirectory() as directory:
+            events_path = os.path.join(directory, "market-events.jsonl")
+            exceptions_path = os.path.join(directory, "monitor-exceptions.jsonl")
+            health_path = os.path.join(directory, "live-health.json")
+            open(events_path, "w", encoding="utf-8").close()
+            write_health(health_path, {
+                "status": "running",
+                "pid": 999999999,
+                "open_negrisk": 4,
+                "heartbeat_at": time.time() - 1.0,
+            })
+            report = book_health_report(
+                events_path=events_path,
+                exceptions_path=exceptions_path,
+                health_path=health_path,
+            )
+            self.assertEqual(report["health"]["status"], "stopped")
+            with open(health_path, encoding="utf-8") as handle:
+                stored = json.load(handle)
+            self.assertEqual(stored["status"], "stopped")
+            self.assertTrue(stored.get("halt_reason"))
+            self.assertTrue(stored.get("last_error"))
+            counts = count_exception_kinds(exceptions_path)
+            self.assertEqual(counts["process_exit"], 1)
 
     def test_classify_feed_faults(self):
         self.assertEqual(classify_feed_fault(TimeoutError("market stream text PONG timeout")), "pong_timeout")
