@@ -196,6 +196,24 @@ class ReplayTests(unittest.TestCase):
         self.assertEqual(found, [])
         self.assertEqual(replay.execution_stats["skew_missed"], 1)
 
+    def test_replay_rejects_fee_drag_combo_and_never_opens(self):
+        market = BinaryMarket("m1", "c1", "Test", "yes", "no", category="politics")
+        scanner = BinaryArbitrageScanner()
+        self.assertEqual(scanner.min_net_profit_usd, 0.05)
+        self.assertEqual(scanner.min_return, 0.002)
+        self.assertEqual(scanner.safety_buffer_usd, 0.02)
+        replay = BinaryMarketReplay([market], scanner=scanner, consume_fills=True)
+        for token in ("yes", "no"):
+            replay.process({
+                "event_type": "book", "asset_id": token, "timestamp": "1700000000000",
+                "hash": token, "asks": [{"price": "0.48", "size": "2"}], "bids": [],
+            })
+        self.assertEqual(replay.opportunities, [])
+        self.assertEqual(replay.executed_opportunities, [])
+        self.assertEqual(scanner.last_reject_reason, "fee_drag")
+        self.assertEqual(replay.report()["execution"]["signals"], 0)
+        self.assertEqual(replay.report()["executed_opportunities"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

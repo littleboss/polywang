@@ -32,7 +32,12 @@ from .arbitrage_core import (
     _response_ok,
     _response_value,
 )
-from .polymarket_edge import PolymarketFeeModel
+from .polymarket_edge import (
+    PolymarketFeeModel,
+    admit_net_reject_reason,
+    decision_fee_fields,
+    modeled_taker_fee_usd,
+)
 
 
 def _gamma_end_ts(payload: dict) -> Optional[float]:
@@ -358,6 +363,9 @@ class NegRiskBookOpportunity:
         "runs after the market resolves; pre-resolution convert stays off "
         "unless the official client exposes convert_positions."
     )
+    modeled_fees: float = 0.0
+    expected_net: float = 0.0
+    post_fee_net: float = 0.0
 
     @property
     def capital_required(self) -> float:
@@ -394,28 +402,48 @@ class NegRiskBookScanner:
         self.max_order_usd = max(0.01, max_order_usd)
         self.max_levels = max(1, int(max_levels)) if max_levels is not None else None
         self.merge_gas_usd = max(0.0, float(merge_gas_usd))
+        # Set on each scan() call so SCAN REJECTS can attribute silent rejects.
+        self.last_reject_reason: Optional[str] = None
+        self.last_best_net: Optional[float] = None
 
     def scan(self, market: NegRiskMarket, books: Dict[str, OrderBook],
              fee_model: Optional[PolymarketFeeModel] = None) -> Optional[NegRiskBookOpportunity]:
+        self.last_reject_reason = None
+        self.last_best_net = None
         if not market.active or len(market.outcomes) < 2:
             return None
-        yes = self._scan_direction(market, books, "BUY_ALL_YES", fee_model)
-        no = None
+        yes, yes_any = self._scan_direction(market, books, "BUY_ALL_YES", fee_model)
+        no, no_any = None, None
         if market.has_no_tokens:
-            no = self._scan_direction(market, books, "BUY_ALL_NO", fee_model)
+            no, no_any = self._scan_direction(market, books, "BUY_ALL_NO", fee_model)
         candidates = [item for item in (yes, no) if item is not None]
-        if not candidates:
+        observed = [item for item in (yes_any, no_any) if item is not None]
+        if observed:
+            best_any = max(observed, key=lambda item: item.post_fee_net)
+            self.last_best_net = float(best_any.post_fee_net)
+        if candidates:
+            return max(candidates, key=lambda item: item.post_fee_net)
+        if not observed:
+            if self.last_reject_reason is None:
+                self.last_reject_reason = "no_depth"
             return None
-        return max(candidates, key=lambda item: item.net_profit)
+        self.last_reject_reason = admit_net_reject_reason(
+            expected_net=best_any.expected_net,
+            post_fee_net=best_any.post_fee_net,
+            min_net_profit_usd=self.min_net_profit_usd,
+            return_on_capital=best_any.return_on_capital,
+            min_return=self.min_return,
+        ) or "net_after_fee_below_floor"
+        return None
 
     def _scan_direction(self, market: NegRiskMarket, books: Dict[str, OrderBook],
                         direction: str, fee_model: Optional[PolymarketFeeModel]
-                        ) -> Optional[NegRiskBookOpportunity]:
+                        ) -> Tuple[Optional[NegRiskBookOpportunity], Optional[NegRiskBookOpportunity]]:
         specs = []
         for outcome in market.outcomes:
             token_id = outcome.yes_token_id if direction == "BUY_ALL_YES" else outcome.no_token_id
             if not token_id:
-                return None
+                return None, None
             specs.append((outcome.name, token_id))
         synced_books: Dict[str, OrderBook] = {}
         levels_map: Dict[str, List[Tuple[float, float]]] = {}
@@ -424,12 +452,14 @@ class NegRiskBookScanner:
         for _, token_id in specs:
             book = books.get(token_id)
             if book is None or not book.synced or not book.timestamp_ms:
-                return None
+                self.last_reject_reason = "not_synced"
+                return None, None
             levels = book.asks_sorted()
             if self.max_levels is not None:
                 levels = levels[:self.max_levels]
             if not levels:
-                return None
+                self.last_reject_reason = "no_touch"
+                return None, None
             synced_books[token_id] = book
             levels_map[token_id] = levels
             timestamps.append(book.timestamp_ms)
@@ -442,7 +472,8 @@ class NegRiskBookScanner:
         )
         max_shares = min(sum(size for _, size in levels_map[token_id]) for _, token_id in specs)
         if max_shares <= 0.0:
-            return None
+            self.last_reject_reason = "no_depth"
+            return None, None
 
         def execution_capital_for(shares: float) -> float:
             total = 0.0
@@ -468,7 +499,8 @@ class NegRiskBookScanner:
                     high = middle
             max_shares = low
         if max_shares <= 1e-12 or (market.min_order_size > 0.0 and max_shares < market.min_order_size):
-            return None
+            self.last_reject_reason = "below_min_size"
+            return None, None
 
         candidates = {max_shares}
         for _, token_id in specs:
@@ -479,6 +511,7 @@ class NegRiskBookScanner:
                 candidates.add(min(max_shares, size))
 
         best = None
+        best_any = None
         payout_per_share = 1.0 if direction == "BUY_ALL_YES" else float(len(specs) - 1)
         for shares in sorted(candidates):
             if shares <= 0.0:
@@ -493,7 +526,7 @@ class NegRiskBookScanner:
                 if not fills:
                     ok = False
                     break
-                fee = sum(fee_model.fee_usd(quantity, price, is_taker=True) for price, quantity in fills)
+                fee = modeled_taker_fee_usd(fee_model, fills, is_taker=True)
                 worst = fills[-1][0]
                 fee_cap = shares * max(
                     (fee_model.fee_per_share(price, is_taker=True) for price, _ in levels_map[token_id]),
@@ -511,7 +544,12 @@ class NegRiskBookScanner:
             if not ok:
                 continue
             gross = shares * payout_per_share - total_cost
-            net = gross - total_fee - self.safety_buffer_usd - self.merge_gas_usd
+            expected_net, post_fee_net = decision_fee_fields(
+                gross, total_fee,
+                safety_buffer_usd=self.safety_buffer_usd,
+                merge_gas_usd=self.merge_gas_usd,
+            )
+            net = post_fee_net
             capital = total_cost + total_fee
             result = NegRiskBookOpportunity(
                 market_id=market.market_id,
@@ -532,11 +570,24 @@ class NegRiskBookScanner:
                 child_condition_ids=tuple(
                     outcome.child_condition_id or market.condition_id for outcome in market.outcomes
                 ),
+                modeled_fees=total_fee,
+                expected_net=expected_net,
+                post_fee_net=post_fee_net,
             )
-            if result.net_profit >= self.min_net_profit_usd and result.return_on_capital >= self.min_return:
-                if best is None or result.net_profit > best.net_profit:
+            if best_any is None or result.post_fee_net > best_any.post_fee_net:
+                best_any = result
+            if admit_net_reject_reason(
+                expected_net=result.expected_net,
+                post_fee_net=result.post_fee_net,
+                min_net_profit_usd=self.min_net_profit_usd,
+                return_on_capital=result.return_on_capital,
+                min_return=self.min_return,
+            ) is None:
+                if best is None or result.post_fee_net > best.post_fee_net:
                     best = result
-        return best
+        if best_any is None:
+            self.last_reject_reason = "no_depth"
+        return best, best_any
 
 
 def _cost_for(book: OrderBook, shares: float,
@@ -637,6 +688,9 @@ class LiveNegRiskJournal:
             "requested_shares": float(opportunity.shares),
             "capital_reserved": float(opportunity.execution_capital_required),
             "expected_net_profit": float(opportunity.net_profit),
+            "expected_net": float(opportunity.expected_net),
+            "modeled_fees": float(opportunity.modeled_fees),
+            "post_fee_net": float(opportunity.post_fee_net),
             "payout_per_share": float(opportunity.payout_per_share),
             "source": opportunity.source,
             "child_condition_ids": list(opportunity.child_condition_ids),
@@ -859,6 +913,9 @@ class PaperNegRiskExecutor:
                 "direction": opportunity.direction,
                 "shares": opportunity.shares,
                 "cost": opportunity.capital_required,
+                "expected_net": float(opportunity.expected_net),
+                "modeled_fees": float(opportunity.modeled_fees),
+                "post_fee_net": float(opportunity.post_fee_net),
             })
             position_id = f"nr:{opportunity.market_id}:{time.time_ns()}"
             self.ledger.state["positions"][position_id] = {

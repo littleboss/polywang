@@ -16,10 +16,13 @@ from polywang.polymarket_edge import (
     NegRiskScanner,
     PolymarketFeeModel,
     StrategyCalibration,
+    admit_net_reject_reason,
     combo_arb_universe_score,
     combo_ask_sum,
+    decision_fee_fields,
     merge_gas_clears_at_order_usd,
     merge_gas_startup_warning,
+    modeled_taker_fee_usd,
     rank_combo_arb_markets,
     debias_market_price,
     liquidity_adjusted_lambda,
@@ -73,6 +76,50 @@ class FeeModelTests(unittest.TestCase):
         for price in (0.10, 0.25, 0.40):
             self.assertAlmostEqual(sports.fee_usd(100, price),
                                    sports.fee_usd(100, 1.0 - price), places=6)
+
+    def test_modeled_taker_fee_sums_each_decision_fill(self):
+        sports = PolymarketFeeModel("sports")
+        fills = ((0.50, 10.0), (0.40, 5.0))
+        self.assertAlmostEqual(
+            modeled_taker_fee_usd(sports, fills),
+            sports.fee_usd(10.0, 0.50) + sports.fee_usd(5.0, 0.40),
+            places=9,
+        )
+        self.assertEqual(modeled_taker_fee_usd(sports, fills, is_taker=False), 0.0)
+
+    def test_admit_reason_is_fee_drag_when_gross_clears_but_post_fee_does_not(self):
+        expected_net, post_fee_net = decision_fee_fields(0.08, 0.04, safety_buffer_usd=0.02)
+        self.assertAlmostEqual(expected_net, 0.06, places=9)
+        self.assertAlmostEqual(post_fee_net, 0.02, places=9)
+        self.assertEqual(
+            admit_net_reject_reason(
+                expected_net=expected_net,
+                post_fee_net=post_fee_net,
+                min_net_profit_usd=0.05,
+                return_on_capital=0.01,
+                min_return=0.002,
+            ),
+            "fee_drag",
+        )
+        self.assertEqual(
+            admit_net_reject_reason(
+                expected_net=0.03,
+                post_fee_net=0.01,
+                min_net_profit_usd=0.05,
+                return_on_capital=0.01,
+                min_return=0.002,
+            ),
+            "net_after_fee_below_floor",
+        )
+        self.assertIsNone(
+            admit_net_reject_reason(
+                expected_net=0.12,
+                post_fee_net=0.08,
+                min_net_profit_usd=0.05,
+                return_on_capital=0.01,
+                min_return=0.002,
+            )
+        )
 
     def test_fraction_of_notional_reduces_to_rate_times_one_minus_price(self):
         # This identity is what makes favourites cheap to trade and the flat

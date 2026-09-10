@@ -266,9 +266,26 @@ class ScannerTests(unittest.TestCase):
         scanner = BinaryArbitrageScanner(min_net_profit_usd=0.05, min_return=0.0, safety_buffer_usd=0.02)
         opportunity = scanner.scan(market(), self.book([(0.49, 100)]), self.book([(0.49, 100)]))
         self.assertIsNone(opportunity)
-        self.assertEqual(scanner.last_reject_reason, "net_below_floor")
+        # Politics 0.49+0.49 still has a pre-fee edge; taker fees drag post-fee
+        # net below the $0.05 floor (QUANT-20260911-01).
+        self.assertEqual(scanner.last_reject_reason, "fee_drag")
         self.assertAlmostEqual(scanner.last_touch_sum, 0.98)
         self.assertIsNotNone(scanner.last_best_net)
+        self.assertLess(scanner.last_best_net, 0.05)
+
+    def test_gross_edge_below_post_fee_floor_is_fee_drag_and_never_opens(self):
+        scanner = BinaryArbitrageScanner()
+        self.assertEqual(scanner.min_net_profit_usd, 0.05)
+        self.assertEqual(scanner.min_return, 0.002)
+        self.assertEqual(scanner.safety_buffer_usd, 0.02)
+        # 2 shares at 0.48+0.48: $0.08 gross, buffer $0.02 → expected_net $0.06,
+        # but politics taker fees leave post_fee_net well under $0.05.
+        opportunity = scanner.scan(
+            market(), self.book([(0.48, 2)]), self.book([(0.48, 2)]),
+        )
+        self.assertIsNone(opportunity)
+        self.assertEqual(scanner.last_reject_reason, "fee_drag")
+        self.assertGreater(scanner.last_best_net + scanner.min_net_profit_usd, 0.0)
         self.assertLess(scanner.last_best_net, 0.05)
 
     def test_missing_touch_sets_no_touch_reason(self):
@@ -360,6 +377,13 @@ class LedgerTests(unittest.TestCase):
             position = PaperArbitrageExecutor(ledger, max_total_exposure_fraction=1.0,
                                                max_market_exposure_fraction=1.0).execute(opportunity)
             self.assertAlmostEqual(ledger.state["cash"], 992.0 - opportunity.yes_fee - opportunity.no_fee, places=6)
+            opened = next(trade for trade in ledger.state["trades"] if trade.get("type") == "OPEN_PAIR")
+            self.assertIn("modeled_fees", opened)
+            self.assertIn("post_fee_net", opened)
+            self.assertIn("expected_net", opened)
+            self.assertAlmostEqual(opened["modeled_fees"], opportunity.modeled_fees, places=6)
+            self.assertAlmostEqual(opened["post_fee_net"], opportunity.post_fee_net, places=6)
+            self.assertAlmostEqual(opened["post_fee_net"], opportunity.net_profit, places=6)
             reloaded = JsonLedger(path, initial_cash=1)
             self.assertIn(position.position_id, reloaded.state["positions"])
             reloaded.settle(position.position_id, "Yes")

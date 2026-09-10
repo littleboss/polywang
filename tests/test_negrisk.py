@@ -272,6 +272,25 @@ class BookScannerTests(unittest.TestCase):
         )
         self.assertIsNone(costly.scan(self.market, books))
 
+    def test_mid_price_sports_combo_is_fee_drag_under_default_floors(self):
+        """QUANT-20260911-01: gross edge that dies after taker fees must not OPEN."""
+        market = NegRiskMarket.from_gamma(nway_payload(category="sports"))
+        scanner = NegRiskBookScanner()
+        self.assertEqual(scanner.min_net_profit_usd, 0.05)
+        self.assertEqual(scanner.min_return, 0.002)
+        self.assertEqual(scanner.safety_buffer_usd, 0.02)
+        books = {
+            "tok-a": synced_book({0.32: 2}),
+            "tok-b": synced_book({0.32: 2}),
+            "tok-c": synced_book({0.32: 2}),
+        }
+        self.assertIsNone(scanner.scan(market, books))
+        self.assertEqual(scanner.last_reject_reason, "fee_drag")
+        self.assertIsNotNone(scanner.last_best_net)
+        self.assertLess(scanner.last_best_net, 0.05)
+        # Pre-fee expected still clears the dollar floor; fees are the drag.
+        self.assertGreaterEqual(0.08 - scanner.safety_buffer_usd, scanner.min_net_profit_usd)
+
 
 class ExecutorTests(unittest.TestCase):
     def opportunity(self):
@@ -384,10 +403,62 @@ class RiskAndRunnerTests(unittest.TestCase):
             self.assertEqual(baskets[0]["status"], "ASSEMBLED")
             self.assertEqual(baskets[0]["direction"], "BUY_ALL_YES")
             self.assertTrue(any(pos.get("kind") == "negrisk" for pos in runner.ledger.state["positions"].values()))
+            opened = next(
+                trade for trade in runner.ledger.state["trades"] if trade.get("type") == "OPEN_NEGRISK"
+            )
+            self.assertIn("expected_net", opened)
+            self.assertIn("modeled_fees", opened)
+            self.assertIn("post_fee_net", opened)
+            basket = baskets[0]
+            self.assertIn("expected_net", basket)
+            self.assertIn("modeled_fees", basket)
+            self.assertIn("post_fee_net", basket)
+            self.assertAlmostEqual(opened["post_fee_net"], basket["post_fee_net"], places=6)
             self.assertEqual(runner.live_journal, None)
             live_orders = os.path.join(directory, "live-orders.json")
             self.assertFalse(os.path.exists(live_orders))
             self.assertNotEqual(os.path.basename(nr_journal.path), "live-orders.json")
+
+    def test_paper_runner_rejects_sports_fee_drag_without_open_negrisk(self):
+        market = NegRiskMarket.from_gamma(nway_payload(category="sports"))
+        binary = BinaryMarket("m1", "c1", "Binary", "yes-token", "no-token", category="geopolitics")
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ, {"WHALE_STATE_PATH": ""}, clear=False,
+        ):
+            nr_journal = LiveNegRiskJournal(os.path.join(directory, "paper-negrisk.json"))
+            nr_exec = PaperNegRiskExecutor(nr_journal)
+            runner = PaperMarketRunner(
+                [binary], os.path.join(directory, "ledger.json"), 1000.0,
+                BinaryArbitrageScanner(),
+                negrisk_markets=[market],
+                negrisk_scanner=NegRiskBookScanner(),
+                negrisk_executor=nr_exec,
+            )
+            nr_exec.ledger = runner.ledger
+            runner.max_book_age_seconds = 1e9
+            runner.scan_rejects.flush_interval_s = 3600.0
+            now = int(__import__("time").time() * 1000)
+            for token in ("tok-a", "tok-b", "tok-c"):
+                asyncio.run(runner.process({
+                    "event_type": "book", "asset_id": token, "timestamp": str(now),
+                    "hash": token, "asks": [{"price": "0.32", "size": "2"}], "bids": [],
+                }))
+            self.assertEqual(nr_journal.state["baskets"], {})
+            self.assertFalse(any(
+                trade.get("type") == "OPEN_NEGRISK" for trade in runner.ledger.state["trades"]
+            ))
+            self.assertGreater(runner.scan_rejects.counts["fee_drag"], 0)
+            self.assertEqual(runner.scan_rejects.accepted, 0)
+            self.assertEqual(runner.scanner.min_net_profit_usd, 0.05)
+            self.assertEqual(runner.negrisk_scanner.min_net_profit_usd, 0.05)
+            self.assertEqual(runner.negrisk_scanner.min_return, 0.002)
+            self.assertEqual(runner.negrisk_scanner.safety_buffer_usd, 0.02)
+            with self.assertLogs("arbitrage-bot", level="INFO") as captured:
+                runner.scan_rejects.flush()
+            line = next(item for item in captured.output if "SCAN REJECTS:" in item)
+            self.assertIn("fee_drag=", line)
+            self.assertRegex(line, r"fee_drag=[1-9]")
+            self.assertIn("net_after_fee_below_floor=0", line)
 
     def test_paper_negrisk_journal_default_is_not_live_orders(self):
         with mock.patch.dict(os.environ, {}, clear=False):

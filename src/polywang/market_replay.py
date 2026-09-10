@@ -177,6 +177,9 @@ class ReplayOpportunity:
     gross_profit: float
     net_profit: float
     fingerprint: str
+    modeled_fees: float = 0.0
+    expected_net: float = 0.0
+    post_fee_net: float = 0.0
 
     @classmethod
     def from_opportunity(cls, event_index: int, opportunity: ArbitrageOpportunity) -> "ReplayOpportunity":
@@ -189,6 +192,9 @@ class ReplayOpportunity:
             gross_profit=opportunity.gross_profit,
             net_profit=opportunity.net_profit,
             fingerprint=opportunity.fingerprint,
+            modeled_fees=opportunity.modeled_fees,
+            expected_net=opportunity.expected_net,
+            post_fee_net=opportunity.post_fee_net,
         )
 
 
