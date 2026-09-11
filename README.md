@@ -15,12 +15,12 @@ uv sync
 # 跑单元测试（不联网）
 uv run python -m unittest discover -s tests -v
 
-# 纸面扫描，不需要密钥
-uv run polywang --markets 100 --cash 1000
+# 纸面扫描，不需要密钥（下一窗默认 MARKET_LIMIT=200 / NEGRISK_MARKET_LIMIT=40）
+uv run polywang --markets 200 --cash 1000
 
 # 纸面监督进程（QUANT-20260909-01）：子进程意外退出会写 status=stopped 并退避拉起
-uv run python scripts/paper_supervisor.py --markets 100 --cash 1000
-# 等价：uv run polywang-supervise --markets 100 --cash 1000
+uv run python scripts/paper_supervisor.py --markets 200 --cash 1000
+# 等价：uv run polywang-supervise --markets 200 --cash 1000
 ```
 
 监督进程是**增量**的，不必先杀掉已经在跑的 `uv run polywang`。干净停机（不要再拉起）任选其一：
@@ -54,10 +54,10 @@ live 或 paper 运行时设置 `MARKET_EVENT_LOG=market-events.jsonl` 可记录�
 纸面模式是默认路径：
 
 ```bash
-uv run polywang --markets 100 --cash 1000
+uv run polywang --markets 200 --cash 1000
 ```
 
-它只研究 Yes 和 No 两腿同时买入后合计支付 1.00 的二元市场。选市会先拉一个按成交量过滤的候选池（`MARKET_SCAN_POOL`），再按 **最低 yes_ask+no_ask** 排序（Gamma `outcomePrices` 作抓取代理，有盘口后用 live touch）。总和相同时优先 geopolitics（费率 0）。不再把 longshot 的 1-tick 理论（`ticks_to_breakeven` / `one_tick_net`）当作主排序。纸面 NegRisk 独立 n 腿路径默认打开（`ENABLE_NEGRISK_EXECUTION` 未设置即为开，`ENABLE_NEGRISK_LIVE` 保持未设置），账本写入 `paper-negrisk.json`，不会写 `live-orders.json`。机会必须使用订单簿中的实际 ask 和深度，并覆盖两腿 taker 费用、可选 merge gas（`MERGE_GAS_USD`）、资金安全缓冲和最大仓位；纸面成交写入 `paper-ledger.json`，程序重启后会恢复账本。两腿仍是顺序 FOK，不是原子交易，`is_risk_free` 恒为 false。小额阶段保持 `AUTO_MERGE_COMPLETE_SETS=0`：merge gas 是固定成本，未实测就填 0 并打开自动 merge 会把亏损单显示成盈利。
+它只研究 Yes 和 No 两腿同时买入后合计支付 1.00 的二元市场。选市会先拉一个按成交量过滤的候选池（`MARKET_SCAN_POOL`），再按 **最低 yes_ask+no_ask** 排序（Gamma `outcomePrices` 作抓取代理，有盘口后用 live touch）。总和相同时优先 geopolitics（费率 0）。不再把 longshot 的 1-tick 理论（`ticks_to_breakeven` / `one_tick_net`）当作主排序。纸面 NegRisk 独立 n 腿路径默认打开（`ENABLE_NEGRISK_EXECUTION` 未设置即为开，`ENABLE_NEGRISK_LIVE` 保持未设置），账本写入 `paper-negrisk.json`，不会写 `live-orders.json`。下一窗宇宙默认 `MARKET_LIMIT=200`、`NEGRISK_MARKET_LIMIT=40`，只在启动时读 CLI `--markets` / 环境变量，**不会**中途改正在跑的监督窗口。纸面 NegRisk 在 execute 前硬限制未结篮子数（`PAPER_MAX_OPEN_NEGRISK`，默认 8）和已预留资金（`PAPER_MAX_NEGRISK_RESERVED_USD`，默认 `0.40 * initial_cash`，例如 $1000 本金对应 $400）；超限记入 SCAN `risk_skip_open_negrisk` / `risk_skip_negrisk_capital`，现金不足仍走 `risk_skip_cash`。机会必须使用订单簿中的实际 ask 和深度，并覆盖两腿 taker 费用、可选 merge gas（`MERGE_GAS_USD`）、资金安全缓冲和最大仓位；纸面成交写入 `paper-ledger.json`，程序重启后会恢复账本。两腿仍是顺序 FOK，不是原子交易，`is_risk_free` 恒为 false。小额阶段保持 `AUTO_MERGE_COMPLETE_SETS=0`：merge gas 是固定成本，未实测就填 0 并打开自动 merge 会把亏损单显示成盈利。费率地板不变：`post_fee_net >= min_net_profit`（0.05）、`min_return=0.002`、`safety_buffer=0.02`。
 
 新引擎只有在显式设置 `POLYMARKET_LIVE_CONFIRM=I_UNDERSTAND_THE_RISK`、官方 geoblock 放行、私钥存在且安装了 live extra 时，才会使用两腿 FOK 执行器：
 
@@ -180,7 +180,11 @@ unwind。这条路径**默认关闭**，也**不会**调用二元 `merge_positio
 ```bash
 ENABLE_NEGRISK_EXECUTION=1   # paper 默认未设置即为开
 # ENABLE_NEGRISK_LIVE 保持未设置；实盘才显式设 1
-NEGRISK_MARKET_LIMIT=20
+# POLYMARKET_LIVE_CONFIRM 保持未设置；实盘仍 fail-closed
+MARKET_LIMIT=200
+NEGRISK_MARKET_LIMIT=40
+PAPER_MAX_OPEN_NEGRISK=8
+# PAPER_MAX_NEGRISK_RESERVED_USD 未设置时 = 0.40 * initial_cash
 PAPER_NEGRISK_JOURNAL=paper-negrisk.json
 ```
 

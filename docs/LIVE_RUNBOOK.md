@@ -41,8 +41,8 @@ uv run polywang --status --live-journal live-orders.json \
 4. 退避后重新拉起（默认 1s、2s、… 上限 30s，第一次 respawn 远小于 60s）。
 
 ```bash
-uv run python scripts/paper_supervisor.py --markets 100 --cash 1000
-# 或：uv run polywang-supervise --markets 100 --cash 1000
+uv run python scripts/paper_supervisor.py --markets 200 --cash 1000
+# 或：uv run polywang-supervise --markets 200 --cash 1000
 ```
 
 本地验收：
@@ -172,10 +172,15 @@ ENABLE_CRYPTO_LIVE=1
 ```bash
 ENABLE_NEGRISK_EXECUTION=1
 # ENABLE_NEGRISK_LIVE=1        # 仅实盘需要；纸面保持未设置
-NEGRISK_MARKET_LIMIT=20
+# POLYMARKET_LIVE_CONFIRM 保持未设置；实盘仍 fail-closed
+MARKET_LIMIT=200               # 下一纸面窗口；只读启动 CLI/env，不中途改正在跑的进程
+NEGRISK_MARKET_LIMIT=40
+PAPER_MAX_OPEN_NEGRISK=8
+# PAPER_MAX_NEGRISK_RESERVED_USD 未设置时 = 0.40 * initial_cash（$1000 → $400）
 LIVE_MAX_OPEN_NEGRISK=2
 AUTO_CONVERT_NEGRISK=0         # 保持关闭：polymarket-client 0.6.0 没有 convert_positions
 AUTO_REDEEM_RESOLVED_POSITIONS=1
+# 费率地板不变：MIN_NET_PROFIT_USD=0.05 MIN_RETURN_ON_CAPITAL=0.002 SAFETY_BUFFER_USD=0.02
 ```
 
 成交量池里散落的 `negRisk` 二元行**不会**在本地拼成完整集合。打开执行后，程序只用它们当 Gamma event 的查找键（`events[].id` / `eventId` / `eventSlug`），再去拉带齐 `markets[]` 的完整 event。拉不到就跳过，缺腿就是方向性敞口。纸面账本是 `paper-negrisk.json`，实盘账本是 `live-negrisk.json`，都和 `live-orders.json` 分开。

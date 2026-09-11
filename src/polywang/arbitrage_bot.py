@@ -68,6 +68,7 @@ from .arbitrage_core import (
     PaperAskDepthLedger,
     PaperArbitrageExecutor,
     PaperDirectionalExecutor,
+    PaperNegRiskRiskHelper,
     OfficialFOKExecutor,
     LiveRiskController,
     RiskHaltError,
@@ -146,8 +147,13 @@ RISK_SKIP_REASONS = (
     "cash",
     "open_exposure",
     "position_limit",
+    "open_negrisk",
+    "negrisk_capital",
     "other",
 )
+
+DEFAULT_MARKET_LIMIT = 200
+DEFAULT_NEGRISK_MARKET_LIMIT = 40
 
 
 def classify_risk_skip(error: BaseException) -> str:
@@ -155,14 +161,21 @@ def classify_risk_skip(error: BaseException) -> str:
     text = " ".join(str(error).strip().lower().split())
     if "insufficient paper cash" in text:
         return "cash"
+    if "negrisk" in text and (
+        "reserved capital" in text
+        or "capital reservation" in text
+        or "negrisk capital" in text
+    ):
+        return "negrisk_capital"
     if "total exposure" in text:
         return "open_exposure"
+    if "open negrisk" in text:
+        return "open_negrisk"
     if (
         "market exposure" in text
         or "open live pairs" in text
         or "open pairs" in text
         or "open directional" in text
-        or "open negrisk" in text
     ):
         return "position_limit"
     return "other"
@@ -595,6 +608,19 @@ class PaperMarketRunner:
         self.last_directional_event = ""
         self.health_publisher = None
 
+    def _paper_negrisk_risk(self) -> PaperNegRiskRiskHelper:
+        """Lazy paper NegRisk count/reserved helper. Never enables live."""
+        journal = self.negrisk_journal or getattr(self.negrisk_executor, "journal", None)
+        attached = getattr(self.negrisk_executor, "risk", None)
+        if isinstance(attached, PaperNegRiskRiskHelper):
+            if attached.journal is None:
+                attached.journal = journal
+            return attached
+        helper = PaperNegRiskRiskHelper.from_env(journal, ledger=self.ledger)
+        if self.negrisk_executor is not None and getattr(self.negrisk_executor, "risk", None) is None:
+            self.negrisk_executor.risk = helper
+        return helper
+
     def _publish_health(self, running: bool = True) -> None:
         publisher = getattr(self, "health_publisher", None)
         if publisher is not None:
@@ -875,6 +901,9 @@ class PaperMarketRunner:
         try:
             if self.risk_controller and self.live:
                 self.risk_controller.check_negrisk(opportunity)
+            elif not self.live:
+                # Paper admit before execute: count + reserved (not live).
+                self._paper_negrisk_risk().check(opportunity)
             result = self.negrisk_executor.execute(opportunity)
             if inspect.isawaitable(result):
                 result = await result
@@ -2085,7 +2114,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Polymarket deterministic binary arbitrage scanner")
     parser.add_argument("--live", action="store_true", help="Use the official FOK executor after explicit environment confirmation")
     parser.add_argument("--preflight", action="store_true", help="Run live account and journal checks without starting streams or placing orders")
-    parser.add_argument("--markets", type=int, default=env_int("MARKET_LIMIT", 100))
+    parser.add_argument("--markets", type=int, default=env_int("MARKET_LIMIT", DEFAULT_MARKET_LIMIT))
     parser.add_argument("--ledger", default=os.getenv("PAPER_LEDGER", "paper-ledger.json"))
     parser.add_argument("--live-journal", default=os.getenv("LIVE_ORDER_JOURNAL", "live-orders.json"))
     parser.add_argument("--directional-journal", default=os.getenv("LIVE_DIRECTIONAL_JOURNAL", "live-directional.json"))
@@ -2133,7 +2162,7 @@ def main() -> int:
     configure_exception_log(os.getenv("MONITOR_EXCEPTIONS_LOG", "monitor-exceptions.jsonl"))
 
     want_negrisk = negrisk_execution_enabled(args.live)
-    negrisk_limit = env_int("NEGRISK_MARKET_LIMIT", 20) if want_negrisk else 0
+    negrisk_limit = env_int("NEGRISK_MARKET_LIMIT", DEFAULT_NEGRISK_MARKET_LIMIT) if want_negrisk else 0
     markets, negrisk_markets = fetch_universe(args.markets, negrisk_limit=negrisk_limit)
     if not markets:
         LOG.error("No active binary markets with Yes/No token IDs were found")
@@ -2309,7 +2338,11 @@ def main() -> int:
             negrisk_scanner=negrisk_scanner,
         )
         if want_negrisk and negrisk_markets:
-            paper_negrisk = PaperNegRiskExecutor(negrisk_journal, runner.ledger)
+            paper_negrisk = PaperNegRiskExecutor(
+                negrisk_journal,
+                runner.ledger,
+                risk=PaperNegRiskRiskHelper.from_env(negrisk_journal, ledger=runner.ledger),
+            )
             runner.negrisk_executor = paper_negrisk
             runner.negrisk_journal = negrisk_journal
             recovered = paper_negrisk.settle_baskets()
