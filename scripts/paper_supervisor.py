@@ -3,7 +3,7 @@
 
 Start (from the repo root, secrets stay in the environment / local .env):
 
-    uv run python scripts/paper_supervisor.py --markets 100 --cash 1000
+    uv run python scripts/paper_supervisor.py --markets 200 --cash 1000
 
 Clean stop without a respawn loop — pick one, then wait for the child to exit
 (or send SIGTERM to the supervisor):

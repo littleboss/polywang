@@ -958,6 +958,130 @@ class RiskHaltError(RuntimeError):
     """A live risk gate has halted new order placement."""
 
 
+PAPER_MAX_OPEN_NEGRISK_DEFAULT = 8
+PAPER_NEGRISK_RESERVED_FRACTION_DEFAULT = 0.40
+
+
+def resolve_paper_max_open_negrisk(
+    default: int = PAPER_MAX_OPEN_NEGRISK_DEFAULT,
+) -> int:
+    """PAPER_MAX_OPEN_NEGRISK, default 8. Env only; never pulls a live window."""
+    raw = os.getenv("PAPER_MAX_OPEN_NEGRISK")
+    try:
+        value = int(raw) if raw else default
+    except (TypeError, ValueError):
+        value = default
+    return max(0, int(value))
+
+
+def resolve_paper_max_negrisk_reserved_usd(initial_cash: float) -> float:
+    """PAPER_MAX_NEGRISK_RESERVED_USD, else 0.40 * initial_cash (e.g. $400 / $1000)."""
+    raw = os.getenv("PAPER_MAX_NEGRISK_RESERVED_USD")
+    if raw is not None and str(raw).strip() != "":
+        try:
+            value = float(raw)
+            if math.isfinite(value):
+                return max(0.0, value)
+        except (TypeError, ValueError):
+            pass
+    cash = float(initial_cash)
+    if not math.isfinite(cash) or cash < 0.0:
+        cash = 0.0
+    return PAPER_NEGRISK_RESERVED_FRACTION_DEFAULT * cash
+
+
+def check_negrisk_inventory_limits(
+    journal,
+    required,
+    *,
+    max_open_negrisk: int,
+    max_reserved_usd: Optional[float] = None,
+    error_cls=ValueError,
+) -> None:
+    """Shared NegRisk count + reserved-capital admit gate.
+
+    Paper uses ValueError so SCAN maps the skip. Live uses RiskHaltError and
+    leaves reserved_usd unset (live still applies total/market exposure).
+    Reads journal.incomplete_baskets() and capital_reserved via open_exposure().
+    """
+    if journal is None:
+        raise error_cls("NegRisk journal is not configured")
+    if int(max_open_negrisk) <= 0:
+        raise error_cls("NegRisk execution is disabled by risk limits")
+    try:
+        needed = float(required)
+    except (TypeError, ValueError):
+        needed = float("nan")
+    if not math.isfinite(needed) or needed < 0.0:
+        raise error_cls("NegRisk capital reservation is invalid")
+    if len(journal.incomplete_baskets()) >= int(max_open_negrisk):
+        raise error_cls("maximum number of open NegRisk baskets reached")
+    if max_reserved_usd is None:
+        return
+    try:
+        cap = float(max_reserved_usd)
+    except (TypeError, ValueError):
+        cap = float("nan")
+    if not math.isfinite(cap) or cap < 0.0:
+        raise error_cls("NegRisk reserved capital limit is invalid")
+    reserved = journal.open_exposure()
+    if reserved + needed > cap + 1e-9:
+        raise error_cls("NegRisk reserved capital limit")
+
+
+class PaperNegRiskRiskHelper:
+    """Paper NegRisk admit helper: same count/reserved semantics as live, no live.
+
+    Rejects when incomplete_baskets() >= PAPER_MAX_OPEN_NEGRISK (default 8) or
+    when open reserved + required would exceed PAPER_MAX_NEGRISK_RESERVED_USD
+    (default 0.40 * initial_cash). Does not unlock ENABLE_NEGRISK_LIVE.
+    """
+
+    def __init__(
+        self,
+        journal,
+        max_open_negrisk: Optional[int] = None,
+        max_reserved_usd: Optional[float] = None,
+        initial_cash: Optional[float] = None,
+    ):
+        self.journal = journal
+        if max_open_negrisk is None:
+            self.max_open_negrisk = resolve_paper_max_open_negrisk()
+        else:
+            self.max_open_negrisk = max(0, int(max_open_negrisk))
+        if max_reserved_usd is None:
+            cash = 1000.0 if initial_cash is None else float(initial_cash)
+            self.max_reserved_usd = resolve_paper_max_negrisk_reserved_usd(cash)
+        else:
+            self.max_reserved_usd = float(max_reserved_usd)
+
+    @classmethod
+    def from_env(cls, journal, ledger=None, initial_cash: Optional[float] = None):
+        if initial_cash is None and ledger is not None:
+            raw = None
+            state = getattr(ledger, "state", None)
+            if isinstance(state, dict):
+                raw = state.get("initial_cash")
+            if raw is None:
+                raw = getattr(ledger, "initial_cash", None)
+            initial_cash = 1000.0 if raw is None else float(raw)
+        if initial_cash is None:
+            initial_cash = 1000.0
+        return cls(journal, initial_cash=initial_cash)
+
+    def check(self, opportunity) -> None:
+        required = getattr(opportunity, "execution_capital_required", None)
+        if required is None:
+            required = opportunity.capital_required
+        check_negrisk_inventory_limits(
+            self.journal,
+            required,
+            max_open_negrisk=self.max_open_negrisk,
+            max_reserved_usd=self.max_reserved_usd,
+            error_cls=ValueError,
+        )
+
+
 class LiveOrderJournal:
     """Atomic journal for live pairs and confirmed fills.
 
@@ -2238,16 +2362,16 @@ class LiveRiskController:
     def check_negrisk(self, opportunity) -> None:
         """Admit an n-leg NegRisk basket against the shared live exposure budget."""
         self.check_startup()
-        if self.negrisk_journal is None:
-            raise RiskHaltError("NegRisk journal is not configured")
-        if self.max_open_negrisk <= 0:
-            raise RiskHaltError("NegRisk execution is disabled by risk limits")
         required = float(opportunity.execution_capital_required)
-        if not math.isfinite(required) or required < 0.0:
-            raise RiskHaltError("NegRisk capital reservation is invalid")
-        open_baskets = self.negrisk_journal.incomplete_baskets()
-        if len(open_baskets) >= self.max_open_negrisk:
-            raise RiskHaltError("maximum number of open NegRisk baskets reached")
+        # Count gate is shared with paper. Live capital stays total/market
+        # exposure (not PAPER_MAX_NEGRISK_RESERVED_USD).
+        check_negrisk_inventory_limits(
+            self.negrisk_journal,
+            required,
+            max_open_negrisk=self.max_open_negrisk,
+            max_reserved_usd=None,
+            error_cls=RiskHaltError,
+        )
         total = self.journal.open_exposure() + self.extra_exposure()
         if total + required > self.equity_usd * self.max_total_exposure_fraction + 1e-9:
             raise RiskHaltError("live total exposure limit")

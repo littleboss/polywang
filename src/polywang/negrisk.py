@@ -24,6 +24,7 @@ from .arbitrage_core import (
     BinaryMarket,
     OfficialFOKExecutor,
     OrderBook,
+    PaperNegRiskRiskHelper,
     UnhedgedPairError,
     _as_bool,
     _category,
@@ -893,13 +894,22 @@ class LiveNegRiskJournal:
 
 
 class PaperNegRiskExecutor:
-    def __init__(self, journal: LiveNegRiskJournal, ledger=None):
+    def __init__(self, journal: LiveNegRiskJournal, ledger=None, risk=None):
         self.journal = journal
         self.ledger = ledger
+        self.risk = risk
+
+    def _admit(self, opportunity: NegRiskBookOpportunity) -> None:
+        """Count/reserved gates before cash or journal writes (paper≈live)."""
+        risk = self.risk
+        if risk is None:
+            risk = PaperNegRiskRiskHelper.from_env(self.journal, ledger=self.ledger)
+        risk.check(opportunity)
 
     def execute(self, opportunity: NegRiskBookOpportunity):
         if opportunity.shares <= 0.0:
             raise ValueError("cannot execute an empty NegRisk basket")
+        self._admit(opportunity)
         position_id = ""
         if self.ledger is not None:
             required = opportunity.capital_required

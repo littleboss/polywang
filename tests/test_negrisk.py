@@ -9,8 +9,11 @@ import unittest
 from unittest import mock
 
 from polywang.arbitrage_bot import (
+    DEFAULT_MARKET_LIMIT,
+    DEFAULT_NEGRISK_MARKET_LIMIT,
     PaperMarketRunner,
     classify_risk_skip,
+    env_int,
     fetch_markets,
     fetch_universe,
     resolve_negrisk_journal_path,
@@ -24,8 +27,11 @@ from polywang.arbitrage_core import (
     LiveRiskController,
     OfficialFOKExecutor,
     OrderBook,
+    PaperNegRiskRiskHelper,
     RiskHaltError,
     UnhedgedPairError,
+    resolve_paper_max_negrisk_reserved_usd,
+    resolve_paper_max_open_negrisk,
 )
 from polywang.negrisk import (
     LiveNegRiskJournal,
@@ -838,6 +844,198 @@ class PaperSettlementAccountingTests(unittest.TestCase):
             self.assertEqual(remaining[0]["status"], "ASSEMBLED")
             self.assertIn(remaining[0]["basket_id"], open_ids)
             self.assertAlmostEqual(journal.open_exposure(), float(remaining[0]["capital_reserved"]))
+
+
+class PaperNegRiskAdmitCapsTests(unittest.TestCase):
+    """QUANT-20260911-02: paper NegRisk count/reserved admit before execute."""
+
+    def _opportunity(self):
+        market = NegRiskMarket.from_gamma(nway_payload())
+        books = {
+            "tok-a": synced_book({0.20: 10}),
+            "tok-b": synced_book({0.20: 10}),
+            "tok-c": synced_book({0.20: 10}),
+        }
+        opportunity = NegRiskBookScanner(
+            min_net_profit_usd=0.01, min_return=0.0, safety_buffer_usd=0.0,
+        ).scan(market, books)
+        self.assertIsNotNone(opportunity)
+        return market, opportunity
+
+    def _seed_assembled(self, journal, opportunity, count):
+        for _ in range(count):
+            basket_id = journal.create_basket(opportunity)
+            journal.set_status(basket_id, "ASSEMBLED")
+
+    def _runner(self, directory, journal, market, cash=1000.0):
+        binary = BinaryMarket("m1", "c1", "Binary", "yes-token", "no-token", category="geopolitics")
+        executor = PaperNegRiskExecutor(journal)
+        runner = PaperMarketRunner(
+            [binary], os.path.join(directory, "ledger.json"), cash,
+            BinaryArbitrageScanner(min_net_profit_usd=0.01, min_return=0.0, safety_buffer_usd=0.0),
+            negrisk_markets=[market],
+            negrisk_scanner=NegRiskBookScanner(
+                min_net_profit_usd=0.01, min_return=0.0, safety_buffer_usd=0.0,
+            ),
+            negrisk_executor=executor,
+        )
+        executor.ledger = runner.ledger
+        runner.max_book_age_seconds = 1e9
+        runner.scan_rejects.flush_interval_s = 3600.0
+        return runner, executor
+
+    def _feed_books(self, runner, now=None):
+        now = int(__import__("time").time() * 1000) if now is None else now
+        for token in ("tok-a", "tok-b", "tok-c"):
+            asyncio.run(runner.process({
+                "event_type": "book", "asset_id": token, "timestamp": str(now),
+                "hash": token, "asks": [{"price": "0.20", "size": "10"}], "bids": [],
+            }))
+
+    def test_paper_admit_rejects_open_negrisk_at_default_eight(self):
+        market, opportunity = self._opportunity()
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ, {"WHALE_STATE_PATH": ""}, clear=False,
+        ):
+            os.environ.pop("ENABLE_NEGRISK_LIVE", None)
+            os.environ.pop("POLYMARKET_LIVE_CONFIRM", None)
+            os.environ.pop("PAPER_MAX_OPEN_NEGRISK", None)
+            journal = LiveNegRiskJournal(os.path.join(directory, "paper-negrisk.json"))
+            self._seed_assembled(journal, opportunity, 8)
+            runner, executor = self._runner(directory, journal, market)
+            cash_before = float(runner.ledger.state["cash"])
+            self.assertGreater(cash_before, opportunity.execution_capital_required)
+            self.assertEqual(len(journal.incomplete_baskets()), 8)
+            with self.assertRaises(ValueError) as raised:
+                executor.execute(opportunity)
+            self.assertEqual(classify_risk_skip(raised.exception), "open_negrisk")
+            self._feed_books(runner)
+            self.assertEqual(len(journal.incomplete_baskets()), 8)
+            self.assertEqual(runner.scan_rejects.counts["risk_skip"], 1)
+            self.assertEqual(runner.scan_rejects.risk_skip_reasons["open_negrisk"], 1)
+            self.assertEqual(runner.scan_rejects.risk_skip_reasons["cash"], 0)
+            self.assertAlmostEqual(float(runner.ledger.state["cash"]), cash_before)
+            with self.assertLogs("arbitrage-bot", level="INFO") as captured:
+                runner.scan_rejects.flush()
+            line = next(item for item in captured.output if "SCAN REJECTS:" in item)
+            self.assertIn("risk_skip_open_negrisk=1", line)
+            self.assertIn("fee_drag=0", line)
+            self.assertIn("net_after_fee_below_floor=0", line)
+            self.assertEqual(runner.negrisk_scanner.min_net_profit_usd, 0.01)
+            self.assertIsNone(os.environ.get("ENABLE_NEGRISK_LIVE"))
+            self.assertNotEqual(os.getenv("POLYMARKET_LIVE_CONFIRM"), "I_UNDERSTAND_THE_RISK")
+
+    def test_paper_admit_rejects_negrisk_capital_when_reserved_would_exceed(self):
+        market, opportunity = self._opportunity()
+        required = float(opportunity.execution_capital_required)
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ,
+            {
+                "WHALE_STATE_PATH": "",
+                "PAPER_MAX_NEGRISK_RESERVED_USD": f"{required * 1.5:.6f}",
+            },
+            clear=False,
+        ):
+            os.environ.pop("ENABLE_NEGRISK_LIVE", None)
+            journal = LiveNegRiskJournal(os.path.join(directory, "paper-negrisk.json"))
+            self._seed_assembled(journal, opportunity, 1)
+            runner, executor = self._runner(directory, journal, market)
+            cash_before = float(runner.ledger.state["cash"])
+            self.assertGreater(cash_before, required)
+            self.assertLess(journal.open_exposure() + required, cash_before)
+            with self.assertRaises(ValueError) as raised:
+                executor.execute(opportunity)
+            self.assertEqual(classify_risk_skip(raised.exception), "negrisk_capital")
+            self._feed_books(runner)
+            self.assertEqual(len(journal.incomplete_baskets()), 1)
+            self.assertEqual(runner.scan_rejects.risk_skip_reasons["negrisk_capital"], 1)
+            self.assertEqual(runner.scan_rejects.risk_skip_reasons["cash"], 0)
+            self.assertAlmostEqual(float(runner.ledger.state["cash"]), cash_before)
+            with self.assertLogs("arbitrage-bot", level="INFO") as captured:
+                runner.scan_rejects.flush()
+            line = next(item for item in captured.output if "SCAN REJECTS:" in item)
+            self.assertIn("risk_skip_negrisk_capital=1", line)
+            self.assertIn("fee_drag=0", line)
+            self.assertIn("net_after_fee_below_floor=0", line)
+
+    def test_caps_block_fixture_accumulation_while_cash_remains(self):
+        _market, opportunity = self._opportunity()
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ, {"WHALE_STATE_PATH": ""}, clear=False,
+        ):
+            os.environ.pop("PAPER_MAX_OPEN_NEGRISK", None)
+            os.environ.pop("PAPER_MAX_NEGRISK_RESERVED_USD", None)
+            journal = LiveNegRiskJournal(os.path.join(directory, "paper-negrisk.json"))
+            ledger = JsonLedger(os.path.join(directory, "ledger.json"), initial_cash=1000.0)
+            helper = PaperNegRiskRiskHelper(
+                journal, max_open_negrisk=8, max_reserved_usd=400.0, initial_cash=1000.0,
+            )
+            executor = PaperNegRiskExecutor(journal, ledger, risk=helper)
+            opened = 0
+            for _ in range(12):
+                try:
+                    executor.execute(opportunity)
+                    opened += 1
+                except ValueError as error:
+                    self.assertEqual(classify_risk_skip(error), "open_negrisk")
+                    break
+            self.assertEqual(opened, 8)
+            self.assertEqual(len(journal.incomplete_baskets()), 8)
+            self.assertLessEqual(journal.open_exposure(), 400.0)
+            self.assertGreater(float(ledger.state["cash"]), 0.0)
+            self.assertGreater(float(ledger.state["cash"]), opportunity.execution_capital_required)
+
+            tight = PaperNegRiskRiskHelper(
+                journal, max_open_negrisk=80, max_reserved_usd=journal.open_exposure() + 0.01,
+            )
+            with self.assertRaises(ValueError) as raised:
+                PaperNegRiskExecutor(journal, ledger, risk=tight).execute(opportunity)
+            self.assertEqual(classify_risk_skip(raised.exception), "negrisk_capital")
+            self.assertEqual(len(journal.incomplete_baskets()), 8)
+
+    def test_next_window_universe_defaults_and_paper_reserved_formula(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MARKET_LIMIT", None)
+            os.environ.pop("NEGRISK_MARKET_LIMIT", None)
+            os.environ.pop("PAPER_MAX_OPEN_NEGRISK", None)
+            os.environ.pop("PAPER_MAX_NEGRISK_RESERVED_USD", None)
+            os.environ.pop("ENABLE_NEGRISK_LIVE", None)
+            os.environ.pop("POLYMARKET_LIVE_CONFIRM", None)
+            os.environ.pop("APPROVED_FOR_RELEASE", None)
+            self.assertEqual(DEFAULT_MARKET_LIMIT, 200)
+            self.assertEqual(DEFAULT_NEGRISK_MARKET_LIMIT, 40)
+            self.assertEqual(env_int("MARKET_LIMIT", DEFAULT_MARKET_LIMIT), 200)
+            self.assertEqual(env_int("NEGRISK_MARKET_LIMIT", DEFAULT_NEGRISK_MARKET_LIMIT), 40)
+            self.assertEqual(resolve_paper_max_open_negrisk(), 8)
+            self.assertAlmostEqual(resolve_paper_max_negrisk_reserved_usd(1000.0), 400.0)
+            self.assertIsNone(os.environ.get("ENABLE_NEGRISK_LIVE"))
+            self.assertNotEqual(os.getenv("POLYMARKET_LIVE_CONFIRM"), "I_UNDERSTAND_THE_RISK")
+            self.assertIsNone(os.environ.get("APPROVED_FOR_RELEASE"))
+
+    def test_live_count_gate_stays_risk_halt_and_live_stays_off(self):
+        _market, opportunity = self._opportunity()
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ, {}, clear=False,
+        ):
+            os.environ.pop("ENABLE_NEGRISK_LIVE", None)
+            os.environ.pop("POLYMARKET_LIVE_CONFIRM", None)
+            journal = LiveNegRiskJournal(os.path.join(directory, "nr.json"))
+            self._seed_assembled(journal, opportunity, 2)
+            pairs = LiveOrderJournal(os.path.join(directory, "pairs.json"))
+            risk = LiveRiskController(
+                pairs,
+                equity_usd=1000.0,
+                state_path=os.path.join(directory, "risk.json"),
+                kill_switch_path=os.path.join(directory, "missing-kill"),
+                negrisk_journal=journal,
+                max_open_negrisk=2,
+            )
+            with self.assertRaises(RiskHaltError) as raised:
+                risk.check_negrisk(opportunity)
+            self.assertIn("open NegRisk", str(raised.exception))
+            self.assertEqual(classify_risk_skip(raised.exception), "open_negrisk")
+            self.assertFalse(negrisk_execution_enabled(True))
+            self.assertIsNone(os.environ.get("ENABLE_NEGRISK_LIVE"))
 
 
 if __name__ == "__main__":
