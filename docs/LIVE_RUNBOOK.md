@@ -174,16 +174,21 @@ ENABLE_NEGRISK_EXECUTION=1
 # ENABLE_NEGRISK_LIVE=1        # 仅实盘需要；纸面保持未设置
 # POLYMARKET_LIVE_CONFIRM 保持未设置；实盘仍 fail-closed
 MARKET_LIMIT=200               # 下一纸面窗口；只读启动 CLI/env，不中途改正在跑的进程
-NEGRISK_MARKET_LIMIT=40
+NEGRISK_MARKET_LIMIT=40         # 截断前优先 2 结果 / 最少腿数字段
 PAPER_MAX_OPEN_NEGRISK=8
 # PAPER_MAX_NEGRISK_RESERVED_USD 未设置时 = 0.40 * initial_cash（$1000 → $400）
+PAPER_NEGRISK_MAX_LEGS=2
+PAPER_NEGRISK_MIN_LEG_PRICE=0.05
+PAPER_NEGRISK_MAX_LEG_PRICE=0.95
+PAPER_NEGRISK_ALLOW_BUY_ALL_NO=0
 LIVE_MAX_OPEN_NEGRISK=2
 AUTO_CONVERT_NEGRISK=0         # 保持关闭：polymarket-client 0.6.0 没有 convert_positions
 AUTO_REDEEM_RESOLVED_POSITIONS=1
 # 费率地板不变：MIN_NET_PROFIT_USD=0.05 MIN_RETURN_ON_CAPITAL=0.002 SAFETY_BUFFER_USD=0.02
+# 不要为了加速验证而降低地板或打开 live / APPROVED_FOR_RELEASE
 ```
 
-成交量池里散落的 `negRisk` 二元行**不会**在本地拼成完整集合。打开执行后，程序只用它们当 Gamma event 的查找键（`events[].id` / `eventId` / `eventSlug`），再去拉带齐 `markets[]` 的完整 event。拉不到就跳过，缺腿就是方向性敞口。纸面账本是 `paper-negrisk.json`，实盘账本是 `live-negrisk.json`，都和 `live-orders.json` 分开。
+成交量池里散落的 `negRisk` 二元行**不会**在本地拼成完整集合。打开执行后，程序只用它们当 Gamma event 的查找键（`events[].id` / `eventId` / `eventSlug`），再去拉带齐 `markets[]` 的完整 event。拉不到就跳过，缺腿就是方向性敞口。纸面账本是 `paper-negrisk.json`，实盘账本是 `live-negrisk.json`，都和 `live-orders.json` 分开。纸面 execute 默认只 admit 2 腿、0.05–0.95 腿价的 `BUY_ALL_YES`；SCAN 会计 `negrisk_too_many_legs` / `negrisk_extreme_price` / `negrisk_direction_disabled`，不影响 `fee_drag` / `net_after_fee_below_floor` / `risk_skip_open_negrisk` / `risk_skip_negrisk_capital`。观察日志仍可留下被过滤的形态。
 
 市场 resolution 后篮子进入 `RESOLVED_PENDING_REDEMPTION`，对账会对每个 child `condition_id` 调用官方 `redeem_positions`；输家腿余额可以为 0。确认后才变成 `SETTLED` 并释放风险预算。`ASSEMBLED` / `RESOLVED_PENDING_REDEMPTION` / `CONVERT_SUBMITTED` 在启动时不 halt（稳定库存）；未完成或未知结果仍 halt。
 

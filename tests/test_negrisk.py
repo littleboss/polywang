@@ -35,14 +35,24 @@ from polywang.arbitrage_core import (
 )
 from polywang.negrisk import (
     LiveNegRiskJournal,
+    NegRiskBookOpportunity,
     NegRiskBookScanner,
+    NegRiskLeg,
     NegRiskMarket,
     OfficialNegRiskExecutor,
+    PAPER_NEGRISK_MAX_LEGS_DEFAULT,
+    PAPER_NEGRISK_MAX_LEG_PRICE_DEFAULT,
+    PAPER_NEGRISK_MIN_LEG_PRICE_DEFAULT,
     PaperNegRiskExecutor,
+    PaperNegRiskSubsetReject,
     collect_event_lookups,
     fetch_complete_negrisk_events,
     negrisk_execution_enabled,
+    paper_negrisk_subset_reject_reason,
     parse_negrisk_markets,
+    resolve_paper_negrisk_allow_buy_all_no,
+    resolve_paper_negrisk_max_legs,
+    select_negrisk_universe,
 )
 
 
@@ -54,6 +64,22 @@ def nway_payload(**overrides):
         "clobTokenIds": '["tok-a", "tok-b", "tok-c"]',
         "outcomes": '["A", "B", "C"]',
         "outcomePrices": '["0.20", "0.20", "0.20"]',
+        "category": "geopolitics",
+        "active": True,
+        "closed": False,
+    }
+    row.update(overrides)
+    return row
+
+
+def two_leg_payload(**overrides):
+    row = {
+        "id": "nr2",
+        "conditionId": "cnr2",
+        "question": "Two horse",
+        "clobTokenIds": '["tok-a", "tok-b"]',
+        "outcomes": '["A", "B"]',
+        "outcomePrices": '["0.40", "0.40"]',
         "category": "geopolitics",
         "active": True,
         "closed": False,
@@ -383,7 +409,7 @@ class RiskAndRunnerTests(unittest.TestCase):
         market = NegRiskMarket.from_gamma(nway_payload())
         binary = BinaryMarket("m1", "c1", "Binary", "yes-token", "no-token", category="geopolitics")
         with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
-            os.environ, {"WHALE_STATE_PATH": ""}, clear=False,
+            os.environ, {"WHALE_STATE_PATH": "", "PAPER_NEGRISK_MAX_LEGS": "8"}, clear=False,
         ):
             nr_journal = LiveNegRiskJournal(os.path.join(directory, "nr.json"))
             nr_exec = PaperNegRiskExecutor(nr_journal)
@@ -429,7 +455,7 @@ class RiskAndRunnerTests(unittest.TestCase):
         market = NegRiskMarket.from_gamma(nway_payload(category="sports"))
         binary = BinaryMarket("m1", "c1", "Binary", "yes-token", "no-token", category="geopolitics")
         with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
-            os.environ, {"WHALE_STATE_PATH": ""}, clear=False,
+            os.environ, {"WHALE_STATE_PATH": "", "PAPER_NEGRISK_MAX_LEGS": "8"}, clear=False,
         ):
             nr_journal = LiveNegRiskJournal(os.path.join(directory, "paper-negrisk.json"))
             nr_exec = PaperNegRiskExecutor(nr_journal)
@@ -485,7 +511,7 @@ class RiskAndRunnerTests(unittest.TestCase):
         market = NegRiskMarket.from_gamma(nway_payload())
         binary = BinaryMarket("m1", "c1", "Binary", "yes-token", "no-token", category="geopolitics")
         with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
-            os.environ, {"WHALE_STATE_PATH": ""}, clear=False,
+            os.environ, {"WHALE_STATE_PATH": "", "PAPER_NEGRISK_MAX_LEGS": "8"}, clear=False,
         ):
             os.environ.pop("ENABLE_NEGRISK_LIVE", None)
             journal_path = os.path.join(directory, "paper-negrisk.json")
@@ -618,7 +644,7 @@ class RiskAndRunnerTests(unittest.TestCase):
         market = NegRiskMarket.from_gamma(nway_payload())
         binary = BinaryMarket("m1", "c1", "Binary", "yes-token", "no-token", category="geopolitics")
         with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
-            os.environ, {"WHALE_STATE_PATH": ""}, clear=False,
+            os.environ, {"WHALE_STATE_PATH": "", "PAPER_NEGRISK_MAX_LEGS": "8"}, clear=False,
         ):
             os.environ.pop("ENABLE_NEGRISK_LIVE", None)
             os.environ.pop("POLYMARKET_LIVE_CONFIRM", None)
@@ -700,7 +726,7 @@ class PaperSettlementAccountingTests(unittest.TestCase):
             markets.append(market)
             opportunities.append(opportunity)
         with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
-            os.environ, {"WHALE_STATE_PATH": ""}, clear=False,
+            os.environ, {"WHALE_STATE_PATH": "", "PAPER_NEGRISK_MAX_LEGS": "8"}, clear=False,
         ):
             os.environ.pop("ENABLE_NEGRISK_LIVE", None)
             journal_path = os.path.join(directory, "paper-negrisk.json")
@@ -787,7 +813,7 @@ class PaperSettlementAccountingTests(unittest.TestCase):
         market = NegRiskMarket.from_gamma(nway_payload())
         binary = BinaryMarket("m1", "c1", "Binary", "yes-token", "no-token", category="geopolitics")
         with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
-            os.environ, {"WHALE_STATE_PATH": ""}, clear=False,
+            os.environ, {"WHALE_STATE_PATH": "", "PAPER_NEGRISK_MAX_LEGS": "8"}, clear=False,
         ):
             nr_journal = LiveNegRiskJournal(os.path.join(directory, "paper-negrisk.json"))
             nr_exec = PaperNegRiskExecutor(nr_journal)
@@ -823,7 +849,9 @@ class PaperSettlementAccountingTests(unittest.TestCase):
 
     def test_legacy_settled_ledger_pairs_assembled_journal_one_to_one(self):
         _market, opportunity = self._market_and_opportunity("legacy")
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ, {"PAPER_NEGRISK_MAX_LEGS": "8"}, clear=False,
+        ):
             journal = LiveNegRiskJournal(os.path.join(directory, "paper-negrisk.json"))
             ledger = JsonLedger(os.path.join(directory, "ledger.json"), initial_cash=1000.0)
             executor = PaperNegRiskExecutor(journal, ledger)
@@ -895,7 +923,7 @@ class PaperNegRiskAdmitCapsTests(unittest.TestCase):
     def test_paper_admit_rejects_open_negrisk_at_default_eight(self):
         market, opportunity = self._opportunity()
         with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
-            os.environ, {"WHALE_STATE_PATH": ""}, clear=False,
+            os.environ, {"WHALE_STATE_PATH": "", "PAPER_NEGRISK_MAX_LEGS": "8"}, clear=False,
         ):
             os.environ.pop("ENABLE_NEGRISK_LIVE", None)
             os.environ.pop("POLYMARKET_LIVE_CONFIRM", None)
@@ -932,6 +960,7 @@ class PaperNegRiskAdmitCapsTests(unittest.TestCase):
             os.environ,
             {
                 "WHALE_STATE_PATH": "",
+                "PAPER_NEGRISK_MAX_LEGS": "8",
                 "PAPER_MAX_NEGRISK_RESERVED_USD": f"{required * 1.5:.6f}",
             },
             clear=False,
@@ -961,7 +990,7 @@ class PaperNegRiskAdmitCapsTests(unittest.TestCase):
     def test_caps_block_fixture_accumulation_while_cash_remains(self):
         _market, opportunity = self._opportunity()
         with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
-            os.environ, {"WHALE_STATE_PATH": ""}, clear=False,
+            os.environ, {"WHALE_STATE_PATH": "", "PAPER_NEGRISK_MAX_LEGS": "8"}, clear=False,
         ):
             os.environ.pop("PAPER_MAX_OPEN_NEGRISK", None)
             os.environ.pop("PAPER_MAX_NEGRISK_RESERVED_USD", None)
@@ -1011,6 +1040,15 @@ class PaperNegRiskAdmitCapsTests(unittest.TestCase):
             self.assertIsNone(os.environ.get("ENABLE_NEGRISK_LIVE"))
             self.assertNotEqual(os.getenv("POLYMARKET_LIVE_CONFIRM"), "I_UNDERSTAND_THE_RISK")
             self.assertIsNone(os.environ.get("APPROVED_FOR_RELEASE"))
+            os.environ.pop("PAPER_NEGRISK_MAX_LEGS", None)
+            os.environ.pop("PAPER_NEGRISK_MIN_LEG_PRICE", None)
+            os.environ.pop("PAPER_NEGRISK_MAX_LEG_PRICE", None)
+            os.environ.pop("PAPER_NEGRISK_ALLOW_BUY_ALL_NO", None)
+            self.assertEqual(PAPER_NEGRISK_MAX_LEGS_DEFAULT, 2)
+            self.assertEqual(resolve_paper_negrisk_max_legs(), 2)
+            self.assertEqual(PAPER_NEGRISK_MIN_LEG_PRICE_DEFAULT, 0.05)
+            self.assertEqual(PAPER_NEGRISK_MAX_LEG_PRICE_DEFAULT, 0.95)
+            self.assertFalse(resolve_paper_negrisk_allow_buy_all_no())
 
     def test_live_count_gate_stays_risk_halt_and_live_stays_off(self):
         _market, opportunity = self._opportunity()
@@ -1036,6 +1074,246 @@ class PaperNegRiskAdmitCapsTests(unittest.TestCase):
             self.assertEqual(classify_risk_skip(raised.exception), "open_negrisk")
             self.assertFalse(negrisk_execution_enabled(True))
             self.assertIsNone(os.environ.get("ENABLE_NEGRISK_LIVE"))
+
+
+class PaperNegRiskSubsetFilterTests(unittest.TestCase):
+    """QUANT-20260913-01: paper execute admits 2-leg mid-price BUY_ALL_YES."""
+
+    def _scan(self, market, books, min_net=0.01, min_return=0.0, buffer=0.0):
+        opportunity = NegRiskBookScanner(
+            min_net_profit_usd=min_net, min_return=min_return, safety_buffer_usd=buffer,
+        ).scan(market, books)
+        self.assertIsNotNone(opportunity)
+        return opportunity
+
+    def _two_leg_yes(self, asks):
+        market = NegRiskMarket.from_gamma(two_leg_payload())
+        books = {token: synced_book({price: 10}) for token, price in asks.items()}
+        return market, self._scan(market, books)
+
+    def test_three_or_more_legs_rejected_under_default_max_legs(self):
+        market = NegRiskMarket.from_gamma(nway_payload())
+        books = {
+            "tok-a": synced_book({0.20: 10}),
+            "tok-b": synced_book({0.20: 10}),
+            "tok-c": synced_book({0.20: 10}),
+        }
+        opportunity = self._scan(market, books)
+        self.assertEqual(len(opportunity.legs), 3)
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("PAPER_NEGRISK_MAX_LEGS", None)
+            self.assertEqual(resolve_paper_negrisk_max_legs(), 2)
+            self.assertEqual(
+                paper_negrisk_subset_reject_reason(opportunity), "negrisk_too_many_legs",
+            )
+            with tempfile.TemporaryDirectory() as directory:
+                journal = LiveNegRiskJournal(os.path.join(directory, "paper-negrisk.json"))
+                with self.assertRaises(PaperNegRiskSubsetReject) as raised:
+                    PaperNegRiskExecutor(journal).execute(opportunity)
+                self.assertEqual(raised.exception.reason, "negrisk_too_many_legs")
+                self.assertEqual(journal.state["baskets"], {})
+
+    def _priced_opportunity(self, prices, direction="BUY_ALL_YES"):
+        legs = []
+        for index, price in enumerate(prices):
+            legs.append(NegRiskLeg(
+                name=f"L{index}",
+                token_id=f"tok-{index}",
+                cost=float(price) * 10.0,
+                fee=0.0,
+                average_price=float(price),
+                worst_price=float(price),
+                execution_amount=float(price) * 10.0,
+                execution_fee_cap=0.0,
+            ))
+        return NegRiskBookOpportunity(
+            market_id="nr-subset",
+            condition_id="c-subset",
+            title="subset",
+            direction=direction,
+            shares=10.0,
+            legs=tuple(legs),
+            gross_profit=1.0,
+            net_profit=1.0,
+            return_on_capital=0.1,
+            execution_capital_required=sum(float(price) * 10.0 for price in prices),
+            book_timestamp_ms=1,
+            fingerprint="subset-fp",
+            expected_net=1.0,
+            post_fee_net=1.0,
+        )
+
+    def test_extreme_leg_price_rejected_mid_price_still_admitted(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("PAPER_NEGRISK_MAX_LEGS", None)
+            os.environ.pop("PAPER_NEGRISK_MIN_LEG_PRICE", None)
+            os.environ.pop("PAPER_NEGRISK_MAX_LEG_PRICE", None)
+            os.environ.pop("PAPER_NEGRISK_ALLOW_BUY_ALL_NO", None)
+            low = self._priced_opportunity((0.04, 0.40))
+            high = self._priced_opportunity((0.96, 0.40))
+            self.assertEqual(paper_negrisk_subset_reject_reason(low), "negrisk_extreme_price")
+            self.assertEqual(paper_negrisk_subset_reject_reason(high), "negrisk_extreme_price")
+            with tempfile.TemporaryDirectory() as directory:
+                journal = LiveNegRiskJournal(os.path.join(directory, "paper-negrisk.json"))
+                with self.assertRaises(PaperNegRiskSubsetReject) as raised:
+                    PaperNegRiskExecutor(journal).execute(low)
+                self.assertEqual(raised.exception.reason, "negrisk_extreme_price")
+                with self.assertRaises(PaperNegRiskSubsetReject) as raised:
+                    PaperNegRiskExecutor(journal).execute(high)
+                self.assertEqual(raised.exception.reason, "negrisk_extreme_price")
+                self.assertEqual(journal.state["baskets"], {})
+
+            _mid_market, mid = self._two_leg_yes({"tok-a": 0.15, "tok-b": 0.70})
+            _band_market, band = self._two_leg_yes({"tok-a": 0.40, "tok-b": 0.40})
+            _wide_market, wide = self._two_leg_yes({"tok-a": 0.85, "tok-b": 0.10})
+            self.assertIsNone(paper_negrisk_subset_reject_reason(mid))
+            self.assertIsNone(paper_negrisk_subset_reject_reason(band))
+            self.assertIsNone(paper_negrisk_subset_reject_reason(wide))
+            with tempfile.TemporaryDirectory() as directory:
+                ledger = JsonLedger(os.path.join(directory, "ledger.json"), initial_cash=1000.0)
+                journal = LiveNegRiskJournal(os.path.join(directory, "paper-negrisk.json"))
+                result = PaperNegRiskExecutor(journal, ledger).execute(mid)
+                self.assertEqual(result.status, "ASSEMBLED")
+                self.assertEqual(result.direction, "BUY_ALL_YES")
+                self.assertEqual(len(journal.incomplete_baskets()), 1)
+
+    def test_buy_all_no_disabled_by_default_buy_all_yes_unchanged(self):
+        yes_market, yes_opp = self._two_leg_yes({"tok-a": 0.40, "tok-b": 0.40})
+        no_market = NegRiskMarket.from_gamma({
+            "id": "evt2", "title": "Two horse", "active": True, "closed": False,
+            "category": "geopolitics",
+            "markets": [
+                child_binary("m-a", "ya", "na", "A", "0.40"),
+                child_binary("m-b", "yb", "nb", "B", "0.40"),
+            ],
+        })
+        no_books = {
+            "ya": synced_book({0.80: 10}),
+            "yb": synced_book({0.80: 10}),
+            "na": synced_book({0.20: 10}),
+            "nb": synced_book({0.20: 10}),
+        }
+        no_opp = self._scan(no_market, no_books)
+        self.assertEqual(no_opp.direction, "BUY_ALL_NO")
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("PAPER_NEGRISK_ALLOW_BUY_ALL_NO", None)
+            os.environ.pop("PAPER_NEGRISK_MAX_LEGS", None)
+            self.assertFalse(resolve_paper_negrisk_allow_buy_all_no())
+            self.assertEqual(
+                paper_negrisk_subset_reject_reason(no_opp), "negrisk_direction_disabled",
+            )
+            self.assertIsNone(paper_negrisk_subset_reject_reason(yes_opp))
+            self.assertEqual(yes_opp.direction, "BUY_ALL_YES")
+            with tempfile.TemporaryDirectory() as directory:
+                ledger = JsonLedger(os.path.join(directory, "ledger.json"), initial_cash=1000.0)
+                journal = LiveNegRiskJournal(os.path.join(directory, "paper-negrisk.json"))
+                with self.assertRaises(PaperNegRiskSubsetReject) as raised:
+                    PaperNegRiskExecutor(journal, ledger).execute(no_opp)
+                self.assertEqual(raised.exception.reason, "negrisk_direction_disabled")
+                result = PaperNegRiskExecutor(journal, ledger).execute(yes_opp)
+                self.assertEqual(result.direction, "BUY_ALL_YES")
+                self.assertEqual(result.status, "ASSEMBLED")
+
+        with mock.patch.dict(os.environ, {"PAPER_NEGRISK_ALLOW_BUY_ALL_NO": "1"}, clear=False):
+            self.assertTrue(resolve_paper_negrisk_allow_buy_all_no())
+            self.assertIsNone(paper_negrisk_subset_reject_reason(no_opp))
+
+    def test_scan_rejects_count_subset_reasons_and_keep_existing_counters(self):
+        three_market = NegRiskMarket.from_gamma(nway_payload())
+        binary = BinaryMarket("m1", "c1", "Binary", "yes-token", "no-token", category="geopolitics")
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ, {"WHALE_STATE_PATH": ""}, clear=False,
+        ):
+            os.environ.pop("PAPER_NEGRISK_MAX_LEGS", None)
+            os.environ.pop("PAPER_NEGRISK_ALLOW_BUY_ALL_NO", None)
+            os.environ.pop("ENABLE_NEGRISK_LIVE", None)
+            os.environ.pop("POLYMARKET_LIVE_CONFIRM", None)
+            journal = LiveNegRiskJournal(os.path.join(directory, "paper-negrisk.json"))
+            executor = PaperNegRiskExecutor(journal)
+            runner = PaperMarketRunner(
+                [binary], os.path.join(directory, "ledger.json"), 1000.0,
+                BinaryArbitrageScanner(min_net_profit_usd=0.01, min_return=0.0, safety_buffer_usd=0.0),
+                negrisk_markets=[three_market],
+                negrisk_scanner=NegRiskBookScanner(
+                    min_net_profit_usd=0.01, min_return=0.0, safety_buffer_usd=0.0,
+                ),
+                negrisk_executor=executor,
+            )
+            executor.ledger = runner.ledger
+            runner.max_book_age_seconds = 1e9
+            runner.scan_rejects.flush_interval_s = 3600.0
+            now = int(__import__("time").time() * 1000)
+            for token in ("tok-a", "tok-b", "tok-c"):
+                asyncio.run(runner.process({
+                    "event_type": "book", "asset_id": token, "timestamp": str(now),
+                    "hash": token, "asks": [{"price": "0.20", "size": "10"}], "bids": [],
+                }))
+            self.assertEqual(journal.state["baskets"], {})
+            self.assertGreater(runner.scan_rejects.counts["negrisk_too_many_legs"], 0)
+            self.assertEqual(runner.scan_rejects.counts["fee_drag"], 0)
+            self.assertEqual(runner.scan_rejects.counts["net_after_fee_below_floor"], 0)
+            self.assertEqual(runner.scan_rejects.risk_skip_reasons["open_negrisk"], 0)
+            self.assertEqual(runner.scan_rejects.risk_skip_reasons["negrisk_capital"], 0)
+            self.assertEqual(runner.scan_rejects.accepted, 0)
+            with self.assertLogs("arbitrage-bot", level="INFO") as captured:
+                runner.scan_rejects.flush()
+            line = next(item for item in captured.output if "SCAN REJECTS:" in item)
+            self.assertIn("negrisk_too_many_legs=", line)
+            self.assertRegex(line, r"negrisk_too_many_legs=[1-9]")
+            self.assertIn("negrisk_extreme_price=0", line)
+            self.assertIn("negrisk_direction_disabled=0", line)
+            self.assertIn("fee_drag=0", line)
+            self.assertIn("net_after_fee_below_floor=0", line)
+            self.assertIn("risk_skip_open_negrisk=0", line)
+            self.assertIn("risk_skip_negrisk_capital=0", line)
+            self.assertEqual(runner.negrisk_scanner.min_net_profit_usd, 0.01)
+            self.assertEqual(runner.negrisk_scanner.min_return, 0.0)
+            self.assertEqual(runner.negrisk_scanner.safety_buffer_usd, 0.0)
+            self.assertIsNone(os.environ.get("ENABLE_NEGRISK_LIVE"))
+            self.assertNotEqual(os.getenv("POLYMARKET_LIVE_CONFIRM"), "I_UNDERSTAND_THE_RISK")
+
+    def test_universe_helper_prefers_two_outcome_when_truncating(self):
+        rows = [
+            nway_payload(
+                id="three-a", conditionId="c-3a",
+                clobTokenIds='["a1", "a2", "a3"]', outcomes='["A", "B", "C"]',
+            ),
+            two_leg_payload(
+                id="two-a", conditionId="c-2a",
+                clobTokenIds='["t1", "t2"]', outcomes='["A", "B"]',
+            ),
+            nway_payload(
+                id="four", conditionId="c-4",
+                clobTokenIds='["d1", "d2", "d3", "d4"]', outcomes='["A", "B", "C", "D"]',
+            ),
+            two_leg_payload(
+                id="two-b", conditionId="c-2b",
+                clobTokenIds='["u1", "u2"]', outcomes='["A", "B"]',
+            ),
+            nway_payload(
+                id="three-b", conditionId="c-3b",
+                clobTokenIds='["b1", "b2", "b3"]', outcomes='["A", "B", "C"]',
+            ),
+            {
+                "id": "bin", "conditionId": "cb", "question": "Binary",
+                "clobTokenIds": '["y", "n"]', "outcomes": '["Yes", "No"]',
+                "outcomePrices": '["0.40", "0.60"]', "category": "geopolitics",
+                "active": True, "closed": False,
+            },
+        ]
+        parsed = parse_negrisk_markets(rows)
+        self.assertEqual(
+            [market.market_id for market in select_negrisk_universe(parsed, 2)],
+            ["two-a", "two-b"],
+        )
+        self.assertEqual(
+            [len(market.outcomes) for market in select_negrisk_universe(parsed, 3)],
+            [2, 2, 3],
+        )
+        binary, negrisk = fetch_universe(5, get=lambda params: rows, pool=10, negrisk_limit=2)
+        self.assertEqual([market.market_id for market in negrisk], ["two-a", "two-b"])
+        self.assertEqual([market.market_id for market in binary], ["bin"])
+        self.assertTrue(all(len(market.outcomes) == 2 for market in negrisk))
 
 
 if __name__ == "__main__":

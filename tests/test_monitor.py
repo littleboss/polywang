@@ -75,7 +75,9 @@ def _nr_market_and_opportunity(suffix="1"):
 class HealthFromLedgerTests(unittest.TestCase):
     def test_nr_settle_clears_open_negrisk_even_if_journal_is_ghost(self):
         _market, opportunity = _nr_market_and_opportunity("ghost")
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ, {"PAPER_NEGRISK_MAX_LEGS": "8"}, clear=False,
+        ):
             ledger = JsonLedger(os.path.join(directory, "paper-ledger.json"), initial_cash=1000.0)
             journal = LiveNegRiskJournal(os.path.join(directory, "paper-negrisk.json"))
             executor = PaperNegRiskExecutor(journal, ledger)
@@ -100,7 +102,7 @@ class HealthFromLedgerTests(unittest.TestCase):
         market, opportunity = _nr_market_and_opportunity("flush")
         binary = BinaryMarket("m1", "c1", "Binary", "yes-token", "no-token", category="geopolitics")
         with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
-            os.environ, {"WHALE_STATE_PATH": ""}, clear=False,
+            os.environ, {"WHALE_STATE_PATH": "", "PAPER_NEGRISK_MAX_LEGS": "8"}, clear=False,
         ):
             os.environ.pop("ENABLE_NEGRISK_LIVE", None)
             journal = LiveNegRiskJournal(os.path.join(directory, "paper-negrisk.json"))

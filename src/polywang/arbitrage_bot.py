@@ -51,10 +51,13 @@ from .negrisk import (
     NegRiskMarket,
     OfficialNegRiskExecutor,
     PaperNegRiskExecutor,
+    PaperNegRiskSubsetReject,
+    check_paper_negrisk_subset,
     collect_event_lookups,
     fetch_complete_negrisk_events,
     negrisk_execution_enabled,
     parse_negrisk_markets,
+    select_negrisk_universe,
 )
 from .arbitrage_core import (
     BinaryArbitrageScanner,
@@ -135,6 +138,9 @@ SCAN_REJECT_REASONS = (
     "net_below_floor",
     "fee_drag",
     "net_after_fee_below_floor",
+    "negrisk_too_many_legs",
+    "negrisk_extreme_price",
+    "negrisk_direction_disabled",
     "roc_below_floor",
     "fingerprint_dup",
     "walk_mismatch",
@@ -383,6 +389,9 @@ def fetch_universe(limit: int, *, get=None, pool: Optional[int] = None,
     field comes from a Gamma event fetch, never from local grouping.
     The binary keep-set is unique on `market_id` versus the NegRisk keep-set:
     an overlapping Gamma id stays on the NegRisk path and is dropped here.
+    When truncating to ``negrisk_limit``, 2-outcome (fewest-leg) fields are
+    kept first. This is start-of-window only; it does not pull a running
+    supervisor process.
     """
     getter = get or _http_get_gamma
     keep = max(1, int(limit))
@@ -414,7 +423,7 @@ def fetch_universe(limit: int, *, get=None, pool: Optional[int] = None,
             _log_negrisk_market(market)
     ranked = rank_combo_arb_markets(binary)
     keep_negrisk = max(0, int(negrisk_limit))
-    selected_negrisk = negrisk[:keep_negrisk]
+    selected_negrisk = select_negrisk_universe(negrisk, keep_negrisk)
     ranked = drop_binary_markets_overlapping_negrisk(ranked, selected_negrisk)
     selected = ranked[:keep]
     if selected:
@@ -435,7 +444,8 @@ def fetch_universe(limit: int, *, get=None, pool: Optional[int] = None,
         )
     if selected_negrisk:
         LOG.info(
-            "NegRisk universe: %d complete fields parsed, keeping %d for the independent path",
+            "NegRisk universe: %d complete fields parsed, keeping %d "
+            "(prefer outcomes_count==2 / fewest legs) for the independent path",
             len(negrisk), len(selected_negrisk),
         )
     return selected, selected_negrisk
@@ -902,7 +912,8 @@ class PaperMarketRunner:
             if self.risk_controller and self.live:
                 self.risk_controller.check_negrisk(opportunity)
             elif not self.live:
-                # Paper admit before execute: count + reserved (not live).
+                # Paper admit before execute: subset + count/reserved (not live).
+                check_paper_negrisk_subset(opportunity)
                 self._paper_negrisk_risk().check(opportunity)
             result = self.negrisk_executor.execute(opportunity)
             if inspect.isawaitable(result):
@@ -912,6 +923,15 @@ class PaperMarketRunner:
                 self.risk_controller.halt("unfinished NegRisk basket requires manual reconciliation")
             LOG.critical("UNHEDGED NEGRISK BASKET: stopping the process for manual reconciliation")
             raise
+        except PaperNegRiskSubsetReject as error:
+            if error.reason in self.scan_rejects.counts:
+                self.scan_rejects.record(error.reason)
+            LOG.info("Skip NegRisk %s: %s", market.title, error.reason)
+            LOG.info(
+                "NEGRISK OBSERVE FILTERED: %s | %s | %d legs | reason=%s | not executed",
+                market.title, opportunity.direction, len(opportunity.legs), error.reason,
+            )
+            return
         except ValueError as error:
             self.scan_rejects.record("risk_skip", detail=classify_risk_skip(error))
             LOG.info("Skip NegRisk %s: %s", market.title, error)
