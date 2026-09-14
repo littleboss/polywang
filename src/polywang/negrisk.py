@@ -327,6 +327,120 @@ def parse_negrisk_markets(rows: Iterable[dict],
     return markets
 
 
+def select_negrisk_universe(
+    markets: Sequence[NegRiskMarket],
+    limit: int,
+) -> List[NegRiskMarket]:
+    """Keep 2-outcome (fewest-leg) fields first when filling NEGRISK_MARKET_LIMIT.
+
+    Paper scan cycles on 3–26 leg morphs do not drive settled NegRisk PnL.
+    Ranking is stable: outcomes_count==2, then fewest remaining legs, then
+    original parse order. Does not change MARKET_LIMIT or running windows.
+    """
+    keep = max(0, int(limit))
+    if keep <= 0:
+        return []
+    indexed = list(enumerate(markets))
+    indexed.sort(key=lambda item: (
+        0 if len(item[1].outcomes) == 2 else 1,
+        len(item[1].outcomes),
+        item[0],
+    ))
+    return [market for _, market in indexed[:keep]]
+
+
+PAPER_NEGRISK_MAX_LEGS_DEFAULT = 2
+PAPER_NEGRISK_MIN_LEG_PRICE_DEFAULT = 0.05
+PAPER_NEGRISK_MAX_LEG_PRICE_DEFAULT = 0.95
+PAPER_NEGRISK_SUBSET_REASONS = (
+    "negrisk_too_many_legs",
+    "negrisk_extreme_price",
+    "negrisk_direction_disabled",
+)
+
+
+class PaperNegRiskSubsetReject(ValueError):
+    """Paper-only subset filter. Not a live halt and not a risk_skip bucket."""
+
+    def __init__(self, reason: str, message: str = ""):
+        self.reason = str(reason)
+        super().__init__(message or self.reason)
+
+
+def resolve_paper_negrisk_max_legs(
+    default: int = PAPER_NEGRISK_MAX_LEGS_DEFAULT,
+) -> int:
+    """PAPER_NEGRISK_MAX_LEGS, default 2. Env only; never pulls a live window."""
+    raw = os.getenv("PAPER_NEGRISK_MAX_LEGS")
+    try:
+        value = int(raw) if raw else default
+    except (TypeError, ValueError):
+        value = default
+    return max(1, int(value))
+
+
+def resolve_paper_negrisk_min_leg_price(
+    default: float = PAPER_NEGRISK_MIN_LEG_PRICE_DEFAULT,
+) -> float:
+    raw = os.getenv("PAPER_NEGRISK_MIN_LEG_PRICE")
+    try:
+        value = float(raw) if raw not in (None, "") else default
+    except (TypeError, ValueError):
+        value = default
+    if not math.isfinite(value):
+        return default
+    return max(0.0, float(value))
+
+
+def resolve_paper_negrisk_max_leg_price(
+    default: float = PAPER_NEGRISK_MAX_LEG_PRICE_DEFAULT,
+) -> float:
+    raw = os.getenv("PAPER_NEGRISK_MAX_LEG_PRICE")
+    try:
+        value = float(raw) if raw not in (None, "") else default
+    except (TypeError, ValueError):
+        value = default
+    if not math.isfinite(value):
+        return default
+    return max(0.0, float(value))
+
+
+def resolve_paper_negrisk_allow_buy_all_no(default: bool = False) -> bool:
+    """PAPER_NEGRISK_ALLOW_BUY_ALL_NO, default off. Observe logging may remain."""
+    raw = os.getenv("PAPER_NEGRISK_ALLOW_BUY_ALL_NO")
+    if raw is None or str(raw).strip() == "":
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def paper_negrisk_subset_reject_reason(opportunity: NegRiskBookOpportunity) -> Optional[str]:
+    """Paper execute admit: 2-leg mid-price BUY_ALL_YES by default.
+
+    Scanner/observe may still see high-leg, extreme-price, or BUY_ALL_NO
+    morphs. This gate only blocks paper execute. Floors stay unchanged.
+    """
+    max_legs = resolve_paper_negrisk_max_legs()
+    if len(opportunity.legs) > max_legs:
+        return "negrisk_too_many_legs"
+    min_price = resolve_paper_negrisk_min_leg_price()
+    max_price = resolve_paper_negrisk_max_leg_price()
+    for leg in opportunity.legs:
+        price = float(leg.worst_price)
+        if not math.isfinite(price) or price < min_price or price > max_price:
+            return "negrisk_extreme_price"
+    if opportunity.direction == "BUY_ALL_NO" and not resolve_paper_negrisk_allow_buy_all_no():
+        return "negrisk_direction_disabled"
+    return None
+
+
+def check_paper_negrisk_subset(opportunity: NegRiskBookOpportunity) -> None:
+    """Raise PaperNegRiskSubsetReject when the paper subset filter blocks."""
+    reason = paper_negrisk_subset_reject_reason(opportunity)
+    if reason is None:
+        return
+    raise PaperNegRiskSubsetReject(reason)
+
+
 @dataclass(frozen=True)
 class NegRiskLeg:
     name: str
@@ -900,7 +1014,8 @@ class PaperNegRiskExecutor:
         self.risk = risk
 
     def _admit(self, opportunity: NegRiskBookOpportunity) -> None:
-        """Count/reserved gates before cash or journal writes (paper≈live)."""
+        """Subset + count/reserved gates before cash or journal writes (paper)."""
+        check_paper_negrisk_subset(opportunity)
         risk = self.risk
         if risk is None:
             risk = PaperNegRiskRiskHelper.from_env(self.journal, ledger=self.ledger)
