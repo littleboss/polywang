@@ -379,6 +379,43 @@ def drop_binary_markets_overlapping_negrisk(
     return kept
 
 
+def dedupe_ranked_binary_markets(
+    markets: Iterable[BinaryMarket],
+) -> List[BinaryMarket]:
+    """Keep the first (best-ranked) BinaryMarket per market_id and condition_id.
+
+    Gamma's volume pool can repeat the same binary id. Those rows must be
+    collapsed after ranking and before the keep slice so ``MARKET_LIMIT=200``
+    cannot feed PaperMarketRunner two copies of one id. Token collisions
+    across *different* market_ids are not resolved here — the runner still
+    fail-closes on those.
+    """
+    kept: List[BinaryMarket] = []
+    seen_market_ids = set()
+    seen_condition_ids = set()
+    dropped_duplicate_market_id = 0
+    for market in markets:
+        market_id = str(getattr(market, "market_id", "") or "")
+        condition_id = str(getattr(market, "condition_id", "") or "")
+        if market_id and market_id in seen_market_ids:
+            dropped_duplicate_market_id += 1
+            continue
+        if condition_id and condition_id in seen_condition_ids:
+            dropped_duplicate_market_id += 1
+            continue
+        if market_id:
+            seen_market_ids.add(market_id)
+        if condition_id:
+            seen_condition_ids.add(condition_id)
+        kept.append(market)
+    if dropped_duplicate_market_id:
+        LOG.info(
+            "Universe: dropped_duplicate_market_id=%d from the ranked binary keep-set",
+            dropped_duplicate_market_id,
+        )
+    return kept
+
+
 def fetch_universe(limit: int, *, get=None, pool: Optional[int] = None,
                    negrisk_limit: int = 0, get_event=None) -> tuple:
     """Return ranked binary combo-arb markets plus complete NegRisk fields.
@@ -390,9 +427,12 @@ def fetch_universe(limit: int, *, get=None, pool: Optional[int] = None,
     field comes from a Gamma event fetch, never from local grouping.
     The binary keep-set is unique on `market_id` versus the NegRisk keep-set:
     an overlapping Gamma id stays on the NegRisk path and is dropped here.
-    When truncating to ``negrisk_limit``, 2-outcome (fewest-leg) fields are
-    kept first. This is start-of-window only; it does not pull a running
-    supervisor process.
+    After ranking, duplicate Gamma binary rows are collapsed by `market_id`
+    (and `condition_id`), keeping the first / best-ranked copy, then the
+    keep slice is applied. Token collisions across different market_ids
+    still fail-close in the runner. When truncating to ``negrisk_limit``,
+    2-outcome (fewest-leg) fields are kept first. This is start-of-window
+    only; it does not pull a running supervisor process.
     """
     getter = get or _http_get_gamma
     keep = max(1, int(limit))
@@ -426,6 +466,9 @@ def fetch_universe(limit: int, *, get=None, pool: Optional[int] = None,
     keep_negrisk = max(0, int(negrisk_limit))
     selected_negrisk = select_negrisk_universe(negrisk, keep_negrisk)
     ranked = drop_binary_markets_overlapping_negrisk(ranked, selected_negrisk)
+    unique_count_before = len(ranked)
+    ranked = dedupe_ranked_binary_markets(ranked)
+    dropped_duplicate_market_id = unique_count_before - len(ranked)
     selected = ranked[:keep]
     if selected:
         head = selected[0]
@@ -436,8 +479,9 @@ def fetch_universe(limit: int, *, get=None, pool: Optional[int] = None,
         combo = combo_ask_sum(head)
         LOG.info(
             "Universe: %d binary candidates ranked by yes+no, keeping %d; "
+            "dropped_duplicate_market_id=%d; "
             "top %s combo_sum=%s ticks_to_breakeven=%d one_tick_net=%.4f implied_yes=%s",
-            len(binary), len(selected), head.category,
+            len(binary), len(selected), dropped_duplicate_market_id, head.category,
             "unknown" if combo is None else f"{combo:.4f}",
             score.ticks_to_breakeven,
             score.one_tick_net,

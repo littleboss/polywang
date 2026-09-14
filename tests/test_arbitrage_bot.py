@@ -302,6 +302,160 @@ class UniverseOverlapTests(unittest.TestCase):
             self.assertNotEqual(os.getenv("POLYMARKET_LIVE_CONFIRM"), "I_UNDERSTAND_THE_RISK")
 
 
+class UniverseDuplicateMarketIdTests(unittest.TestCase):
+    """QUANT-20260914-02: Gamma duplicate binary ids must not reach the runner."""
+
+    DUP_ID = "3120760"
+    DUP_ID_B = "4451606"
+
+    def _gamma_binary(self, market_id, yes_price, no_price, *,
+                      condition_id=None, yes=None, no=None, title=None):
+        return {
+            "id": market_id,
+            "conditionId": condition_id or f"c-{market_id}",
+            "question": title or f"Q {market_id}",
+            "clobTokenIds": json.dumps([yes or f"y-{market_id}", no or f"n-{market_id}"]),
+            "outcomes": '["Yes", "No"]',
+            "outcomePrices": json.dumps([str(yes_price), str(no_price)]),
+            "category": "geopolitics",
+            "active": True,
+            "closed": False,
+        }
+
+    def test_dedupe_keeps_first_best_ranked_and_logs_count(self):
+        from polywang.arbitrage_bot import dedupe_ranked_binary_markets
+        worse = BinaryMarket(
+            self.DUP_ID, f"c-{self.DUP_ID}", "Worse copy", "y-w", "n-w",
+            category="geopolitics", implied_yes=0.40, implied_no=0.60,
+        )
+        better = BinaryMarket(
+            self.DUP_ID, f"c-{self.DUP_ID}", "Better copy", "y-b", "n-b",
+            category="geopolitics", implied_yes=0.48, implied_no=0.48,
+        )
+        other = BinaryMarket(
+            "bin-other", "c-other", "Other", "y-o", "n-o",
+            category="geopolitics", implied_yes=0.49, implied_no=0.49,
+        )
+        from polywang.polymarket_edge import rank_combo_arb_markets
+        ranked = rank_combo_arb_markets([worse, better, other])
+        self.assertEqual(ranked[0].title, "Better copy")
+        with self.assertLogs("arbitrage-bot", level="INFO") as captured:
+            kept = dedupe_ranked_binary_markets(ranked)
+        self.assertEqual([market.market_id for market in kept], [self.DUP_ID, "bin-other"])
+        self.assertEqual(kept[0].title, "Better copy")
+        self.assertAlmostEqual(kept[0].implied_yes, 0.48)
+        self.assertTrue(any("dropped_duplicate_market_id=1" in line for line in captured.output))
+
+    def test_fetch_universe_dedupes_duplicate_gamma_market_id_and_honors_limit(self):
+        from polywang.arbitrage_bot import fetch_universe
+        rows = [
+            self._gamma_binary(self.DUP_ID, "0.40", "0.60", title="Worse copy 3120760"),
+            self._gamma_binary(self.DUP_ID, "0.48", "0.48", title="Better copy 3120760"),
+            self._gamma_binary(self.DUP_ID_B, "0.41", "0.59", title="Worse copy 4451606"),
+            self._gamma_binary(self.DUP_ID_B, "0.47", "0.47", title="Better copy 4451606"),
+            self._gamma_binary("bin-a", "0.49", "0.49", title="Unique A"),
+            self._gamma_binary("bin-b", "0.50", "0.50", title="Unique B"),
+            self._gamma_binary("bin-c", "0.51", "0.51", title="Unique C"),
+        ]
+        with self.assertLogs("arbitrage-bot", level="INFO") as captured:
+            binary, negrisk = fetch_universe(
+                3, get=lambda params: list(rows), pool=len(rows), negrisk_limit=0,
+            )
+        self.assertEqual(negrisk, [])
+        ids = [market.market_id for market in binary]
+        self.assertEqual(len(ids), 3)
+        self.assertEqual(len(set(ids)), 3)
+        self.assertEqual(ids.count(self.DUP_ID), 1)
+        self.assertEqual(ids.count(self.DUP_ID_B), 1)
+        # 4451606 combo 0.94 beats 3120760 combo 0.96; both beat unique 0.98.
+        self.assertEqual(ids, [self.DUP_ID_B, self.DUP_ID, "bin-a"])
+        kept_dup = next(market for market in binary if market.market_id == self.DUP_ID)
+        self.assertEqual(kept_dup.title, "Better copy 3120760")
+        self.assertAlmostEqual(kept_dup.implied_yes, 0.48)
+        self.assertTrue(any("dropped_duplicate_market_id=2" in line for line in captured.output))
+
+        full, _ = fetch_universe(
+            10, get=lambda params: list(rows), pool=len(rows), negrisk_limit=0,
+        )
+        self.assertEqual(len(full), 5)
+        self.assertEqual(len({market.market_id for market in full}), 5)
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ, {"WHALE_STATE_PATH": ""}, clear=False,
+        ):
+            runner = PaperMarketRunner(
+                binary, os.path.join(directory, "ledger.json"), 1000.0,
+                BinaryArbitrageScanner(),
+            )
+        self.assertEqual(set(runner.markets), {self.DUP_ID, self.DUP_ID_B, "bin-a"})
+        self.assertEqual(len(runner.token_to_market), len(set(runner.token_to_market)))
+
+    def test_fetch_universe_uniques_duplicate_condition_id(self):
+        from polywang.arbitrage_bot import fetch_universe
+        rows = [
+            self._gamma_binary("m-first", "0.48", "0.48", condition_id="cond-shared"),
+            self._gamma_binary("m-second", "0.49", "0.49", condition_id="cond-shared"),
+            self._gamma_binary("m-other", "0.50", "0.50"),
+        ]
+        with self.assertLogs("arbitrage-bot", level="INFO") as captured:
+            binary, _ = fetch_universe(
+                10, get=lambda params: list(rows), pool=len(rows), negrisk_limit=0,
+            )
+        self.assertEqual([market.market_id for market in binary], ["m-first", "m-other"])
+        self.assertTrue(any("dropped_duplicate_market_id=1" in line for line in captured.output))
+
+    def test_runner_still_fail_closes_on_duplicate_market_id_in_keep_set(self):
+        first = BinaryMarket(self.DUP_ID, "c-a", "One", "yes-a", "no-a")
+        duplicate = BinaryMarket(self.DUP_ID, "c-b", "Two", "yes-b", "no-b")
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "duplicate market"):
+                PaperMarketRunner(
+                    [first, duplicate], os.path.join(directory, "ledger.json"), 100.0,
+                    BinaryArbitrageScanner(),
+                )
+
+    def test_token_collision_across_different_market_ids_still_raises(self):
+        first = BinaryMarket("m1", "c1", "One", "yes-token", "no-token")
+        colliding = BinaryMarket("m2", "c2", "Two", "yes-token", "other-token")
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "duplicate token"):
+                PaperMarketRunner(
+                    [first, colliding], os.path.join(directory, "ledger.json"), 100.0,
+                    BinaryArbitrageScanner(),
+                )
+
+    def test_condition_collision_across_different_market_ids_still_raises(self):
+        first = BinaryMarket("m1", "c-shared", "One", "yes-1", "no-1")
+        colliding = BinaryMarket("m2", "c-shared", "Two", "yes-2", "no-2")
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "duplicate condition"):
+                PaperMarketRunner(
+                    [first, colliding], os.path.join(directory, "ledger.json"), 100.0,
+                    BinaryArbitrageScanner(),
+                )
+
+    def test_floors_and_live_fail_closed_unchanged(self):
+        from polywang.arbitrage_bot import DEFAULT_MARKET_LIMIT
+        from polywang.negrisk import NegRiskBookScanner, negrisk_execution_enabled
+        self.assertEqual(DEFAULT_MARKET_LIMIT, 200)
+        scanner = BinaryArbitrageScanner()
+        self.assertEqual(scanner.min_net_profit_usd, 0.05)
+        self.assertEqual(scanner.min_return, 0.002)
+        self.assertEqual(scanner.safety_buffer_usd, 0.02)
+        nr = NegRiskBookScanner()
+        self.assertEqual(nr.min_net_profit_usd, 0.05)
+        self.assertEqual(nr.min_return, 0.002)
+        self.assertEqual(nr.safety_buffer_usd, 0.02)
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ENABLE_NEGRISK_LIVE", None)
+            os.environ.pop("POLYMARKET_LIVE_CONFIRM", None)
+            os.environ.pop("APPROVED_FOR_RELEASE", None)
+            self.assertFalse(negrisk_execution_enabled(True))
+            self.assertNotEqual(os.getenv("ENABLE_NEGRISK_LIVE", "").strip().lower(), "1")
+            self.assertNotEqual(os.getenv("POLYMARKET_LIVE_CONFIRM"), "I_UNDERSTAND_THE_RISK")
+            self.assertNotEqual(os.getenv("APPROVED_FOR_RELEASE", "").strip().lower(), "1")
+
+
 class ResearchExecutionPathTests(unittest.TestCase):
     def _runner(self, directory, market=None):
         from polywang.arbitrage_core import LiveDirectionalJournal, PaperDirectionalExecutor
