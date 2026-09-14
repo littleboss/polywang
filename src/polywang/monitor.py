@@ -24,6 +24,8 @@ DEFAULT_EXCEPTIONS_LOG = "monitor-exceptions.jsonl"
 DEFAULT_SUPERVISOR_STOP_FILE = "paper-supervisor.stop"
 PROCESS_EXIT_KIND = "process_exit"
 
+SETTLEMENT_STUCK_KIND = "settlement_stuck"
+
 DISCONNECT_KINDS = frozenset({
     "disconnect",
     "http_429",
@@ -155,6 +157,67 @@ def _position_exposure(position: dict) -> float:
     except (TypeError, ValueError):
         fees = 0.0
     return cost + fees
+
+
+def _unhedged_leg_count(negrisk) -> int:
+    """Incomplete NegRisk legs. Paper complete-sets should stay at 0."""
+    if negrisk is None:
+        return 0
+    incomplete = getattr(negrisk, "incomplete_baskets", None)
+    records = incomplete() if callable(incomplete) else []
+    total = 0
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        legs = record.get("legs") or []
+        try:
+            requested = float(record.get("requested_shares") or 0.0)
+        except (TypeError, ValueError):
+            requested = 0.0
+        if not legs:
+            if str(record.get("status") or "") == "UNHEDGED":
+                total += 1
+            continue
+        for leg in legs:
+            if not isinstance(leg, dict):
+                continue
+            try:
+                need = float(leg.get("requested_shares") or requested)
+            except (TypeError, ValueError):
+                need = requested
+            try:
+                matched = float(leg.get("matched_shares") or 0.0)
+            except (TypeError, ValueError):
+                matched = 0.0
+            if matched + 1e-9 < need:
+                total += 1
+    return total
+
+
+def _settlement_stuck_count(ledger=None, negrisk=None) -> int:
+    """Open rows marked SETTLEMENT_STUCK (past grace, no verified payout)."""
+    stuck = 0
+    claimed = set()
+    for position in _positions(ledger):
+        if position.get("settled"):
+            continue
+        if position.get("settlement_stuck"):
+            stuck += 1
+        basket_id = str(position.get("basket_id") or "")
+        if basket_id:
+            claimed.add(basket_id)
+    if negrisk is None:
+        return stuck
+    incomplete = getattr(negrisk, "incomplete_baskets", None)
+    records = incomplete() if callable(incomplete) else []
+    for record in records:
+        if not isinstance(record, dict) or not record.get("settlement_stuck"):
+            continue
+        basket_id = str(record.get("basket_id") or "")
+        if basket_id and basket_id in claimed:
+            continue
+        stuck += 1
+    return stuck
 
 
 def _journal_reserved(record: dict) -> float:
@@ -349,6 +412,8 @@ def compute_health_payload(
         "open_pairs": int(open_pairs),
         "open_directional": len(directional.incomplete_trades()) if directional else 0,
         "open_negrisk": int(open_negrisk),
+        "settlement_stuck": int(_settlement_stuck_count(ledger, negrisk)),
+        "unhedged_leg_count": int(_unhedged_leg_count(negrisk)),
         "heartbeat_at": clock,
         "last_flush_at": clock,
     }
@@ -543,6 +608,7 @@ def record_monitor_exception(
 def count_exception_kinds(path: str) -> Dict[str, int]:
     """Read the exception tape only. Never opens the book-depth jsonl."""
     counts = {kind: 0 for kind in sorted(DISCONNECT_KINDS)}
+    counts[SETTLEMENT_STUCK_KIND] = 0
     counts["total"] = 0
     if not path or not os.path.isfile(path):
         return counts
@@ -558,7 +624,7 @@ def count_exception_kinds(path: str) -> Dict[str, int]:
             if not isinstance(row, dict):
                 continue
             kind = str(row.get("kind") or "feed_fault")
-            if kind not in DISCONNECT_KINDS:
+            if kind not in DISCONNECT_KINDS and kind != SETTLEMENT_STUCK_KIND:
                 kind = "feed_fault"
             counts[kind] = counts.get(kind, 0) + 1
             counts["total"] += 1
