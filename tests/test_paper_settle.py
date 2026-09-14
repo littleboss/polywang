@@ -104,7 +104,14 @@ def open_nr_basket(runner, market):
         min_net_profit_usd=0.01, min_return=0.0, safety_buffer_usd=0.0,
     ).scan(market, books)
     assert opportunity is not None
-    return runner.negrisk_executor.execute(opportunity)
+    # Settlement fixtures need already-open inventory. The paper admit subset
+    # (default max 2 legs) is for new scans, not for constructing a basket the
+    # reconciler will later settle. Production subset defaults stay unchanged.
+    with mock.patch.dict(
+        os.environ, {"PAPER_NEGRISK_MAX_LEGS": str(max(2, len(opportunity.legs)))},
+        clear=False,
+    ):
+        return runner.negrisk_executor.execute(opportunity)
 
 
 class FakeGamma:
