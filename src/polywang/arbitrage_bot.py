@@ -56,6 +56,7 @@ from .negrisk import (
     negrisk_execution_enabled,
     parse_negrisk_markets,
 )
+from .paper_settle import run_paper_settle_loop
 from .arbitrage_core import (
     BinaryArbitrageScanner,
     BinaryMarket,
@@ -696,16 +697,29 @@ class PaperMarketRunner:
                             self._publish_health()
                 return
             for position_id, position in list(self.ledger.state["positions"].items()):
+                if position.get("settled"):
+                    continue
                 market = self.markets.get(position.get("market_id")) or self.negrisk_markets.get(position.get("market_id"))
-                if market and resolved_id in {market.market_id, market.condition_id} and not position.get("settled"):
-                    self.ledger.settle(position_id, winning)
-                    LOG.info("PAPER SETTLE: %s | position %s", market.title, position_id)
-                    self._publish_health()
+                # Match the open row even after the market left the scanned
+                # universe — paper settlement must not wait for a stream
+                # event that will never be routed.
+                ids = {str(position.get("market_id") or ""), str(position.get("condition_id") or "")}
+                if market is not None:
+                    ids.update({str(market.market_id), str(market.condition_id)})
+                ids.discard("")
+                if resolved_id not in ids:
+                    continue
+                self.ledger.settle(position_id, winning)
+                title = market.title if market is not None else position.get("title") or resolved_id
+                LOG.info("PAPER SETTLE: %s | position %s", title, position_id)
+                self._publish_health()
             if self.negrisk_journal:
-                marked = 0
+                marked = self.negrisk_journal.mark_resolved(resolved_id, winning)
                 for resolved_market in self.negrisk_markets.values():
                     if resolved_id in {resolved_market.market_id, resolved_market.condition_id}:
-                        marked += self.negrisk_journal.mark_resolved(resolved_id, winning)
+                        marked += self.negrisk_journal.mark_resolved(resolved_market.market_id, winning)
+                        if resolved_market.condition_id != resolved_market.market_id:
+                            marked += self.negrisk_journal.mark_resolved(resolved_market.condition_id, winning)
                 if marked:
                     LOG.info("PAPER NEGRISK RESOLUTION: %s basket(s) pending paper settlement", marked)
                 settler = getattr(self.negrisk_executor, "settle_baskets", None)
@@ -2375,7 +2389,8 @@ def main() -> int:
             )
         )
         market_task = asyncio.create_task(run_market_stream(runner, list(runner.token_to_market)))
-        tasks = {market_task, health_task} | _research_tasks(runner)
+        settle_task = asyncio.create_task(run_paper_settle_loop(runner, stop))
+        tasks = {market_task, health_task, settle_task} | _research_tasks(runner)
         shutdown_task = asyncio.create_task(stop.wait())
         try:
             done, pending = await asyncio.wait(

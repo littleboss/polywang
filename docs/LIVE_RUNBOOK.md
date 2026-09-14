@@ -61,6 +61,23 @@ rm -f paper-supervisor.stop
 
 环境变量：`PAPER_SUPERVISOR_STOP=1`、`PAPER_SUPERVISOR_STOP_FILE`（默认 `paper-supervisor.stop`）、`PAPER_SUPERVISOR_BACKOFF_START` / `_MAX`、`PAPER_SUPERVISOR_CMD`（覆盖子命令，仍禁止 `--live`）。密钥继续只放环境 / 本地 `.env`，不要写进命令行或仓库。
 
+## 纸面结算对账（QUANT-20260914-01）
+
+纸面完整集合在市场结束或比赛完成后，如果没收到 `market_resolved` 流事件（或市场已经滚出当前宇宙），会一直停在 `OPEN_PAIR` / `ASSEMBLED`，资金锁在 `capital_reserved`。对账器只跑 paper：
+
+1. 每 `PAPER_SETTLE_RECONCILE_INTERVAL_SEC`（默认 300）秒向 Gamma 拉每个未结 `position_id` / NegRisk 篮子。
+2. 已判定：走现有 `market_resolved` 处理器，写 `SETTLE_PAIR` / NR `SETTLED`，按 resolution 兑付并释放预留资金；现金和暴露应在 $0.01 内闭合。
+3. 未判定但已过 `event_end + PAPER_SETTLE_STUCK_GRACE_HOURS`（默认 48）：UMA 为 Known/Finalized 且是完整集合则强制纸面结算；否则标记 `SETTLEMENT_STUCK`。`PAPER_SETTLE_STUCK_ALERT=1` 时打 CRITICAL 并写 `monitor-exceptions.jsonl`。
+4. 不绕过 Deterministic Policy Gate；实盘 redeem/merge 不变；费率地板不变。`ENABLE_NEGRISK_LIVE` / `POLYMARKET_LIVE_CONFIRM` 保持未设置。不要为了对账去中途拉停正在跑的 4a39991 监督窗口。
+
+```bash
+PAPER_SETTLE_RECONCILE_INTERVAL_SEC=300
+PAPER_SETTLE_STUCK_GRACE_HOURS=48
+PAPER_SETTLE_STUCK_ALERT=0
+```
+
+`--health` 会多两个只读字段：`settlement_stuck`（过了 grace 仍未结的仓）和 `unhedged_leg_count`（完整集合应为 0）。
+
 可选 systemd 单元见 `deploy/polywang-paper.service`：它只看管监督进程自己；子进程重启由 Python wrapper 负责。`Restart=on-failure` 不要和 wrapper 叠成双层死循环——干净停机请先 `touch paper-supervisor.stop`。
 
 ## 首次小额实盘
