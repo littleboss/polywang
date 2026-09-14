@@ -59,7 +59,7 @@ live 或 paper 运行时设置 `MARKET_EVENT_LOG=market-events.jsonl` 可记录�
 uv run polywang --markets 200 --cash 1000
 ```
 
-它只研究 Yes 和 No 两腿同时买入后合计支付 1.00 的二元市场。选市会先拉一个按成交量过滤的候选池（`MARKET_SCAN_POOL`），再按 **最低 yes_ask+no_ask** 排序（Gamma `outcomePrices` 作抓取代理，有盘口后用 live touch）。总和相同时优先 geopolitics（费率 0）。不再把 longshot 的 1-tick 理论（`ticks_to_breakeven` / `one_tick_net`）当作主排序。纸面 NegRisk 独立 n 腿路径默认打开（`ENABLE_NEGRISK_EXECUTION` 未设置即为开，`ENABLE_NEGRISK_LIVE` 保持未设置），账本写入 `paper-negrisk.json`，不会写 `live-orders.json`。下一窗宇宙默认 `MARKET_LIMIT=200`、`NEGRISK_MARKET_LIMIT=40`，只在启动时读 CLI `--markets` / 环境变量，**不会**中途改正在跑的监督窗口。纸面 NegRisk 在 execute 前硬限制未结篮子数（`PAPER_MAX_OPEN_NEGRISK`，默认 8）和已预留资金（`PAPER_MAX_NEGRISK_RESERVED_USD`，默认 `0.40 * initial_cash`，例如 $1000 本金对应 $400）；超限记入 SCAN `risk_skip_open_negrisk` / `risk_skip_negrisk_capital`，现金不足仍走 `risk_skip_cash`。机会必须使用订单簿中的实际 ask 和深度，并覆盖两腿 taker 费用、可选 merge gas（`MERGE_GAS_USD`）、资金安全缓冲和最大仓位；纸面成交写入 `paper-ledger.json`，程序重启后会恢复账本。两腿仍是顺序 FOK，不是原子交易，`is_risk_free` 恒为 false。小额阶段保持 `AUTO_MERGE_COMPLETE_SETS=0`：merge gas 是固定成本，未实测就填 0 并打开自动 merge 会把亏损单显示成盈利。费率地板不变：`post_fee_net >= min_net_profit`（0.05）、`min_return=0.002`、`safety_buffer=0.02`。
+它只研究 Yes 和 No 两腿同时买入后合计支付 1.00 的二元市场。选市会先拉一个按成交量过滤的候选池（`MARKET_SCAN_POOL`），再按 **最低 yes_ask+no_ask** 排序（Gamma `outcomePrices` 作抓取代理，有盘口后用 live touch）。总和相同时优先 geopolitics（费率 0）。不再把 longshot 的 1-tick 理论（`ticks_to_breakeven` / `one_tick_net`）当作主排序。纸面 NegRisk 独立 n 腿路径默认打开（`ENABLE_NEGRISK_EXECUTION` 未设置即为开，`ENABLE_NEGRISK_LIVE` 保持未设置），账本写入 `paper-negrisk.json`，不会写 `live-orders.json`。下一窗宇宙默认 `MARKET_LIMIT=200`、`NEGRISK_MARKET_LIMIT=40`，只在启动时读 CLI `--markets` / 环境变量，**不会**中途改正在跑的监督窗口。纸面 NegRisk 在 execute 前硬限制未结篮子数（`PAPER_MAX_OPEN_NEGRISK`，默认 8）和已预留资金（`PAPER_MAX_NEGRISK_RESERVED_USD`，默认 `0.40 * initial_cash`，例如 $1000 本金对应 $400）；超限记入 SCAN `risk_skip_open_negrisk` / `risk_skip_negrisk_capital`，现金不足仍走 `risk_skip_cash`。纸面 admit 默认只做 2 腿、腿价在 `PAPER_NEGRISK_MIN_LEG_PRICE`/`PAPER_NEGRISK_MAX_LEG_PRICE`（0.05–0.95）之间的 `BUY_ALL_YES`（`PAPER_NEGRISK_MAX_LEGS=2`，`PAPER_NEGRISK_ALLOW_BUY_ALL_NO=0`）；多腿记 `negrisk_too_many_legs`，极端价记 `negrisk_extreme_price`，`BUY_ALL_NO` 记 `negrisk_direction_disabled`。观察日志仍可留下被过滤的形态。选宇宙时优先 `outcomes_count==2`（腿数最少）再填满 `NEGRISK_MARKET_LIMIT`。机会必须使用订单簿中的实际 ask 和深度，并覆盖两腿 taker 费用、可选 merge gas（`MERGE_GAS_USD`）、资金安全缓冲和最大仓位；纸面成交写入 `paper-ledger.json`，程序重启后会恢复账本。两腿仍是顺序 FOK，不是原子交易，`is_risk_free` 恒为 false。小额阶段保持 `AUTO_MERGE_COMPLETE_SETS=0`：merge gas 是固定成本，未实测就填 0 并打开自动 merge 会把亏损单显示成盈利。费率地板不变：`post_fee_net >= min_net_profit`（0.05）、`min_return=0.002`、`safety_buffer=0.02`。
 
 新引擎只有在显式设置 `POLYMARKET_LIVE_CONFIRM=I_UNDERSTAND_THE_RISK`、官方 geoblock 放行、私钥存在且安装了 live extra 时，才会使用两腿 FOK 执行器：
 
@@ -187,17 +187,23 @@ MARKET_LIMIT=200
 NEGRISK_MARKET_LIMIT=40
 PAPER_MAX_OPEN_NEGRISK=8
 # PAPER_MAX_NEGRISK_RESERVED_USD 未设置时 = 0.40 * initial_cash
+PAPER_NEGRISK_MAX_LEGS=2
+PAPER_NEGRISK_MIN_LEG_PRICE=0.05
+PAPER_NEGRISK_MAX_LEG_PRICE=0.95
+PAPER_NEGRISK_ALLOW_BUY_ALL_NO=0
 PAPER_NEGRISK_JOURNAL=paper-negrisk.json
 ```
 
 只接受 Gamma 里已经列全的字段：一张 n 结果市场，或带齐 `markets[]` 子市场的
 event。成交量池里散落的 `negRisk` 二元行不会在本地拼场；打开执行后只把它们
-当成 event 查找键，再去 Gamma 拉完整 event。`BUY_ALL_NO` 只有在每个结果都有
-NO token 时才执行。组装后默认不 convert（`AUTO_CONVERT_NEGRISK=0`，0.6.0 没有
-`convert_positions`）。市场判定后进入 `RESOLVED_PENDING_REDEMPTION`，对每个
-child condition 调用 `redeem_positions`，确认后才 `SETTLED`。未完成篮子重启
-halt；已组装或待赎回库存计入暴露。纸面写入 `paper-negrisk.json`，实盘写入
-`live-negrisk.json`，都不会写进 `live-orders.json`。
+当成 event 查找键，再去 Gamma 拉完整 event。选宇宙时优先 2 结果字段。纸面
+execute 默认不做 `BUY_ALL_NO`（观察日志仍可留下）；`BUY_ALL_NO` 只有在每个
+结果都有 NO token、且显式 `PAPER_NEGRISK_ALLOW_BUY_ALL_NO=1` 时才执行。组装后
+默认不 convert（`AUTO_CONVERT_NEGRISK=0`，0.6.0 没有 `convert_positions`）。
+市场判定后进入 `RESOLVED_PENDING_REDEMPTION`，对每个 child condition 调用
+`redeem_positions`，确认后才 `SETTLED`。未完成篮子重启 halt；已组装或待赎回
+库存计入暴露。纸面写入 `paper-negrisk.json`，实盘写入 `live-negrisk.json`，
+都不会写进 `live-orders.json`。
 
 二元组合套利另有可选 Maker/GTC（`ENABLE_MAKER_GTC=0`）：扫描按 0 费率，两腿
 `post_only` 限价挂着，超时撤单并对单边成交 FAK unwind。默认关闭。不要给

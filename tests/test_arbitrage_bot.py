@@ -519,6 +519,9 @@ class ScanRejectAndGammaTests(unittest.TestCase):
         self.assertIn("net_below_floor=1", lines[0])
         self.assertIn("fee_drag=0", lines[0])
         self.assertIn("net_after_fee_below_floor=0", lines[0])
+        self.assertIn("negrisk_too_many_legs=0", lines[0])
+        self.assertIn("negrisk_extreme_price=0", lines[0])
+        self.assertIn("negrisk_direction_disabled=0", lines[0])
         self.assertIn("stale_book=1", lines[0])
         self.assertIn("leg_skew=1", lines[0])
         self.assertIn("risk_skip_cash=0", lines[0])
@@ -567,6 +570,9 @@ class ScanRejectAndGammaTests(unittest.TestCase):
         self.assertIn("risk_skip_negrisk_capital=1", lines[0])
         self.assertIn("fee_drag=0", lines[0])
         self.assertIn("net_after_fee_below_floor=0", lines[0])
+        self.assertIn("negrisk_too_many_legs=0", lines[0])
+        self.assertIn("negrisk_extreme_price=0", lines[0])
+        self.assertIn("negrisk_direction_disabled=0", lines[0])
         self.assertIn("risk_skip_other=0", lines[0])
 
     def test_paper_process_logs_rejects_and_does_not_write_live_orders(self):
