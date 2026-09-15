@@ -10,6 +10,10 @@ handlers.
 
 It never opens new trades and never touches the Deterministic Policy Gate
 (fee floors stay on the scanners).
+
+QUANT-20260915-01: after grace, UMA disputed / no unique winner on a paper
+complete-set takes a documented terminal force-settle (reason codes on the
+ledger, journal, and SETTLE_PAIR). Incomplete legs stay SETTLEMENT_STUCK.
 """
 
 from __future__ import annotations
@@ -27,7 +31,9 @@ import requests
 
 from .arbitrage_core import _as_bool, _json_list
 from .monitor import (
+    SETTLEMENT_EXCEPTION_KIND,
     SETTLEMENT_STUCK_KIND,
+    _settlement_exception_count,
     _settlement_stuck_count,
     _unhedged_leg_count,
     record_monitor_exception,
@@ -39,10 +45,19 @@ LOG = logging.getLogger("arbitrage-bot")
 # Cadence and grace are paper-only. Live redeem still uses the official path.
 DEFAULT_RECONCILE_INTERVAL_SEC = 300
 DEFAULT_STUCK_GRACE_HOURS = 48
+DEFAULT_UNRESOLVED_POLICY = "force_settle"
+UNRESOLVED_POLICIES = frozenset({"force_settle", "stuck"})
 CASH_CLOSE_TOLERANCE = 0.01
 GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
 GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
 UMA_FINALIZED_OUTCOME = "UMA_FINALIZED"
+UMA_DISPUTED_OUTCOME = "UMA_DISPUTED"
+PAST_GRACE_NO_WINNER_OUTCOME = "PAST_GRACE_NO_WINNER"
+
+# Ledger / journal reason codes. Paper-only; live redeem never writes these.
+REASON_PAPER_FORCE_SETTLE_UMA_FINALIZED = "PAPER_FORCE_SETTLE_UMA_FINALIZED"
+REASON_PAPER_FORCE_SETTLE_UMA_DISPUTED = "PAPER_FORCE_SETTLE_UMA_DISPUTED"
+REASON_PAPER_FORCE_SETTLE_PAST_GRACE_NO_WINNER = "PAPER_FORCE_SETTLE_PAST_GRACE_NO_WINNER"
 
 # UMA Optimistic Oracle: a proposed price is "known"; after liveness it is
 # finalized / resolved / settled. Polymarket Gamma uses several spellings.
@@ -55,6 +70,21 @@ UMA_KNOWN_OR_FINALIZED = frozenset({
     "resolved",
     "settled",
     "confirmed",
+})
+
+# Disputed / unresolved: Gamma has no unique winner. After grace, paper
+# complete-sets take a documented terminal path instead of sitting OPEN.
+UMA_DISPUTED_OR_UNRESOLVED = frozenset({
+    "disputed",
+    "dispute",
+    "challenged",
+    "unresolved",
+    "undecided",
+    "none",
+    "pending_dispute",
+    "disputedproposed",
+    "price_disputed",
+    "pricedisputed",
 })
 
 
@@ -88,6 +118,21 @@ def paper_settle_stuck_alert(default: bool = False) -> bool:
     if raw is None or raw == "":
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def paper_settle_unresolved_policy(default: str = DEFAULT_UNRESOLVED_POLICY) -> str:
+    """Paper-only: force-settle complete-sets after grace, or keep SETTLEMENT_STUCK.
+
+    ``force_settle`` (default) is the QUANT-20260915-01 path: past_grace +
+    UMA disputed / no unique winner closes inventory with a reason code.
+    ``stuck`` restores the QUANT-20260914-01 wait-and-alert behavior.
+    Invalid values fall back to the default so a typo cannot bypass policy.
+    """
+    raw = os.getenv("PAPER_SETTLE_UNRESOLVED_POLICY")
+    value = str(raw if raw not in (None, "") else default).strip().lower()
+    if value in UNRESOLVED_POLICIES:
+        return value
+    return default
 
 
 def _parse_end_ts(payload: dict) -> Optional[float]:
@@ -181,6 +226,10 @@ def is_uma_known_or_finalized(status: str) -> bool:
     return str(status or "").strip().lower() in UMA_KNOWN_OR_FINALIZED
 
 
+def is_uma_disputed_or_unresolved(status: str) -> bool:
+    return str(status or "").strip().lower() in UMA_DISPUTED_OR_UNRESOLVED
+
+
 @dataclass(frozen=True)
 class GammaResolution:
     market_id: str
@@ -190,6 +239,7 @@ class GammaResolution:
     event_end_ts: Optional[float]
     uma_status: str
     uma_known_or_finalized: bool
+    uma_disputed_or_unresolved: bool
     winning_outcome: Optional[str]
     resolved: bool
     lookup_ids: tuple = ()
@@ -223,7 +273,8 @@ def parse_gamma_resolution(payload: dict, *, fallback_id: str = "") -> Optional[
                 break
     winner = extract_winning_outcome(payload)
     uma_ready = is_uma_known_or_finalized(uma_status)
-    resolved = bool(winner) and (closed or uma_ready)
+    uma_disputed = is_uma_disputed_or_unresolved(uma_status)
+    resolved = bool(winner) and (closed or uma_ready) and not uma_disputed
     lookup = tuple(item for item in (
         market_id, condition_id, str(fallback_id or ""),
         str(payload.get("slug") or ""),
@@ -236,6 +287,7 @@ def parse_gamma_resolution(payload: dict, *, fallback_id: str = "") -> Optional[
         event_end_ts=_parse_end_ts(payload),
         uma_status=uma_status,
         uma_known_or_finalized=uma_ready,
+        uma_disputed_or_unresolved=uma_disputed,
         winning_outcome=winner,
         resolved=resolved,
         lookup_ids=lookup,
@@ -290,6 +342,11 @@ def count_settlement_stuck(ledger=None, negrisk=None) -> int:
     return _settlement_stuck_count(ledger, negrisk)
 
 
+def count_settlement_exceptions(ledger=None, negrisk=None) -> int:
+    """Paper force-settles / terminal exceptions (inventory already closed)."""
+    return _settlement_exception_count(ledger, negrisk)
+
+
 def _safe_float(value, default: float = 0.0) -> float:
     try:
         numeric = float(value)
@@ -338,6 +395,7 @@ class ReconcileReport:
     settled_positions: List[str] = field(default_factory=list)
     settled_baskets: List[str] = field(default_factory=list)
     stuck: List[str] = field(default_factory=list)
+    exceptions: List[str] = field(default_factory=list)
     polled: int = 0
     unhedged_leg_count: int = 0
 
@@ -408,6 +466,7 @@ class PaperSettlementReconciler:
         getter: Optional[GammaGetter] = None,
         grace_hours: Optional[float] = None,
         alert: Optional[bool] = None,
+        unresolved_policy: Optional[str] = None,
     ):
         if getattr(runner, "live", False) or getattr(runner, "ledger", None) is None:
             raise RuntimeError("paper settlement reconciler must not run in live mode")
@@ -417,6 +476,12 @@ class PaperSettlementReconciler:
             float(grace_hours) if grace_hours is not None else paper_settle_grace_hours()
         )
         self.alert = paper_settle_stuck_alert() if alert is None else bool(alert)
+        policy = (
+            str(unresolved_policy).strip().lower()
+            if unresolved_policy is not None
+            else paper_settle_unresolved_policy()
+        )
+        self.unresolved_policy = policy if policy in UNRESOLVED_POLICIES else DEFAULT_UNRESOLVED_POLICY
 
     def _lookup_ids(self, item: InventoryItem) -> List[str]:
         ids = []
@@ -511,6 +576,146 @@ class PaperSettlementReconciler:
         grace_seconds = max(0.0, self.grace_hours) * 3600.0
         return now >= snapshot.event_end_ts + grace_seconds
 
+    def _unresolved_force_plan(
+        self, item: InventoryItem, snapshot: GammaResolution,
+    ) -> Optional[tuple]:
+        """Return (winner, reason_code) for a paper terminal force-settle.
+
+        Complete-set Yes+No / full NegRisk baskets pay ``payout_per_share``
+        regardless of which outcome wins, so paper can close inventory after
+        grace when UMA is disputed or there is no unique winner. Incomplete
+        legs stay fail-closed (SETTLEMENT_STUCK). ``stuck`` policy restores
+        the wait-and-alert path. Live redeem is never called.
+        """
+        if not item.complete_set:
+            return None
+        if snapshot.uma_known_or_finalized and not snapshot.uma_disputed_or_unresolved:
+            return (
+                snapshot.winning_outcome or UMA_FINALIZED_OUTCOME,
+                REASON_PAPER_FORCE_SETTLE_UMA_FINALIZED,
+            )
+        if self.unresolved_policy != "force_settle":
+            return None
+        if snapshot.uma_disputed_or_unresolved:
+            return (
+                snapshot.winning_outcome or UMA_DISPUTED_OUTCOME,
+                REASON_PAPER_FORCE_SETTLE_UMA_DISPUTED,
+            )
+        if not snapshot.winning_outcome:
+            return (
+                PAST_GRACE_NO_WINNER_OUTCOME,
+                REASON_PAPER_FORCE_SETTLE_PAST_GRACE_NO_WINNER,
+            )
+        return None
+
+    def _stamp_settlement_audit(
+        self,
+        item: InventoryItem,
+        *,
+        reason_code: str,
+        uma_status: str,
+        winner: str,
+        now: float,
+    ) -> None:
+        """Write reason codes onto the ledger, journal, and last SETTLE_PAIR."""
+        policy = self.unresolved_policy
+        ledger = self.runner.ledger
+        if item.position_id and ledger is not None:
+            raw = ledger.state.get("positions", {}).get(item.position_id)
+            if isinstance(raw, dict):
+                raw["settlement_reason"] = reason_code
+                raw["settlement_policy"] = policy
+                raw["settlement_uma_status"] = uma_status
+                raw["settlement_exception"] = True
+                raw["settlement_stuck"] = False
+                raw["settlement_exception_at"] = now
+            for trade in reversed(ledger.state.get("trades") or []):
+                if not isinstance(trade, dict):
+                    continue
+                if trade.get("type") != "SETTLE_PAIR":
+                    continue
+                if str(trade.get("position_id") or "") != str(item.position_id):
+                    continue
+                trade["reason_code"] = reason_code
+                trade["settlement_policy"] = policy
+                trade["uma_status"] = uma_status
+                trade["winning_outcome"] = winner
+                break
+            ledger.save()
+        journal = getattr(self.runner, "negrisk_journal", None) or getattr(
+            getattr(self.runner, "negrisk_executor", None), "journal", None
+        )
+        if item.basket_id and journal is not None:
+            try:
+                journal._record(item.basket_id)
+            except KeyError:
+                journal = None
+            if journal is not None:
+                journal.update(
+                    item.basket_id,
+                    settlement_reason=reason_code,
+                    settlement_policy=policy,
+                    settlement_uma_status=uma_status,
+                    settlement_exception=True,
+                    settlement_stuck=False,
+                    settlement_exception_at=now,
+                )
+                events = journal.state.setdefault("events", [])
+                events.append({
+                    "type": "PAPER_SETTLE_EXCEPTION",
+                    "basket_id": item.basket_id,
+                    "market_id": item.market_id,
+                    "reason_code": reason_code,
+                    "uma_status": uma_status,
+                    "winning_outcome": winner,
+                    "policy": policy,
+                    "at": now,
+                })
+                journal.save()
+        label = item.position_id or item.basket_id or item.market_id
+        message = (
+            f"SETTLEMENT_EXCEPTION {label} market={item.market_id} "
+            f"title={item.title!r} reason={reason_code} "
+            f"uma={uma_status or 'unknown'} winner={winner} policy={policy}"
+        )
+        LOG.warning(message)
+        record_monitor_exception(
+            message, source="paper-settle", kind=SETTLEMENT_EXCEPTION_KIND,
+            extra={"market_id": item.market_id, "position_id": item.position_id,
+                   "basket_id": item.basket_id, "reason": reason_code,
+                   "uma_status": uma_status, "winning_outcome": winner,
+                   "policy": policy},
+        )
+
+    async def _force_settle_complete_set(
+        self,
+        item: InventoryItem,
+        snapshot: GammaResolution,
+        report: ReconcileReport,
+        *,
+        winner: str,
+        reason_code: str,
+        now: float,
+    ) -> None:
+        await self._apply_resolution(item, winner)
+        if self._inventory_still_open(item):
+            self._mark_stuck(
+                item,
+                f"{reason_code.lower()}_failed uma={snapshot.uma_status or 'unknown'}",
+                now=now,
+            )
+            report.stuck.append(item.position_id or item.basket_id)
+            return
+        self._stamp_settlement_audit(
+            item,
+            reason_code=reason_code,
+            uma_status=snapshot.uma_status,
+            winner=winner,
+            now=now,
+        )
+        self._record_settled(item, report)
+        report.exceptions.append(item.position_id or item.basket_id or item.market_id)
+
     async def reconcile(self, *, now: Optional[float] = None) -> ReconcileReport:
         clock = float(now if now is not None else time.time())
         report = ReconcileReport()
@@ -541,18 +746,13 @@ class PaperSettlementReconciler:
                 continue
             if not self._past_grace(snapshot, now=clock):
                 continue
-            if snapshot.uma_known_or_finalized and item.complete_set:
-                winner = snapshot.winning_outcome or UMA_FINALIZED_OUTCOME
-                await self._apply_resolution(item, winner)
-                if self._inventory_still_open(item):
-                    self._mark_stuck(
-                        item,
-                        f"uma_{snapshot.uma_status or 'known'}_force_settle_failed",
-                        now=clock,
-                    )
-                    report.stuck.append(item.position_id or item.basket_id)
-                else:
-                    self._record_settled(item, report)
+            plan = self._unresolved_force_plan(item, snapshot)
+            if plan is not None:
+                winner, reason_code = plan
+                await self._force_settle_complete_set(
+                    item, snapshot, report,
+                    winner=winner, reason_code=reason_code, now=clock,
+                )
                 continue
             self._mark_stuck(
                 item,
@@ -603,18 +803,20 @@ async def run_paper_settle_loop(runner, stop: asyncio.Event,
     except RuntimeError:
         return
     LOG.info(
-        "PAPER SETTLE RECONCILE: interval=%ss grace=%sh alert=%s",
+        "PAPER SETTLE RECONCILE: interval=%ss grace=%sh alert=%s unresolved_policy=%s",
         int(interval), reconciler.grace_hours, reconciler.alert,
+        reconciler.unresolved_policy,
     )
     try:
         while not stop.is_set():
             try:
                 report = await reconciler.reconcile()
-                if report.settled_positions or report.settled_baskets:
+                if report.settled_positions or report.settled_baskets or report.exceptions:
                     LOG.info(
-                        "PAPER SETTLE RECONCILE: settled_positions=%s settled_baskets=%s stuck=%s",
+                        "PAPER SETTLE RECONCILE: settled_positions=%s settled_baskets=%s "
+                        "stuck=%s exceptions=%s",
                         len(report.settled_positions), len(report.settled_baskets),
-                        len(report.stuck),
+                        len(report.stuck), len(report.exceptions),
                     )
             except Exception:
                 LOG.exception("paper settlement reconcile failed")

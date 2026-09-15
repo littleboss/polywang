@@ -25,6 +25,7 @@ DEFAULT_SUPERVISOR_STOP_FILE = "paper-supervisor.stop"
 PROCESS_EXIT_KIND = "process_exit"
 
 SETTLEMENT_STUCK_KIND = "settlement_stuck"
+SETTLEMENT_EXCEPTION_KIND = "settlement_exception"
 
 DISCONNECT_KINDS = frozenset({
     "disconnect",
@@ -220,6 +221,33 @@ def _settlement_stuck_count(ledger=None, negrisk=None) -> int:
     return stuck
 
 
+def _settlement_exception_count(ledger=None, negrisk=None) -> int:
+    """Closed paper rows that took the documented terminal exception path."""
+    count = 0
+    claimed = set()
+    for position in _positions(ledger):
+        if not position.get("settlement_exception"):
+            continue
+        count += 1
+        basket_id = str(position.get("basket_id") or "")
+        if basket_id:
+            claimed.add(basket_id)
+    if negrisk is None:
+        return count
+    state = getattr(negrisk, "state", None) or {}
+    baskets = state.get("baskets") if isinstance(state, dict) else {}
+    if not isinstance(baskets, dict):
+        return count
+    for record in baskets.values():
+        if not isinstance(record, dict) or not record.get("settlement_exception"):
+            continue
+        basket_id = str(record.get("basket_id") or "")
+        if basket_id and basket_id in claimed:
+            continue
+        count += 1
+    return count
+
+
 def _journal_reserved(record: dict) -> float:
     try:
         reserved = float(record.get("capital_reserved") or 0.0)
@@ -413,6 +441,7 @@ def compute_health_payload(
         "open_directional": len(directional.incomplete_trades()) if directional else 0,
         "open_negrisk": int(open_negrisk),
         "settlement_stuck": int(_settlement_stuck_count(ledger, negrisk)),
+        "settlement_exceptions": int(_settlement_exception_count(ledger, negrisk)),
         "unhedged_leg_count": int(_unhedged_leg_count(negrisk)),
         "heartbeat_at": clock,
         "last_flush_at": clock,
@@ -609,6 +638,7 @@ def count_exception_kinds(path: str) -> Dict[str, int]:
     """Read the exception tape only. Never opens the book-depth jsonl."""
     counts = {kind: 0 for kind in sorted(DISCONNECT_KINDS)}
     counts[SETTLEMENT_STUCK_KIND] = 0
+    counts[SETTLEMENT_EXCEPTION_KIND] = 0
     counts["total"] = 0
     if not path or not os.path.isfile(path):
         return counts
@@ -624,7 +654,10 @@ def count_exception_kinds(path: str) -> Dict[str, int]:
             if not isinstance(row, dict):
                 continue
             kind = str(row.get("kind") or "feed_fault")
-            if kind not in DISCONNECT_KINDS and kind != SETTLEMENT_STUCK_KIND:
+            if (
+                kind not in DISCONNECT_KINDS
+                and kind not in {SETTLEMENT_STUCK_KIND, SETTLEMENT_EXCEPTION_KIND}
+            ):
                 kind = "feed_fault"
             counts[kind] = counts.get(kind, 0) + 1
             counts["total"] += 1

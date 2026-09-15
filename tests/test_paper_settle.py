@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""QUANT-20260914-01: paper settlement reconciler. No network."""
+"""QUANT-20260914-01 / QUANT-20260915-01: paper settlement reconciler. No network."""
 
 import asyncio
 import os
@@ -27,11 +27,18 @@ from polywang.paper_settle import (
     CASH_CLOSE_TOLERANCE,
     DEFAULT_RECONCILE_INTERVAL_SEC,
     DEFAULT_STUCK_GRACE_HOURS,
+    DEFAULT_UNRESOLVED_POLICY,
+    PAST_GRACE_NO_WINNER_OUTCOME,
+    REASON_PAPER_FORCE_SETTLE_PAST_GRACE_NO_WINNER,
+    REASON_PAPER_FORCE_SETTLE_UMA_DISPUTED,
+    REASON_PAPER_FORCE_SETTLE_UMA_FINALIZED,
+    UMA_DISPUTED_OUTCOME,
     PaperSettlementReconciler,
     extract_winning_outcome,
     parse_gamma_resolution,
     paper_settle_grace_hours,
     paper_settle_interval_sec,
+    paper_settle_unresolved_policy,
     run_paper_settle_loop,
 )
 
@@ -158,12 +165,36 @@ class GammaParseTests(unittest.TestCase):
             self.assertTrue(snapshot.uma_known_or_finalized, status)
             self.assertFalse(snapshot.resolved)
 
+    def test_uma_disputed_is_not_a_verified_winner(self):
+        snapshot = parse_gamma_resolution({
+            "id": "4095052",
+            "conditionId": "c-4095052",
+            "outcomes": '["Yes", "No"]',
+            "outcomePrices": '["0.50", "0.50"]',
+            "closed": True,
+            "active": False,
+            "endDate": "2026-09-04T00:00:00Z",
+            "umaResolutionStatus": "disputed",
+        })
+        self.assertIsNotNone(snapshot)
+        self.assertTrue(snapshot.uma_disputed_or_unresolved)
+        self.assertFalse(snapshot.uma_known_or_finalized)
+        self.assertFalse(snapshot.resolved)
+        self.assertIsNone(snapshot.winning_outcome)
+
     def test_env_defaults(self):
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("PAPER_SETTLE_RECONCILE_INTERVAL_SEC", None)
             os.environ.pop("PAPER_SETTLE_STUCK_GRACE_HOURS", None)
+            os.environ.pop("PAPER_SETTLE_UNRESOLVED_POLICY", None)
             self.assertEqual(paper_settle_interval_sec(), DEFAULT_RECONCILE_INTERVAL_SEC)
             self.assertEqual(paper_settle_grace_hours(), DEFAULT_STUCK_GRACE_HOURS)
+            self.assertEqual(paper_settle_unresolved_policy(), DEFAULT_UNRESOLVED_POLICY)
+            self.assertEqual(paper_settle_unresolved_policy(), "force_settle")
+            os.environ["PAPER_SETTLE_UNRESOLVED_POLICY"] = "stuck"
+            self.assertEqual(paper_settle_unresolved_policy(), "stuck")
+            os.environ["PAPER_SETTLE_UNRESOLVED_POLICY"] = "not-a-policy"
+            self.assertEqual(paper_settle_unresolved_policy(), DEFAULT_UNRESOLVED_POLICY)
 
 
 class PaperSettlementReconcilerTests(unittest.TestCase):
@@ -316,7 +347,11 @@ class PaperSettlementReconcilerTests(unittest.TestCase):
                 trade for trade in runner.ledger.state["trades"] if trade.get("type") == "SETTLE_PAIR"
             )
             self.assertEqual(settle["winning_outcome"], "UMA_FINALIZED")
+            self.assertEqual(settle["reason_code"], REASON_PAPER_FORCE_SETTLE_UMA_FINALIZED)
+            self.assertTrue(raw.get("settlement_exception"))
+            self.assertEqual(raw.get("settlement_reason"), REASON_PAPER_FORCE_SETTLE_UMA_FINALIZED)
             self.assertIn(position.position_id, report.settled_positions)
+            self.assertIn(position.position_id, report.exceptions)
             self.assertEqual(report.unhedged_leg_count, 0)
 
     def test_past_grace_without_uma_marks_settlement_stuck(self):
@@ -350,6 +385,7 @@ class PaperSettlementReconcilerTests(unittest.TestCase):
                 report = asyncio.run(
                     PaperSettlementReconciler(
                         runner, getter=gamma, grace_hours=48, alert=True,
+                        unresolved_policy="stuck",
                     ).reconcile(now=now)
                 )
             self.assertGreaterEqual(len(report.stuck), 2)
@@ -366,6 +402,170 @@ class PaperSettlementReconcilerTests(unittest.TestCase):
             self.assertFalse(any(
                 trade.get("type") == "SETTLE_PAIR" for trade in runner.ledger.state["trades"]
             ))
+
+    def test_past_grace_uma_disputed_and_none_winner_force_settle_4095052_4095053(self):
+        """QUANT-20260915-01: both stuck ceasefire pairs close in one window."""
+        market_sep4 = binary_market(
+            id="4095052",
+            conditionId="c-4095052",
+            clobTokenIds='["yes-4095052", "no-4095052"]',
+            question="US x Iran Effective Ceasefire by September 4?",
+            endDate="2026-09-04T00:00:00Z",
+        )
+        market_sep11 = binary_market(
+            id="4095053",
+            conditionId="c-4095053",
+            clobTokenIds='["yes-4095053", "no-4095053"]',
+            question="US x Iran Effective Ceasefire by September 11?",
+            endDate="2026-09-11T00:00:00Z",
+        )
+        end_sep11 = datetime(2026, 9, 11, tzinfo=timezone.utc).timestamp()
+        now = end_sep11 + 49 * 3600
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ, {"WHALE_STATE_PATH": ""}, clear=False,
+        ):
+            os.environ.pop("PAPER_SETTLE_UNRESOLVED_POLICY", None)
+            os.environ.pop("ENABLE_NEGRISK_LIVE", None)
+            os.environ.pop("APPROVED_FOR_RELEASE", None)
+            runner = PaperMarketRunner(
+                [market_sep4, market_sep11],
+                os.path.join(directory, "ledger.json"),
+                1000.0,
+                BinaryArbitrageScanner(
+                    min_net_profit_usd=0.05, min_return=0.002, safety_buffer_usd=0.02,
+                ),
+            )
+            cash_before = float(runner.ledger.state["cash"])
+            pos_sep4 = open_binary_pair(runner, market_sep4)
+            pos_sep11 = open_binary_pair(runner, market_sep11)
+            already = runner.ledger.state["positions"][pos_sep11.position_id]
+            already["settlement_stuck"] = True
+            already["settlement_stuck_reason"] = "past_grace uma=unknown winner=none"
+            runner.ledger.save()
+            runner.markets.pop(market_sep4.market_id, None)
+            runner.markets.pop(market_sep11.market_id, None)
+            gamma = FakeGamma({
+                "4095052": {
+                    "id": "4095052",
+                    "conditionId": "c-4095052",
+                    "question": market_sep4.title,
+                    "outcomes": '["Yes", "No"]',
+                    "outcomePrices": '["0.50", "0.50"]',
+                    "closed": True,
+                    "active": False,
+                    "endDate": "2026-09-04T00:00:00Z",
+                    "umaResolutionStatus": "disputed",
+                },
+                "4095053": {
+                    "id": "4095053",
+                    "conditionId": "c-4095053",
+                    "question": market_sep11.title,
+                    "outcomes": '["Yes", "No"]',
+                    "outcomePrices": '["0.40", "0.60"]',
+                    "closed": True,
+                    "active": False,
+                    "endDate": "2026-09-11T00:00:00Z",
+                    "umaResolutionStatus": "",
+                },
+            })
+            with mock.patch("polywang.paper_settle.record_monitor_exception") as taped:
+                report = asyncio.run(
+                    PaperSettlementReconciler(runner, getter=gamma, grace_hours=48).reconcile(
+                        now=now,
+                    )
+                )
+            raw_sep4 = runner.ledger.state["positions"][pos_sep4.position_id]
+            raw_sep11 = runner.ledger.state["positions"][pos_sep11.position_id]
+            self.assertTrue(raw_sep4["settled"])
+            self.assertTrue(raw_sep11["settled"])
+            self.assertFalse(raw_sep4.get("settlement_stuck"))
+            self.assertFalse(raw_sep11.get("settlement_stuck"))
+            self.assertTrue(raw_sep4.get("settlement_exception"))
+            self.assertTrue(raw_sep11.get("settlement_exception"))
+            self.assertEqual(raw_sep4["settlement_reason"], REASON_PAPER_FORCE_SETTLE_UMA_DISPUTED)
+            self.assertEqual(
+                raw_sep11["settlement_reason"], REASON_PAPER_FORCE_SETTLE_PAST_GRACE_NO_WINNER,
+            )
+            settles = [
+                trade for trade in runner.ledger.state["trades"]
+                if trade.get("type") == "SETTLE_PAIR"
+            ]
+            by_id = {trade["position_id"]: trade for trade in settles}
+            self.assertEqual(by_id[pos_sep4.position_id]["winning_outcome"], UMA_DISPUTED_OUTCOME)
+            self.assertEqual(
+                by_id[pos_sep4.position_id]["reason_code"], REASON_PAPER_FORCE_SETTLE_UMA_DISPUTED,
+            )
+            self.assertEqual(
+                by_id[pos_sep11.position_id]["winning_outcome"], PAST_GRACE_NO_WINNER_OUTCOME,
+            )
+            self.assertEqual(
+                by_id[pos_sep11.position_id]["reason_code"],
+                REASON_PAPER_FORCE_SETTLE_PAST_GRACE_NO_WINNER,
+            )
+            self.assertEqual(sorted(report.settled_positions), sorted([
+                pos_sep4.position_id, pos_sep11.position_id,
+            ]))
+            self.assertEqual(report.stuck, [])
+            self.assertEqual(len(report.exceptions), 2)
+            cash_after = float(runner.ledger.state["cash"])
+            payout = float(raw_sep4["payout"]) + float(raw_sep11["payout"])
+            cost = (
+                float(raw_sep4["cost"]) + float(raw_sep4["fees"])
+                + float(raw_sep11["cost"]) + float(raw_sep11["fees"])
+            )
+            self.assertGreater(payout, 0.0)
+            self.assertLess(abs(cash_after - (cash_before - cost + payout)), CASH_CLOSE_TOLERANCE)
+            health = compute_health_payload(ledger=runner.ledger)
+            self.assertEqual(health["open_pairs"], 0)
+            self.assertLess(abs(health["pair_exposure"]), CASH_CLOSE_TOLERANCE)
+            self.assertEqual(health["settlement_stuck"], 0)
+            self.assertEqual(health["settlement_exceptions"], 2)
+            self.assertEqual(health["unhedged_leg_count"], 0)
+            self.assertGreaterEqual(taped.call_count, 2)
+            self.assertEqual(runner.scanner.min_net_profit_usd, 0.05)
+            self.assertEqual(runner.scanner.min_return, 0.002)
+            self.assertEqual(runner.scanner.safety_buffer_usd, 0.02)
+            self.assertIsNone(os.environ.get("ENABLE_NEGRISK_LIVE"))
+            self.assertIsNone(os.environ.get("APPROVED_FOR_RELEASE"))
+            self.assertFalse(getattr(runner, "live", False))
+
+    def test_unhedged_past_grace_stays_stuck_even_when_disputed(self):
+        nr = NegRiskMarket.from_gamma(nway_payload())
+        end_ts = 1_700_000_000.0
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ, {"WHALE_STATE_PATH": ""}, clear=False,
+        ):
+            runner = self._runner(directory, binary=binary_market(), negrisk=nr)
+            opened = open_nr_basket(runner, nr)
+            record = runner.negrisk_journal._record(opened.basket_id)
+            record["status"] = "UNHEDGED"
+            record["legs"][0]["matched_shares"] = 0.0
+            runner.negrisk_journal.save()
+            ledger_row = next(
+                row for row in runner.ledger.state["positions"].values()
+                if row.get("basket_id") == opened.basket_id
+            )
+            gamma = FakeGamma({
+                "nr-sports": nway_payload(
+                    closed=True, active=False,
+                    endDate=_iso(end_ts),
+                    umaResolutionStatus="disputed",
+                    outcomePrices='["0.33", "0.33", "0.34"]',
+                ),
+            })
+            report = asyncio.run(
+                PaperSettlementReconciler(runner, getter=gamma, grace_hours=48).reconcile(
+                    now=end_ts + 72 * 3600,
+                )
+            )
+            self.assertFalse(ledger_row.get("settled"))
+            self.assertTrue(ledger_row.get("settlement_stuck"))
+            self.assertIn(ledger_row["position_id"], report.stuck)
+            self.assertEqual(report.exceptions, [])
+            health = compute_health_payload(ledger=runner.ledger, negrisk=runner.negrisk_journal)
+            self.assertGreaterEqual(health["settlement_stuck"], 1)
+            self.assertEqual(health["settlement_exceptions"], 0)
+            self.assertGreaterEqual(health["unhedged_leg_count"], 1)
 
     def test_live_runner_is_rejected_and_loop_is_noop(self):
         market = binary_market()
