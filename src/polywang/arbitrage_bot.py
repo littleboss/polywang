@@ -68,6 +68,7 @@ from .arbitrage_core import (
     JsonLedger,
     LiveDirectionalJournal,
     LiveOrderJournal,
+    MaxOrderPolicy,
     OrderBook,
     PaperAskDepthLedger,
     PaperArbitrageExecutor,
@@ -78,6 +79,7 @@ from .arbitrage_core import (
     RiskHaltError,
     UnhedgedPairError,
     handle_market_event,
+    ledger_available_cash,
     market_event_asset_ids,
     consume_user_stream,
     intent_from_best_ask,
@@ -204,8 +206,17 @@ class ScanRejectCounter:
         self.accepted = 0
         self.best_touch_sum: Optional[float] = None
         self.best_net: Optional[float] = None
+        self.effective_max_order_usd: Optional[float] = None
         self.dual_synced_markets: set = set()
         self._window_start = time.monotonic()
+
+    def note_effective_max_order(self, value: float) -> None:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return
+        if math.isfinite(parsed):
+            self.effective_max_order_usd = parsed
 
     def record(self, reason: str, detail: Optional[str] = None) -> None:
         if reason not in self.counts:
@@ -248,19 +259,25 @@ class ScanRejectCounter:
         reject_total = sum(self.counts.values())
         touch = "n/a" if self.best_touch_sum is None else f"{self.best_touch_sum:.4f}"
         net = "n/a" if self.best_net is None else f"{self.best_net:.4f}"
+        effective = (
+            "n/a" if self.effective_max_order_usd is None
+            else f"{self.effective_max_order_usd:.4f}"
+        )
         reason_parts = " ".join(f"{name}={self.counts[name]}" for name in SCAN_REJECT_REASONS)
         risk_parts = " ".join(
             f"risk_skip_{name}={self.risk_skip_reasons[name]}" for name in RISK_SKIP_REASONS
         )
         self.log.info(
             "SCAN REJECTS: attempts=%d rejects=%d accepted=%d "
-            "dual_synced_markets=%d best_yes_ask+no_ask=%s best_net=%s | %s | %s",
+            "dual_synced_markets=%d best_yes_ask+no_ask=%s best_net=%s "
+            "effective_max_order_usd=%s | %s | %s",
             attempts,
             reject_total,
             self.accepted,
             len(self.dual_synced_markets),
             touch,
             net,
+            effective,
             reason_parts,
             risk_parts,
         )
@@ -581,7 +598,8 @@ class PaperMarketRunner:
                  risk_controller: Optional[LiveRiskController] = None,
                  negrisk_markets: Optional[List[NegRiskMarket]] = None,
                  negrisk_scanner: Optional[NegRiskBookScanner] = None,
-                 negrisk_executor=None):
+                 negrisk_executor=None,
+                 max_order_policy: Optional[MaxOrderPolicy] = None):
         # Same Gamma id in binary + NegRisk keep-sets: NegRisk wins. True
         # token / condition collisions across different market_ids still raise.
         markets = drop_binary_markets_overlapping_negrisk(markets, negrisk_markets)
@@ -662,6 +680,39 @@ class PaperMarketRunner:
         self.edge_evaluator = None
         self.last_directional_event = ""
         self.health_publisher = None
+        self.max_order_policy = max_order_policy
+        self.effective_max_order_usd = float(getattr(scanner, "max_order_usd", 100.0))
+        self._refresh_effective_max_order()
+
+    def _refresh_effective_max_order(self) -> float:
+        """Recompute shared binary/NegRisk max-order budget from paper cash."""
+        policy = self.max_order_policy
+        if policy is None:
+            value = max(0.01, float(getattr(self.scanner, "max_order_usd", 100.0)))
+            self.effective_max_order_usd = value
+            self.scan_rejects.note_effective_max_order(value)
+            return value
+        if policy.dynamic:
+            cash = ledger_available_cash(self.ledger)
+            if cash is None:
+                # Live / no paper ledger: keep CLI/env fixed size, do not
+                # treat missing cash as $0 (that would collapse to the floor).
+                if policy.fixed_max_order_usd is not None and policy.fixed_max_order_usd > 0:
+                    value = float(policy.fixed_max_order_usd)
+                else:
+                    value = float(getattr(self.scanner, "max_order_usd", policy.cap_usd))
+            else:
+                value = policy.effective(cash)
+        else:
+            value = policy.effective(None)
+        value = max(0.01, float(value))
+        self.effective_max_order_usd = value
+        if self.scanner is not None:
+            self.scanner.max_order_usd = value
+        if self.negrisk_scanner is not None:
+            self.negrisk_scanner.max_order_usd = value
+        self.scan_rejects.note_effective_max_order(value)
+        return value
 
     def _paper_negrisk_risk(self) -> PaperNegRiskRiskHelper:
         """Lazy paper NegRisk count/reserved helper. Never enables live."""
@@ -851,6 +902,7 @@ class PaperMarketRunner:
             if abs(yes_book.timestamp_ms - no_book.timestamp_ms) > self.max_leg_skew_ms:
                 self.scan_rejects.record("leg_skew")
                 continue
+            self._refresh_effective_max_order()
             opportunity = self.scanner.scan(
                 market, yes_book, no_book, is_taker=not maker_gtc_enabled(),
             )
@@ -870,6 +922,7 @@ class PaperMarketRunner:
                 self.scan_rejects.record("walk_mismatch")
                 continue
             try:
+                self._refresh_effective_max_order()
                 if self.risk_controller:
                     self.risk_controller.check(opportunity)
                 result = self.executor.execute(opportunity)
@@ -893,15 +946,21 @@ class PaperMarketRunner:
             self.last_fingerprint.add(opportunity.fingerprint)
             self.scan_rejects.record_accept()
             if self.live:
-                LOG.info("LIVE ARB HEDGED/PENDING USER CONFIRMATION: %s | %.4f shares | pair %s | YES %s | NO %s",
-                         market.title, result.shares, result.pair_id, result.yes_order_id, result.no_order_id)
+                LOG.info(
+                    "LIVE ARB HEDGED/PENDING USER CONFIRMATION: %s | %.4f shares | pair %s | "
+                    "YES %s | NO %s | effective_max_order_usd $%.4f",
+                    market.title, result.shares, result.pair_id, result.yes_order_id,
+                    result.no_order_id, self.effective_max_order_usd,
+                )
             else:
                 LOG.info(
                     "PAPER ARB: %s | %.4f shares | capital $%.4f | expected_net $%.4f | "
-                    "modeled_fees $%.4f | post_fee_net $%.4f | position %s",
+                    "modeled_fees $%.4f | post_fee_net $%.4f | effective_max_order_usd $%.4f | "
+                    "position %s",
                     market.title, opportunity.shares, opportunity.capital_required,
                     opportunity.expected_net, opportunity.modeled_fees,
-                    opportunity.post_fee_net, result.position_id,
+                    opportunity.post_fee_net, self.effective_max_order_usd,
+                    result.position_id,
                 )
         self.scan_rejects.maybe_flush()
 
@@ -942,6 +1001,7 @@ class PaperMarketRunner:
         if newest - oldest > self.max_leg_skew_ms:
             self.scan_rejects.record("leg_skew")
             return
+        self._refresh_effective_max_order()
         opportunity = self.negrisk_scanner.scan(market, self.books)
         if self.negrisk_scanner.last_best_net is not None:
             self.scan_rejects.observe_net(self.negrisk_scanner.last_best_net)
@@ -967,6 +1027,7 @@ class PaperMarketRunner:
             self.last_fingerprint.add(opportunity.fingerprint)
             return
         try:
+            self._refresh_effective_max_order()
             if self.risk_controller and self.live:
                 self.risk_controller.check_negrisk(opportunity)
             elif not self.live:
@@ -1003,10 +1064,11 @@ class PaperMarketRunner:
         self.last_fingerprint.add(opportunity.fingerprint)
         self.scan_rejects.record_accept()
         LOG.info(
-            "NEGRISK %s: %s | %s | %.4f shares | expected_net $%.4f | modeled_fees $%.4f | post_fee_net $%.4f | basket %s",
+            "NEGRISK %s: %s | %s | %.4f shares | expected_net $%.4f | modeled_fees $%.4f | "
+            "post_fee_net $%.4f | effective_max_order_usd $%.4f | basket %s",
             "LIVE" if self.live else "PAPER", market.title, opportunity.direction,
             opportunity.shares, opportunity.expected_net, opportunity.modeled_fees,
-            opportunity.post_fee_net, result.basket_id,
+            opportunity.post_fee_net, self.effective_max_order_usd, result.basket_id,
         )
 
     async def execute_directional(self, intent: DirectionalIntent):
@@ -2202,7 +2264,13 @@ def main() -> int:
     parser.add_argument("--morning-health", action="store_true", help="Alias for --book-health")
     parser.add_argument("--status", action="store_true", help="Print the local live journal summary and exit")
     parser.add_argument("--cash", type=float, default=env_float("PAPER_CASH", 1000.0))
-    parser.add_argument("--max-order", type=float, default=env_float("MAX_ORDER_USD", 100.0))
+    parser.add_argument(
+        "--max-order",
+        type=float,
+        default=env_float("MAX_ORDER_USD", 100.0),
+        help="Fixed max order USD when MAX_ORDER_FRACTION_OF_CASH<=0 "
+             "(default: MAX_ORDER_USD or 100). Ignored while fraction>0.",
+    )
     parser.add_argument("--min-profit", type=float, default=env_float("MIN_NET_PROFIT_USD", 0.05))
     parser.add_argument("--min-return", type=float, default=env_float("MIN_RETURN_ON_CAPITAL", 0.002))
     parser.add_argument("--buffer", type=float, default=env_float("SAFETY_BUFFER_USD", 0.02))
@@ -2245,11 +2313,16 @@ def main() -> int:
     if not markets:
         LOG.error("No active binary markets with Yes/No token IDs were found")
         return 1
+    max_order_policy = MaxOrderPolicy.from_env(cli_max_order=args.max_order)
+    if max_order_policy.dynamic and not args.live:
+        startup_max_order = max_order_policy.effective(args.cash)
+    else:
+        startup_max_order = args.max_order
     scanner = BinaryArbitrageScanner(
         min_net_profit_usd=args.min_profit,
         min_return=args.min_return,
         safety_buffer_usd=args.buffer,
-        max_order_usd=args.max_order,
+        max_order_usd=startup_max_order,
         max_levels=env_int("LIVE_MAX_BOOK_LEVELS", 1) if args.live else None,
         merge_gas_usd=env_float("MERGE_GAS_USD", 0.0),
     )
@@ -2257,12 +2330,12 @@ def main() -> int:
         min_net_profit_usd=args.min_profit,
         min_return=args.min_return,
         safety_buffer_usd=args.buffer,
-        max_order_usd=args.max_order,
+        max_order_usd=startup_max_order,
         max_levels=env_int("LIVE_MAX_BOOK_LEVELS", 1) if args.live else None,
         merge_gas_usd=env_float("MERGE_GAS_USD", 0.0),
     ) if negrisk_markets else None
     gas_warning = merge_gas_startup_warning(
-        env_float("MERGE_GAS_USD", 0.0), args.max_order, env_bool("AUTO_MERGE_COMPLETE_SETS"),
+        env_float("MERGE_GAS_USD", 0.0), startup_max_order, env_bool("AUTO_MERGE_COMPLETE_SETS"),
     )
     if gas_warning:
         LOG.warning("%s", gas_warning)
@@ -2332,6 +2405,7 @@ def main() -> int:
                 negrisk_markets=negrisk_markets,
                 negrisk_scanner=negrisk_scanner,
                 negrisk_executor=negrisk_live_executor,
+                max_order_policy=max_order_policy,
             )
             runner.directional_executor = directional
             _attach_research(runner, directional_journal)
@@ -2414,6 +2488,7 @@ def main() -> int:
             markets, args.ledger, args.cash, scanner,
             negrisk_markets=negrisk_markets,
             negrisk_scanner=negrisk_scanner,
+            max_order_policy=max_order_policy,
         )
         if want_negrisk and negrisk_markets:
             paper_negrisk = PaperNegRiskExecutor(

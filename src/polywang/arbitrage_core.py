@@ -914,6 +914,219 @@ class JsonLedger:
         self.save()
         return payout
 
+    def available_cash(self) -> float:
+        """Cash that can still back a new paper order.
+
+        Prefer ``cash_after_reserved`` when a ledger snapshot has that field;
+        otherwise use ``cash`` (already net of opened pair / NegRisk cost).
+        """
+        raw = self.state.get("cash_after_reserved")
+        if raw is None:
+            raw = self.state.get("cash", 0.0)
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            value = 0.0
+        if not math.isfinite(value):
+            return 0.0
+        return value
+
+
+MAX_ORDER_FRACTION_OF_CASH_DEFAULT = 0.025
+MAX_ORDER_FLOOR_USD_DEFAULT = 5.0
+MAX_ORDER_CAP_USD_DEFAULT = 100.0
+
+
+def _optional_env_float(name: str) -> Optional[float]:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value):
+        return None
+    return value
+
+
+def _env_float_or_default(name: str, default: float) -> float:
+    value = _optional_env_float(name)
+    return float(default) if value is None else value
+
+
+def resolve_max_order_fraction_of_cash(
+    default: float = MAX_ORDER_FRACTION_OF_CASH_DEFAULT,
+) -> float:
+    """MAX_ORDER_FRACTION_OF_CASH. >0 enables dynamic sizing (default 0.025)."""
+    return _env_float_or_default("MAX_ORDER_FRACTION_OF_CASH", default)
+
+
+def resolve_max_order_floor_usd(
+    default: float = MAX_ORDER_FLOOR_USD_DEFAULT,
+) -> float:
+    return max(0.0, _env_float_or_default("MAX_ORDER_FLOOR_USD", default))
+
+
+def resolve_max_order_cap_usd(
+    default: float = MAX_ORDER_CAP_USD_DEFAULT,
+) -> float:
+    return max(0.0, _env_float_or_default("MAX_ORDER_CAP_USD", default))
+
+
+def resolve_explicit_max_order_usd() -> Optional[float]:
+    """MAX_ORDER_USD only when the env var is present and finite."""
+    return _optional_env_float("MAX_ORDER_USD")
+
+
+def clamp_order_usd(value: float, floor_usd: float, cap_usd: float) -> float:
+    """Clamp ``value`` into ``[floor, cap]``. Swap bounds if floor > cap."""
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        amount = 0.0
+    if not math.isfinite(amount):
+        amount = 0.0
+    try:
+        lo = float(floor_usd)
+    except (TypeError, ValueError):
+        lo = 0.0
+    try:
+        hi = float(cap_usd)
+    except (TypeError, ValueError):
+        hi = 0.0
+    if not math.isfinite(lo):
+        lo = 0.0
+    if not math.isfinite(hi):
+        hi = 0.0
+    if lo > hi:
+        lo, hi = hi, lo
+    return min(max(amount, lo), hi)
+
+
+def ledger_available_cash(ledger) -> Optional[float]:
+    """Paper ledger cash for dynamic sizing. None when there is no ledger.
+
+    Prefers ``cash_after_reserved`` if that field exists; else ``cash``.
+    """
+    if ledger is None:
+        return None
+    getter = getattr(ledger, "available_cash", None)
+    if callable(getter):
+        try:
+            value = getter()
+        except (TypeError, ValueError):
+            value = None
+        else:
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError):
+                parsed = float("nan")
+            if math.isfinite(parsed):
+                return parsed
+    state = getattr(ledger, "state", None)
+    if not isinstance(state, dict):
+        return None
+    raw = state.get("cash_after_reserved")
+    if raw is None:
+        raw = state.get("cash")
+    if raw is None:
+        return None
+    try:
+        parsed = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed):
+        return None
+    return parsed
+
+
+@dataclass(frozen=True)
+class MaxOrderPolicy:
+    """Shared binary / NegRisk per-admit max-order budget.
+
+    ``fraction > 0`` (the default 0.025) turns on
+    ``clamp(cash * fraction, floor, cap)``. ``fraction <= 0`` keeps the
+    historical fixed ``MAX_ORDER_USD`` / ``--max-order`` path.
+    """
+
+    fraction: float = MAX_ORDER_FRACTION_OF_CASH_DEFAULT
+    floor_usd: float = MAX_ORDER_FLOOR_USD_DEFAULT
+    cap_usd: float = MAX_ORDER_CAP_USD_DEFAULT
+    fixed_max_order_usd: Optional[float] = None
+
+    @property
+    def dynamic(self) -> bool:
+        return float(self.fraction) > 0.0
+
+    def effective(self, cash: Optional[float] = None) -> float:
+        if self.dynamic:
+            try:
+                available = 0.0 if cash is None else float(cash)
+            except (TypeError, ValueError):
+                available = 0.0
+            if not math.isfinite(available) or available < 0.0:
+                available = 0.0
+            return max(0.01, clamp_order_usd(
+                available * float(self.fraction),
+                self.floor_usd,
+                self.cap_usd,
+            ))
+        fixed = self.fixed_max_order_usd
+        if fixed is not None:
+            try:
+                value = float(fixed)
+            except (TypeError, ValueError):
+                value = float("nan")
+            if math.isfinite(value) and value > 0.0:
+                return max(0.01, value)
+        return max(0.01, float(self.cap_usd) if math.isfinite(float(self.cap_usd)) else MAX_ORDER_CAP_USD_DEFAULT)
+
+    @classmethod
+    def from_env(cls, cli_max_order: Optional[float] = None) -> "MaxOrderPolicy":
+        fraction = resolve_max_order_fraction_of_cash()
+        floor_usd = resolve_max_order_floor_usd()
+        cap_usd = resolve_max_order_cap_usd()
+        fixed = None
+        if cli_max_order is not None:
+            try:
+                cli_value = float(cli_max_order)
+            except (TypeError, ValueError):
+                cli_value = float("nan")
+            if math.isfinite(cli_value) and cli_value > 0.0:
+                fixed = cli_value
+        if fixed is None:
+            explicit = resolve_explicit_max_order_usd()
+            if explicit is not None and explicit > 0.0:
+                fixed = explicit
+        return cls(
+            fraction=fraction,
+            floor_usd=floor_usd,
+            cap_usd=cap_usd,
+            fixed_max_order_usd=fixed,
+        )
+
+
+def effective_max_order_usd(
+    cash: float,
+    *,
+    fraction: float = MAX_ORDER_FRACTION_OF_CASH_DEFAULT,
+    floor_usd: float = MAX_ORDER_FLOOR_USD_DEFAULT,
+    cap_usd: float = MAX_ORDER_CAP_USD_DEFAULT,
+    fixed_max_order_usd: Optional[float] = None,
+) -> float:
+    """``clamp(cash * fraction, floor, cap)`` when ``fraction > 0``.
+
+    When ``fraction <= 0``, use ``fixed_max_order_usd`` if it is set and
+    greater than 0 (legacy ``MAX_ORDER_USD`` / ``--max-order``).
+    """
+    return MaxOrderPolicy(
+        fraction=fraction,
+        floor_usd=floor_usd,
+        cap_usd=cap_usd,
+        fixed_max_order_usd=fixed_max_order_usd,
+    ).effective(cash)
+
 
 class PaperArbitrageExecutor:
     def __init__(self, ledger: JsonLedger, max_total_exposure_fraction: float = 0.25,
