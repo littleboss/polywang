@@ -670,6 +670,7 @@ class ScanRejectAndGammaTests(unittest.TestCase):
         self.assertIn("dual_synced_markets=1", lines[0])
         self.assertIn("best_yes_ask+no_ask=0.9700", lines[0])
         self.assertIn("best_net=-0.0400", lines[0])
+        self.assertIn("effective_max_order_usd=n/a", lines[0])
         self.assertIn("net_below_floor=1", lines[0])
         self.assertIn("fee_drag=0", lines[0])
         self.assertIn("net_after_fee_below_floor=0", lines[0])
